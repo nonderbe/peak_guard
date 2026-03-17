@@ -1,0 +1,874 @@
+class PeakGuardPanel extends HTMLElement {
+  constructor() {
+    super();
+    this.attachShadow({ mode: "open" });
+    this._hass = null;
+    this._data = null;
+    this._activeTab = "peak";
+    this._editDevice = null;
+    this._editCascadeType = "peak";
+    this._lastStatusUpdate = 0;
+
+    // De modal leeft als een persistente DOM-node, buiten de render-cyclus
+    this._modalEl = null;
+    this._modalVisible = false;
+  }
+
+  // ------------------------------------------------------------------ //
+  //  HA lifecycle                                                        //
+  // ------------------------------------------------------------------ //
+
+  connectedCallback() {
+    this._refreshInterval = setInterval(() => {
+      // Nooit data herladen als modal open is
+      if (this._hass && !this._modalVisible && !this._fetchInProgress) this._fetchData();
+    }, 15000);
+  }
+
+  disconnectedCallback() {
+    clearInterval(this._refreshInterval);
+  }
+
+  set hass(hass) {
+    this._hass = hass;
+    if (!this._data) {
+      // Voorkom parallelle fetches terwijl de eerste nog bezig is
+      if (this._fetchInProgress) {
+        console.log('[PeakGuard DEBUG] hass setter: fetch al bezig, overgeslagen');
+        return;
+      }
+      console.log('[PeakGuard DEBUG] hass setter: _data=null => _fetchData(). modalVisible=' + this._modalVisible);
+      this._fetchData();
+      return;
+    }
+    if (this._modalVisible) {
+      console.log('[PeakGuard DEBUG] hass setter: modal open, geblokkeerd OK');
+      return;
+    }
+    const now = Date.now();
+    if (now - this._lastStatusUpdate > 1000) {
+      this._lastStatusUpdate = now;
+      this._updateLiveStatus();
+    }
+  }
+
+  // ------------------------------------------------------------------ //
+  //  Data laden / opslaan                                                //
+  // ------------------------------------------------------------------ //
+
+  async _fetchData() {
+    console.log('[PeakGuard DEBUG] _fetchData() gestart. modalVisible=' + this._modalVisible);
+    this._fetchInProgress = true;
+    try {
+      const resp = await this._hass.fetchWithAuth("/api/peak_guard/cascade");
+      if (resp.ok) {
+        this._data = await resp.json();
+        console.log('[PeakGuard DEBUG] _fetchData() data ontvangen. modalVisible=' + this._modalVisible);
+        if (!this._modalVisible) {
+          console.log('[PeakGuard DEBUG] _fetchData() => _render() aanroepen');
+          this._render();
+        } else {
+          console.log('[PeakGuard DEBUG] _fetchData() => render GEBLOKKEERD (modal open) OK');
+        }
+      } else {
+        this._renderError(`API fout: ${resp.status}`);
+      }
+    } catch (e) {
+      this._renderError(`Verbindingsfout: ${e.message}`);
+    } finally {
+      this._fetchInProgress = false;
+    }
+  }
+
+  async _saveDevices(cascadeType, devices, closeModal = false) {
+    try {
+      const resp = await this._hass.fetchWithAuth("/api/peak_guard/cascade", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ type: cascadeType, devices }),
+      });
+      if (resp.ok) {
+        if (closeModal) this._closeModal();
+        await this._fetchData();
+      } else {
+        alert(`Opslaan mislukt (HTTP ${resp.status}). Probeer opnieuw.`);
+      }
+    } catch (e) {
+      console.error("Peak Guard: opslaan mislukt", e);
+      alert("Verbindingsfout bij opslaan. Controleer de integratie.");
+    }
+  }
+
+  // ------------------------------------------------------------------ //
+  //  Live status update (zonder volledige re-render)                     //
+  // ------------------------------------------------------------------ //
+
+  _updateLiveStatus() {
+    if (!this._data?.config) return;
+    const { consumption_sensor, peak_sensor } = this._data.config;
+
+    const getVal = (id) => {
+      if (!id) return null;
+      const s = this._hass.states[id];
+      if (!s) return null;
+      const v = parseFloat(s.state);
+      return isNaN(v) ? null : v;
+    };
+
+    const consumption = getVal(consumption_sensor);
+    const peak = getVal(peak_sensor);
+    const isInjecting = consumption != null && consumption < 0;
+    const injectionValue = isInjecting ? Math.abs(consumption) : 0;
+    const overPeak = consumption != null && peak != null && consumption >= peak;
+
+    const setTextAndClass = (selector, text, cls) => {
+      const el = this.shadowRoot.querySelector(selector);
+      if (!el) return;
+      el.textContent = text;
+      if (cls !== undefined) el.className = `value ${cls}`;
+    };
+    setTextAndClass(
+      "#status-consumption",
+      consumption != null ? `${consumption.toFixed(0)} W` : "—",
+      overPeak ? "warning" : "ok"
+    );
+    setTextAndClass("#status-peak", peak != null ? `${peak.toFixed(0)} W` : "—");
+    setTextAndClass(
+      "#status-injection",
+      `${injectionValue.toFixed(0)} W`,
+      isInjecting ? "warning" : "ok"
+    );
+
+    // Update live statusbadges van alle apparaten in beide cascades
+    ["peak", "inject"].forEach((cascadeType) => {
+      const devices = this._data?.[cascadeType] || [];
+      devices.forEach((device, index) => {
+        const el = this.shadowRoot.querySelector(`#device-status-${cascadeType}-${index}`);
+        if (!el) return;
+        const { text, cls } = this._deviceStatus(device);
+        el.textContent = text;
+        el.className = `device-status ${cls}`;
+      });
+    });
+  }
+
+  // ------------------------------------------------------------------ //
+  //  Hoofd render  — raakt de modal-node NOOIT aan                       //
+  // ------------------------------------------------------------------ //
+
+  _render() {
+    console.log("[PeakGuard DEBUG] _render() aangeroepen. modalVisible=" + this._modalVisible);
+    if (!this._data) return;
+
+    // Bewaar de modal-node zodat innerHTML hem niet vernietigt
+    const savedModal = this._modalEl;
+    if (savedModal && savedModal.parentNode === this.shadowRoot) {
+      this.shadowRoot.removeChild(savedModal);
+    }
+
+    this.shadowRoot.innerHTML = `
+      ${this._styles()}
+      <div class="container">
+        <header class="page-header">
+          <div class="title-row">
+            <span class="logo">⚡</span>
+            <h1>Peak Guard</h1>
+          </div>
+          <div class="header-actions">
+            <span class="badge ${this._data.status?.monitoring ? "active" : "inactive"}">
+              <span class="dot"></span>
+              ${this._data.status?.monitoring ? "Actief" : "Inactief"}
+            </span>
+            <button class="btn-icon" id="btn-refresh" title="Verversen">🔄</button>
+          </div>
+        </header>
+
+        ${this._renderStatusCards()}
+
+        <nav class="tabs">
+          <button class="tab ${this._activeTab === "peak" ? "active" : ""}" data-tab="peak">
+            ⚡ Piekstroom vermijden
+          </button>
+          <button class="tab ${this._activeTab === "inject" ? "active" : ""}" data-tab="inject">
+            ☀️ Stroominjectie vermijden
+          </button>
+        </nav>
+
+        ${this._renderCascadePanel(this._activeTab)}
+      </div>
+    `;
+
+    // Modal-node terugplaatsen als die zichtbaar is
+    if (savedModal && this._modalVisible) {
+      this.shadowRoot.appendChild(savedModal);
+    }
+
+    this._attachMainEvents();
+  }
+
+  // ------------------------------------------------------------------ //
+  //  Status kaarten                                                      //
+  // ------------------------------------------------------------------ //
+
+  _renderStatusCards() {
+    const cfg = this._data?.config || {};
+    const getVal = (id) => {
+      if (!id || !this._hass) return null;
+      const s = this._hass.states[id];
+      if (!s) return null;
+      const v = parseFloat(s.state);
+      return isNaN(v) ? null : v;
+    };
+
+    const consumption = getVal(cfg.consumption_sensor);
+    const peak = getVal(cfg.peak_sensor);
+    const isInjecting = consumption != null && consumption < 0;
+    const injectionValue = isInjecting ? Math.abs(consumption) : 0;
+    const overPeak = consumption != null && peak != null && consumption > 0 && consumption >= peak;
+
+    return `
+      <div class="status-row">
+        <div class="status-card">
+          <div class="label">Huidig verbruik</div>
+          <div class="value ${overPeak ? "warning" : "ok"}" id="status-consumption">
+            ${consumption != null ? `${consumption.toFixed(0)} W` : "—"}
+          </div>
+        </div>
+        <div class="status-card">
+          <div class="label">Maandpiek</div>
+          <div class="value" id="status-peak">
+            ${peak != null ? `${peak.toFixed(0)} W` : "—"}
+          </div>
+        </div>
+        <div class="status-card">
+          <div class="label">Teruglevering</div>
+          <div class="value ${isInjecting ? "warning" : "ok"}" id="status-injection">
+            ${injectionValue.toFixed(0)} W
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  // ------------------------------------------------------------------ //
+  //  Cascade paneel                                                      //
+  // ------------------------------------------------------------------ //
+
+  _renderCascadePanel(type) {
+    const devices = this._data?.[type] || [];
+    const isPeak = type === "peak";
+
+    return `
+      <div class="panel">
+        <div class="panel-header">
+          <div>
+            <div class="panel-title">
+              ${isPeak ? "Cascade Piekstroom" : "Cascade Injectiepreventie"}
+            </div>
+            <div class="panel-desc">
+              ${
+                isPeak
+                  ? "Apparaten worden in volgorde uitgeschakeld of teruggeschroefd wanneer het verbruik de maandpiek dreigt te overschrijden."
+                  : "Apparaten worden in volgorde ingeschakeld of opgeschroefd wanneer er te veel stroom wordt teruggeleverd aan het net."
+              }
+            </div>
+          </div>
+          <button class="btn btn-primary" data-action="add" data-type="${type}">
+            + Toevoegen
+          </button>
+        </div>
+
+        <div class="device-list">
+          ${
+            devices.length === 0
+              ? `<div class="empty-state">
+                  <div class="emoji">${isPeak ? "⚡" : "☀️"}</div>
+                  <div>Geen apparaten geconfigureerd.</div>
+                  <div class="sub">Klik op "+ Toevoegen" om te beginnen.</div>
+                </div>`
+              : devices.map((d, i) => this._renderDeviceCard(d, i, devices.length, type)).join("")
+          }
+        </div>
+      </div>
+    `;
+  }
+
+  _renderDeviceCard(device, index, total, type) {
+    const labels = {
+      switch_off: "Uitschakelen",
+      switch_on: "Inschakelen",
+      throttle: "Vermogen verminderen",
+    };
+
+    const { text: statusText, cls: statusCls } = this._deviceStatus(device);
+    // Unieke ID voor de live status badge zodat _updateLiveStatus hem kan vinden
+    const statusId = `device-status-${type}-${index}`;
+
+    return `
+      <div class="device-card">
+        <div class="order-col">
+          <button class="btn-order" data-action="up" data-index="${index}" data-type="${type}"
+            ${index === 0 ? "disabled" : ""}>▲</button>
+          <div class="priority">${index + 1}</div>
+          <button class="btn-order" data-action="down" data-index="${index}" data-type="${type}"
+            ${index === total - 1 ? "disabled" : ""}>▼</button>
+        </div>
+        <div class="device-info">
+          <div class="device-name-row">
+            <span class="device-name">${device.name}</span>
+            <span id="${statusId}" class="device-status ${statusCls}">${statusText}</span>
+          </div>
+          <div class="device-entity">${device.entity_id}</div>
+          <div class="chips">
+            <span class="chip action">${labels[device.action_type] || device.action_type}</span>
+            ${device.power_watts ? `<span class="chip">${device.power_watts} W</span>` : ""}
+            ${device.max_value != null ? `<span class="chip">Max ${device.max_value} A</span>` : ""}
+            ${!device.enabled ? `<span class="chip disabled">Uitgeschakeld</span>` : ""}
+          </div>
+        </div>
+        <div class="device-actions">
+          <button class="btn-icon" data-action="edit"
+            data-index="${index}" data-type="${type}" title="Bewerken">✏️</button>
+          <button class="btn-icon" data-action="delete"
+            data-index="${index}" data-type="${type}" title="Verwijderen">🗑️</button>
+        </div>
+      </div>
+    `;
+  }
+
+  // Geeft de live statustext en CSS-klasse terug voor een apparaat
+  _deviceStatus(device) {
+    if (!this._hass) return { text: "—", cls: "status-unknown" };
+    const state = this._hass.states[device.entity_id];
+    if (!state || state.state === "unavailable" || state.state === "unknown" || state.state === "") {
+      return { text: "onbeschikbaar", cls: "status-unknown" };
+    }
+    if (device.action_type === "throttle") {
+      const val = parseFloat(state.state);
+      const unit = state.attributes?.unit_of_measurement || "A";
+      const display = isNaN(val) ? state.state : `${val} ${unit}`;
+      return { text: display, cls: "status-throttle" };
+    }
+    // switch_on / switch_off
+    if (state.state === "on") return { text: "aan", cls: "status-on" };
+    if (state.state === "off") return { text: "uit", cls: "status-off" };
+    return { text: state.state, cls: "status-unknown" };
+  }
+
+  // ------------------------------------------------------------------ //
+  //  Modal — persistente DOM-node, nooit door _render() gewist           //
+  // ------------------------------------------------------------------ //
+
+  _openModal(device, cascadeType) {
+    console.log("[PeakGuard DEBUG] _openModal() aangeroepen. type=" + cascadeType);
+    this._editDevice = device || null;
+    this._editCascadeType = cascadeType;
+    this._modalVisible = true;
+
+    // Maak de backdrop-node éénmalig aan en voeg hem toe aan de shadow root
+    if (!this._modalEl) {
+      this._modalEl = document.createElement("div");
+      Object.assign(this._modalEl.style, {
+        position: "fixed",
+        inset: "0",
+        zIndex: "999",
+        background: "rgba(0,0,0,.45)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: "16px",
+      });
+      this.shadowRoot.appendChild(this._modalEl);
+    } else {
+      this._modalEl.style.display = "flex";
+    }
+
+    const d = this._editDevice || {};
+    const isThrottle = d.action_type === "throttle";
+
+    // innerHTML van de modal-node instellen (niet van de shadow root!)
+    this._modalEl.innerHTML = `
+      <div class="modal" id="modal-box">
+        <h3>${d.id ? "Apparaat bewerken" : "Apparaat toevoegen"}</h3>
+
+        <div class="form-group">
+          <label>Naam</label>
+          <input id="f-name" type="text" value="${this._esc(d.name || "")}"
+            placeholder="bijv. Keukenboiler" autocomplete="off" />
+        </div>
+
+        <div class="form-group">
+          <label>Entity ID</label>
+          <div class="entity-picker">
+            <input id="f-entity" type="text" value="${this._esc(d.entity_id || "")}"
+              placeholder="Zoek op naam of entity ID..." autocomplete="off" />
+            <div id="entity-dropdown" class="entity-dropdown" style="display:none;"></div>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label>Actie</label>
+          <select id="f-action">
+            <option value="switch_off" ${d.action_type === "switch_off" ? "selected" : ""}>Uitschakelen (switch)</option>
+            <option value="switch_on"  ${d.action_type === "switch_on"  ? "selected" : ""}>Inschakelen (switch)</option>
+            <option value="throttle"   ${d.action_type === "throttle"   ? "selected" : ""}>Vermogen verminderen (number)</option>
+          </select>
+        </div>
+
+        <div class="form-group">
+          <label>Nominaal vermogen (W)</label>
+          <input id="f-power" type="number" min="0" value="${d.power_watts || 0}" placeholder="bijv. 2000" />
+        </div>
+
+        <div id="throttle-fields" ${isThrottle ? "" : 'style="display:none"'}>
+          <div class="form-row">
+            <div class="form-group">
+              <label>Min. laadstroom (A)</label>
+              <input id="f-min" type="number" min="0" value="${d.min_value ?? 6}" />
+            </div>
+            <div class="form-group">
+              <label>Max. laadstroom (A)</label>
+              <input id="f-max" type="number" min="0" value="${d.max_value ?? 32}" />
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Watt per ampere (bijv. 690 W/A voor 3-fase 230V)</label>
+            <input id="f-ppu" type="number" min="1" value="${d.power_per_unit ?? 690}" />
+          </div>
+        </div>
+
+        <div class="modal-actions">
+          <button class="btn btn-secondary" id="modal-cancel">Annuleren</button>
+          <button class="btn btn-primary" id="modal-save">Opslaan</button>
+        </div>
+      </div>
+    `;
+
+    this._attachModalEvents();
+  }
+
+  _closeModal() {
+    console.log("[PeakGuard DEBUG] _closeModal() aangeroepen");
+    this._modalVisible = false;
+    this._editDevice = null;
+    if (this._modalEl) {
+      this._modalEl.style.display = "none";
+    }
+  }
+
+  _esc(str) {
+    return String(str).replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+  }
+
+  // ------------------------------------------------------------------ //
+  //  Modal events                                                        //
+  // ------------------------------------------------------------------ //
+
+  _attachModalEvents() {
+    const root = this._modalEl;
+
+    // ---- Entity picker ----
+    const entityInput = root.querySelector("#f-entity");
+    const entityDropdown = root.querySelector("#entity-dropdown");
+
+    console.log('[PeakGuard DEBUG] _attachModalEvents: entityInput gevonden=' + !!entityInput + ', entityDropdown gevonden=' + !!entityDropdown);
+    if (entityInput && entityDropdown) {
+      const allEntities = Object.keys(this._hass.states).sort();
+      console.log('[PeakGuard DEBUG] Aantal entiteiten beschikbaar: ' + allEntities.length);
+
+      const showDropdown = (filter) => {
+        console.log('[PeakGuard DEBUG] showDropdown aangeroepen, filter="' + filter + '"');
+        if (!filter) {
+          entityDropdown.style.display = "none";
+          return;
+        }
+        const lower = filter.toLowerCase();
+        const matches = allEntities
+          .filter((id) => {
+            const name = this._hass.states[id]?.attributes?.friendly_name || "";
+            return id.toLowerCase().includes(lower) || name.toLowerCase().includes(lower);
+          })
+          .slice(0, 50);
+
+        if (matches.length === 0) {
+          entityDropdown.style.display = "none";
+          return;
+        }
+
+        entityDropdown.innerHTML = matches
+          .map((id) => {
+            const name = this._hass.states[id]?.attributes?.friendly_name || "";
+            return `<div class="entity-option" data-id="${id}">
+              <span class="eo-id">${id}</span>
+              ${name ? `<span class="eo-name">${name}</span>` : ""}
+            </div>`;
+          })
+          .join("");
+
+        entityDropdown.style.display = "block";
+
+        entityDropdown.querySelectorAll(".entity-option").forEach((opt) => {
+          opt.addEventListener("mousedown", (e) => {
+            e.preventDefault();   // blur triggert niet vóór de waarde gezet is
+            e.stopPropagation();
+            entityInput.value = opt.dataset.id;
+            entityDropdown.style.display = "none";
+            entityInput.focus();
+          });
+        });
+      };
+
+      // Alleen het entity-veld triggert de dropdown
+      entityInput.addEventListener("input", () => {
+        console.log('[PeakGuard DEBUG] entity input event, value="' + entityInput.value + '"');
+        showDropdown(entityInput.value);
+      });
+      entityInput.addEventListener("focus", () => {
+        if (entityInput.value) showDropdown(entityInput.value);
+      });
+      entityInput.addEventListener("blur", () => {
+        setTimeout(() => { entityDropdown.style.display = "none"; }, 250);
+      });
+    }
+
+    // ---- Throttle-velden ----
+    const actionSelect = root.querySelector("#f-action");
+    if (actionSelect) {
+      actionSelect.addEventListener("change", () => {
+        const fields = root.querySelector("#throttle-fields");
+        if (fields) fields.style.display = actionSelect.value === "throttle" ? "" : "none";
+      });
+    }
+
+    // ---- Knoppen ----
+    root.querySelector("#modal-save")?.addEventListener("click", () => this._handleSave());
+    root.querySelector("#modal-cancel")?.addEventListener("click", () => this._closeModal());
+
+    // Klik op de backdrop (niet op de modal zelf) sluit de modal
+    root.addEventListener("click", (e) => {
+      if (e.target === root) this._closeModal();
+    });
+    root.querySelector("#modal-box")?.addEventListener("click", (e) => e.stopPropagation());
+  }
+
+  // ------------------------------------------------------------------ //
+  //  Opslaan                                                             //
+  // ------------------------------------------------------------------ //
+
+  _handleSave() {
+    if (this._saving) return;   // dubbele klik blokkeren
+    const root = this._modalEl;
+    const get = (id) => root.querySelector(id);
+    const name = get("#f-name").value.trim();
+    const entity_id = get("#f-entity").value.trim();
+    const action_type = get("#f-action").value;
+    const power_watts = parseInt(get("#f-power").value) || 0;
+
+    if (!name || !entity_id) {
+      alert("Naam en Entity ID zijn verplicht.");
+      return;
+    }
+
+    const isThrottle = action_type === "throttle";
+    const device = {
+      id: this._editDevice?.id || `dev_${Date.now()}`,
+      name,
+      entity_id,
+      action_type,
+      power_watts,
+      min_value: isThrottle ? (parseFloat(get("#f-min")?.value) || 0) : null,
+      max_value: isThrottle ? (parseFloat(get("#f-max")?.value) || 32) : null,
+      power_per_unit: isThrottle ? (parseFloat(get("#f-ppu")?.value) || 690) : null,
+      priority: this._editDevice?.priority ?? 999,
+      enabled: true,
+    };
+
+    const devices = [...(this._data?.[this._editCascadeType] || [])];
+    const existingIdx = devices.findIndex((d) => d.id === device.id);
+
+    if (existingIdx >= 0) {
+      devices[existingIdx] = device;
+    } else {
+      devices.push(device);
+    }
+
+    this._reprioritize(devices);
+    this._saving = true;
+    const saveBtn = root.querySelector("#modal-save");
+    if (saveBtn) { saveBtn.disabled = true; saveBtn.textContent = "Bezig..."; }
+    this._saveDevices(this._editCascadeType, devices, true).finally(() => {
+      this._saving = false;
+      if (saveBtn) { saveBtn.disabled = false; saveBtn.textContent = "Opslaan"; }
+    });
+  }
+
+  _reprioritize(devices) {
+    devices.forEach((d, i) => { d.priority = i + 1; });
+  }
+
+  // ------------------------------------------------------------------ //
+  //  Hoofd events (achtergrond)                                          //
+  // ------------------------------------------------------------------ //
+
+  _attachMainEvents() {
+    this.shadowRoot.querySelectorAll(".tab").forEach((t) => {
+      t.addEventListener("click", () => {
+        this._activeTab = t.dataset.tab;
+        this._render();
+      });
+    });
+
+    this.shadowRoot.querySelector("#btn-refresh")?.addEventListener("click", () => {
+      this._fetchData();
+    });
+
+    this.shadowRoot.querySelectorAll("[data-action='add']").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        this._openModal(null, btn.dataset.type);
+      });
+    });
+
+    this.shadowRoot
+      .querySelectorAll("[data-action='edit'], [data-action='delete'], [data-action='up'], [data-action='down']")
+      .forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const { action, index: idxStr, type } = btn.dataset;
+          const idx = parseInt(idxStr);
+          const devices = [...(this._data?.[type] || [])];
+
+          if (action === "edit") {
+            this._openModal({ ...devices[idx] }, type);
+          } else if (action === "delete") {
+            if (confirm(`'${devices[idx].name}' verwijderen?`)) {
+              devices.splice(idx, 1);
+              this._reprioritize(devices);
+              this._saveDevices(type, devices);
+            }
+          } else if (action === "up" && idx > 0) {
+            [devices[idx - 1], devices[idx]] = [devices[idx], devices[idx - 1]];
+            this._reprioritize(devices);
+            this._saveDevices(type, devices);
+          } else if (action === "down" && idx < devices.length - 1) {
+            [devices[idx], devices[idx + 1]] = [devices[idx + 1], devices[idx]];
+            this._reprioritize(devices);
+            this._saveDevices(type, devices);
+          }
+        });
+      });
+  }
+
+  // ------------------------------------------------------------------ //
+  //  Fout scherm                                                         //
+  // ------------------------------------------------------------------ //
+
+  _renderError(msg) {
+    this.shadowRoot.innerHTML = `
+      <div style="padding:40px;text-align:center;color:var(--error-color,#f44336);font-family:sans-serif;">
+        <div style="font-size:2em;margin-bottom:8px;">⚠️</div>
+        <div>${msg}</div>
+        <div style="margin-top:12px;font-size:.85em;color:#888;">
+          Controleer of de Peak Guard integratie correct geladen is.
+        </div>
+      </div>
+    `;
+  }
+
+  // ------------------------------------------------------------------ //
+  //  Stijlen (achtergrond)                                               //
+  // ------------------------------------------------------------------ //
+
+  _styles() {
+    return `
+      <style>
+        *, *::before, *::after { box-sizing: border-box; }
+        :host {
+          display: block; height: 100%;
+          background: var(--primary-background-color, #f0f2f5);
+          font-family: var(--paper-font-body1_-_font-family, sans-serif);
+          color: var(--primary-text-color, #212121);
+        }
+        .container { max-width: 860px; margin: 0 auto; padding: 24px 16px; }
+
+        .page-header {
+          display: flex; justify-content: space-between; align-items: center;
+          margin-bottom: 20px;
+        }
+        .title-row { display: flex; align-items: center; gap: 10px; }
+        .logo { font-size: 1.8em; }
+        h1 { margin: 0; font-size: 1.5em; font-weight: 700; }
+        .header-actions { display: flex; align-items: center; gap: 10px; }
+        .badge {
+          display: inline-flex; align-items: center; gap: 6px;
+          padding: 4px 12px; border-radius: 20px; font-size: .8em; font-weight: 600;
+        }
+        .badge.active { background: #e8f5e9; color: #2e7d32; }
+        .badge.inactive { background: #ffebee; color: #c62828; }
+        .dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+        .badge.active .dot { animation: pulse 1.5s ease-in-out infinite; }
+        @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+
+        .status-row {
+          display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+          gap: 12px; margin-bottom: 24px;
+        }
+        .status-card {
+          background: var(--card-background-color, #fff);
+          border-radius: 12px; padding: 16px 20px;
+          box-shadow: 0 1px 3px rgba(0,0,0,.08);
+        }
+        .label {
+          font-size: .75em; text-transform: uppercase; letter-spacing: .06em;
+          margin-bottom: 6px; color: var(--secondary-text-color, #757575);
+        }
+        .value { font-size: 1.9em; font-weight: 700; }
+        .value.ok { color: #388e3c; }
+        .value.warning { color: #d32f2f; }
+
+        .tabs {
+          display: flex; border-bottom: 2px solid var(--divider-color, #e0e0e0);
+          margin-bottom: 20px;
+        }
+        .tab {
+          padding: 10px 22px; cursor: pointer; background: none; border: none;
+          font-size: .95em; font-weight: 500;
+          color: var(--secondary-text-color, #757575);
+          border-bottom: 2px solid transparent; margin-bottom: -2px;
+          transition: color .2s, border-color .2s;
+        }
+        .tab:hover { color: var(--primary-color, #03a9f4); }
+        .tab.active { color: var(--primary-color, #03a9f4); border-bottom-color: var(--primary-color, #03a9f4); }
+
+        .panel {
+          background: var(--card-background-color, #fff);
+          border-radius: 12px; padding: 20px;
+          box-shadow: 0 1px 3px rgba(0,0,0,.08);
+        }
+        .panel-header {
+          display: flex; justify-content: space-between;
+          align-items: flex-start; margin-bottom: 16px; gap: 16px;
+        }
+        .panel-title { font-size: 1.05em; font-weight: 700; margin-bottom: 4px; }
+        .panel-desc { font-size: .85em; color: var(--secondary-text-color, #757575); }
+        .device-list { display: flex; flex-direction: column; gap: 10px; }
+
+        .device-card {
+          display: flex; align-items: center; gap: 12px;
+          background: var(--secondary-background-color, #fafafa);
+          border: 1px solid var(--divider-color, #eeeeee);
+          border-radius: 10px; padding: 12px 14px; transition: box-shadow .2s;
+        }
+        .device-card:hover { box-shadow: 0 2px 8px rgba(0,0,0,.08); }
+        .order-col { display: flex; flex-direction: column; align-items: center; gap: 2px; }
+        .priority {
+          width: 28px; height: 28px; border-radius: 50%;
+          background: var(--primary-color, #03a9f4); color: #fff;
+          display: flex; align-items: center; justify-content: center;
+          font-weight: 700; font-size: .85em;
+        }
+        .btn-order {
+          padding: 1px 5px; border: none; border-radius: 4px;
+          background: var(--divider-color, #e0e0e0);
+          color: var(--secondary-text-color, #757575);
+          cursor: pointer; font-size: .75em; line-height: 1.4;
+          transition: background .15s, color .15s;
+        }
+        .btn-order:hover:not(:disabled) { background: var(--primary-color, #03a9f4); color: #fff; }
+        .btn-order:disabled { opacity: .3; cursor: default; }
+        .device-info { flex: 1; min-width: 0; }
+        .device-name-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 2px; }
+        .device-name { font-weight: 600; font-size: .95em; }
+        .device-status {
+          font-size: .72em; font-weight: 700; padding: 2px 8px;
+          border-radius: 10px; white-space: nowrap;
+          text-transform: uppercase; letter-spacing: .04em;
+        }
+        .status-on  { background: #e8f5e9; color: #2e7d32; }
+        .status-off { background: #fafafa; color: #9e9e9e; border: 1px solid #e0e0e0; }
+        .status-throttle { background: #e3f2fd; color: #1565c0; }
+        .status-unknown { background: #fafafa; color: #bdbdbd; border: 1px solid #e0e0e0; }
+        .device-entity { font-size: .78em; color: var(--secondary-text-color, #9e9e9e); margin: 0 0 6px; word-break: break-all; }
+        .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+        .chip { font-size: .72em; padding: 2px 9px; border-radius: 10px; background: var(--primary-color, #03a9f4); color: #fff; font-weight: 500; }
+        .chip.action { background: #fb8c00; }
+        .chip.disabled { background: #9e9e9e; }
+        .device-actions { display: flex; gap: 4px; }
+
+        .btn {
+          padding: 8px 16px; border: none; border-radius: 8px;
+          cursor: pointer; font-size: .9em; font-weight: 600;
+          transition: opacity .15s, box-shadow .15s; white-space: nowrap;
+        }
+        .btn:hover { opacity: .88; }
+        .btn-primary { background: var(--primary-color, #03a9f4); color: #fff; }
+        .btn-secondary { background: var(--secondary-background-color, #eeeeee); color: var(--primary-text-color, #212121); }
+        .btn-icon {
+          padding: 6px 8px; border: none; border-radius: 6px;
+          background: transparent; cursor: pointer; font-size: 1em;
+          color: var(--secondary-text-color, #9e9e9e); transition: background .15s;
+        }
+        .btn-icon:hover { background: var(--divider-color, #e0e0e0); color: var(--primary-text-color, #212121); }
+
+        .empty-state { text-align: center; padding: 40px 20px; color: var(--secondary-text-color, #9e9e9e); }
+        .empty-state .emoji { font-size: 2.5em; margin-bottom: 8px; }
+        .empty-state .sub { font-size: .85em; margin-top: 4px; }
+
+        /* Modal */
+        .modal {
+          background: var(--card-background-color, #fff);
+          border-radius: 14px; padding: 26px;
+          width: 100%; max-width: 480px; max-height: 90vh;
+          overflow-y: auto;
+          box-shadow: 0 12px 40px rgba(0,0,0,.25);
+          color: var(--primary-text-color, #212121);
+          font-family: var(--paper-font-body1_-_font-family, sans-serif);
+        }
+        .modal h3 { margin: 0 0 20px; font-size: 1.15em; }
+        .form-group { margin-bottom: 16px; }
+        .form-group label {
+          display: block; font-size: .78em; font-weight: 700;
+          text-transform: uppercase; letter-spacing: .05em;
+          color: var(--secondary-text-color, #757575); margin-bottom: 6px;
+        }
+        .form-group input, .form-group select {
+          width: 100%; padding: 10px 12px;
+          border: 1px solid var(--divider-color, #e0e0e0);
+          border-radius: 8px; font-size: .95em;
+          background: var(--primary-background-color, #fafafa);
+          color: var(--primary-text-color, #212121);
+          box-sizing: border-box; transition: border-color .15s;
+        }
+        .form-group input:focus, .form-group select:focus {
+          outline: none; border-color: var(--primary-color, #03a9f4);
+        }
+        .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+        .modal-actions {
+          display: flex; justify-content: flex-end;
+          gap: 10px; margin-top: 22px; padding-top: 16px;
+          border-top: 1px solid var(--divider-color, #e0e0e0);
+        }
+        /* Entity picker */
+        .entity-picker { position: relative; }
+        .entity-dropdown {
+          position: absolute; top: 100%; left: 0; right: 0; z-index: 10;
+          background: var(--card-background-color, #fff);
+          border: 1px solid var(--primary-color, #03a9f4);
+          border-top: none; border-radius: 0 0 8px 8px;
+          max-height: 220px; overflow-y: auto;
+          box-shadow: 0 4px 12px rgba(0,0,0,.15);
+        }
+        .entity-option {
+          padding: 8px 12px; cursor: pointer;
+          display: flex; flex-direction: column; gap: 2px;
+          border-bottom: 1px solid var(--divider-color, #f0f0f0);
+        }
+        .entity-option:last-child { border-bottom: none; }
+        .entity-option:hover { background: var(--primary-color, #03a9f4); color: #fff; }
+        .entity-option:hover .eo-name { color: rgba(255,255,255,.8); }
+        .eo-id { font-size: .85em; font-weight: 600; font-family: monospace; }
+        .eo-name { font-size: .78em; color: var(--secondary-text-color, #9e9e9e); }
+      </style>
+    `;
+  }
+}
+
+customElements.define("peak-guard-panel", PeakGuardPanel);
