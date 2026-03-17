@@ -7,6 +7,6 @@
   "config_flow": true,
   "requirements": [],
   "dependencies": ["frontend", "http", "panel_custom"],
-  "codeowners": ["@JOUW_GITHUB_NAAM"],
+  "codeowners": ["@nonderbe"],
   "iot_class": "local_polling"
 }
