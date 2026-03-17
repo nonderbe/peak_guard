@@ -1,0 +1,20 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Peak Guard instellen",
+        "description": "Selecteer de sensoren van je digitale meter en stel de parameters in.",
+        "data": {
+          "consumption_sensor": "Sensor huidig verbruik (W)",
+          "peak_sensor": "Sensor maandelijkse piek (W)",
+          "buffer_watts": "Buffer boven de piek (W)",
+          "update_interval": "Controle-interval (seconden)"
+        }
+      }
+    },
+    "abort": {
+      "already_configured": "Peak Guard is al geconfigureerd."
+    }
+  }
+}
+
