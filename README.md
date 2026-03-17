@@ -18,7 +18,7 @@ Zodra het verbruik normaliseert, worden de apparaten **automatisch hersteld** na
 ## Installatie via HACS (aanbevolen)
 
 1. Zorg dat [HACS](https://hacs.xyz) geïnstalleerd is in je Home Assistant
-2. Ga naar **HACS → Integraties → ⋮ → Aangepaste opslagplaatsen**
+2. Ga naar **HACS → Integraties → ⋮ → Aangepaste repositories**
 3. Voeg toe: `https://github.com/nonderbe/peak_guard` als type **Integratie**
 4. Zoek naar **Peak Guard** en klik op **Downloaden**
 5. Herstart Home Assistant
@@ -27,7 +27,7 @@ Zodra het verbruik normaliseert, worden de apparaten **automatisch hersteld** na
 
 ## Handmatige installatie
 
-1. Download de [nieuwste release](https://github.com/JOUW_GITHUB_NAAM/peak_guard/releases/latest)
+1. Download de [nieuwste release](https://github.com/nonderbe/peak_guard/releases/latest)
 2. Kopieer de map `custom_components/peak_guard/` naar je HA-configuratiemap
 3. Herstart Home Assistant
 4. Ga naar **Instellingen → Apparaten & Diensten → Integratie toevoegen → Peak Guard**
