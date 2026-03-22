@@ -3,12 +3,22 @@
     "step": {
       "user": {
         "title": "Peak Guard instellen",
-        "description": "Selecteer de sensoren van je digitale meter en stel de parameters in.",
+        "description": "Na installatie verschijnt automatisch het device 'Peak Guard - Overzicht & Besparingen' op de integratie-pagina. Klik op een sensor voor de volledige maandelijkse geschiedenis-grafiek. Geen Lovelace-configuratie nodig.",
         "data": {
           "consumption_sensor": "Sensor huidig verbruik (W)",
           "peak_sensor": "Sensor maandelijkse piek (W)",
           "buffer_watts": "Buffer boven de piek (W)",
-          "update_interval": "Controle-interval (seconden)"
+          "update_interval": "Controle-interval (seconden)",
+          "energy_sensor": "Energiesensor (kWh, stijgend totaal)",
+          "regio": "Fluvius-netgebied (capaciteitstarief 2026)",
+          "power_detection_tolerance_percent": "Tolerantie vermogensdetectie (%)",
+          "netto_besparing_per_kwh_verschoven": "Netto besparing per verschoven kWh (€/kWh)"
+        },
+        "data_description": {
+          "energy_sensor": "De cumulatieve kWh-teller van je digitale meter (P1 of energiedashboard). Moet een steeds stijgende waarde zijn.",
+          "regio": "Kies het netgebied van je distributienetbeheerder. Dit bepaalt het capaciteitstarief (€/kW/jaar, excl. BTW).",
+          "power_detection_tolerance_percent": "Hoeveel procent het totaalverbruik mag afwijken van het nominale vermogen om een 'naturlijke stop' te detecteren. Verhoog bij valse positieven, verlaag voor striktere detectie.",
+          "netto_besparing_per_kwh_verschoven": "Verschil tussen je afnameprijs en injectievergoeding (excl. BTW). Standaard 0.25 €/kWh. Hogere waarde = meer besparing per verschoven kWh."
         }
       }
     },
@@ -17,4 +27,3 @@
     }
   }
 }
-

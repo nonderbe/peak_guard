@@ -1,9 +1,9 @@
 {
   "domain": "peak_guard",
   "name": "Peak Guard",
-  "documentation": "https://github.com/JOUW_GITHUB_NAAM/peak_guard",
-  "issue_tracker": "https://github.com/JOUW_GITHUB_NAAM/peak_guard/issues",
-  "version": "1.0.0",
+  "documentation": "https://github.com/nonderbe/peak_guard",
+  "issue_tracker": "https://github.com/nonderbe/peak_guard/issues",
+  "version": "1.1.0",
   "config_flow": true,
   "requirements": [],
   "dependencies": ["frontend", "http", "panel_custom"],

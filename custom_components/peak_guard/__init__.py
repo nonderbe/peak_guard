@@ -1,3 +1,5 @@
+"""Peak Guard — __init__.py"""
+
 import logging
 import os
 
@@ -12,12 +14,10 @@ from .controller import PeakGuardController
 
 _LOGGER = logging.getLogger(__name__)
 
-# Sleutel om bij te houden of het panel al geregistreerd is (in hass.data)
 _PANEL_REGISTERED_KEY = f"{DOMAIN}_panel_registered"
 
-# ------------------------------------------------------------------ #
-#  REST API View voor cascade data                                     #
-# ------------------------------------------------------------------ #
+# Platforms die door deze integratie geladen worden
+PLATFORMS = ["sensor", "button"]
 
 
 class PeakGuardCascadeView(HomeAssistantView):
@@ -29,20 +29,16 @@ class PeakGuardCascadeView(HomeAssistantView):
 
     async def get(self, request):
         hass = request.app["hass"]
-        controller = hass.data.get(DOMAIN)
+        controller = hass.data.get(DOMAIN, {}).get("controller")
         if not controller:
-            return self.json_message(
-                "Peak Guard niet geïnitialiseerd", status_code=503
-            )
+            return self.json_message("Peak Guard niet geïnitialiseerd", status_code=503)
         return self.json(controller.to_dict())
 
     async def post(self, request):
         hass = request.app["hass"]
-        controller = hass.data.get(DOMAIN)
+        controller = hass.data.get(DOMAIN, {}).get("controller")
         if not controller:
-            return self.json_message(
-                "Peak Guard niet geïnitialiseerd", status_code=503
-            )
+            return self.json_message("Peak Guard niet geïnitialiseerd", status_code=503)
         try:
             data = await request.json()
         except Exception:
@@ -61,34 +57,30 @@ class PeakGuardCascadeView(HomeAssistantView):
         return self.json({"status": "ok", "opgeslagen": len(devices)})
 
 
-# ------------------------------------------------------------------ #
-#  Setup                                                               #
-# ------------------------------------------------------------------ #
-
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
-    """YAML-setup wordt niet ondersteund – gebruik de UI config flow."""
     return True
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Stel Peak Guard in vanuit een config entry."""
     controller = PeakGuardController(hass, dict(entry.data))
-    hass.data[DOMAIN] = controller
-
     await controller.async_load()
 
-    # Registreer de REST API view
+    # Sla alles op onder DOMAIN als dict zodat meerdere objecten
+    # (controller + toekomstige uitbreiding) naast elkaar kunnen leven
+    hass.data.setdefault(DOMAIN, {})
+    hass.data[DOMAIN]["controller"] = controller
+
+    # REST API
     hass.http.register_view(PeakGuardCascadeView())
 
-    # Registreer het static pad en panel slechts éénmalig per HA-instantie
+    # Frontend panel (eenmalig)
     if not hass.data.get(_PANEL_REGISTERED_KEY):
         frontend_path = os.path.join(os.path.dirname(__file__), "frontend")
         static_url = "/peak_guard_static"
-
         await hass.http.async_register_static_paths([
             StaticPathConfig(static_url, frontend_path, cache_headers=False)
         ])
-
         await async_register_panel(
             hass,
             webcomponent_name="peak-guard-panel",
@@ -103,17 +95,43 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     await controller.start_monitoring()
 
+    # Registreer service: peak_guard.get_dashboard_yaml
+    async def _handle_get_dashboard_yaml(call):
+        from .dashboard_yaml import COMPACT_CARD_YAML
+        await hass.services.async_call(
+            "persistent_notification",
+            "create",
+            {
+                "title": "Peak Guard -- Dashboard card YAML",
+                "message": (
+                    "Voeg toe via Dashboard > Bewerken > + Kaart > Handmatig:\n\n"
+                    "```yaml\n" + COMPACT_CARD_YAML + "\n```"
+                ),
+                "notification_id": "peak_guard_dashboard_yaml",
+            },
+        )
+
+    hass.services.async_register(
+        DOMAIN, "get_dashboard_yaml", _handle_get_dashboard_yaml
+    )
+
+    # Laad sensor-platform (sensor.py)
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
     _LOGGER.info("Peak Guard succesvol geladen")
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Verwijder Peak Guard."""
-    controller = hass.data.pop(DOMAIN, None)
+    # Unload sensor-platform
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+
+    controller = hass.data[DOMAIN].pop("controller", None)
     if controller:
         await controller.stop_monitoring()
 
-    # Verwijder panel-registratie vlag zodat een herlaad het panel opnieuw registreert
     hass.data.pop(_PANEL_REGISTERED_KEY, None)
+    hass.services.async_remove(DOMAIN, "get_dashboard_yaml")
     frontend.async_remove_panel(hass, PANEL_URL)
-    return True
+    return unload_ok

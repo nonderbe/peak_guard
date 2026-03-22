@@ -1,0 +1,7 @@
+get_dashboard_yaml:
+  name: "Genereer dashboard YAML"
+  description: >
+    Retourneert de kant-en-klare Lovelace card-YAML als een
+    persistent_notification. Handig om de YAML te kopieren zonder
+    naar GitHub te gaan.
+  fields: {}

@@ -5,6 +5,7 @@ class PeakGuardPanel extends HTMLElement {
     this._hass = null;
     this._data = null;
     this._activeTab = "peak";
+    this._savingsChart = "peak";  // welke grafiek zichtbaar in savings-tab
     this._editDevice = null;
     this._editCascadeType = "peak";
     this._lastStatusUpdate = 0;
@@ -192,9 +193,14 @@ class PeakGuardPanel extends HTMLElement {
           <button class="tab ${this._activeTab === "inject" ? "active" : ""}" data-tab="inject">
             ☀️ Stroominjectie vermijden
           </button>
+          <button class="tab ${this._activeTab === "savings" ? "active" : ""}" data-tab="savings">
+            💰 Besparingen & Overzicht
+          </button>
         </nav>
 
-        ${this._renderCascadePanel(this._activeTab)}
+        ${this._activeTab === "savings"
+          ? this._renderSavingsPanel()
+          : this._renderCascadePanel(this._activeTab)}
       </div>
     `;
 
@@ -615,12 +621,32 @@ class PeakGuardPanel extends HTMLElement {
       t.addEventListener("click", () => {
         this._activeTab = t.dataset.tab;
         this._render();
+        if (t.dataset.tab === "savings") {
+          // Kleine timeout zodat de DOM al gerenderd is voor chart-init
+          setTimeout(() => this._initSavingsCharts(), 80);
+        }
       });
     });
 
     this.shadowRoot.querySelector("#btn-refresh")?.addEventListener("click", () => {
       this._fetchData();
     });
+
+    // Chart selector in savings tab
+    this.shadowRoot.querySelectorAll(".chart-toggle-btn").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        this._savingsChart = btn.dataset.chart;
+        this.shadowRoot.querySelectorAll(".chart-toggle-btn").forEach(b =>
+          b.classList.toggle("active", b.dataset.chart === this._savingsChart)
+        );
+        this._drawBarChart();
+      });
+    });
+
+    // Savings tab: init charts on first render
+    if (this._activeTab === "savings") {
+      setTimeout(() => this._initSavingsCharts(), 80);
+    }
 
     this.shadowRoot.querySelectorAll("[data-action='add']").forEach((btn) => {
       btn.addEventListener("click", () => {
@@ -866,9 +892,518 @@ class PeakGuardPanel extends HTMLElement {
         .entity-option:hover .eo-name { color: rgba(255,255,255,.8); }
         .eo-id { font-size: .85em; font-weight: 600; font-family: monospace; }
         .eo-name { font-size: .78em; color: var(--secondary-text-color, #9e9e9e); }
+
+        /* ============================================================ */
+        /*  Besparingen tab                                              */
+        /* ============================================================ */
+        .savings-panel { padding: 20px; }
+
+        .savings-section-title {
+          font-size: .82em; font-weight: 700; text-transform: uppercase;
+          letter-spacing: .08em; color: var(--secondary-text-color, #757575);
+          margin-bottom: 14px;
+        }
+
+        /* Big numbers grid */
+        .big-numbers-grid {
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+          gap: 14px;
+          margin-bottom: 4px;
+        }
+        .big-card {
+          border-radius: 14px; padding: 18px 16px;
+          display: flex; flex-direction: column; align-items: flex-start;
+          box-shadow: 0 2px 8px rgba(0,0,0,.07);
+          position: relative; overflow: hidden;
+        }
+        .big-card::before {
+          content: ""; position: absolute; top: 0; left: 0; right: 0;
+          height: 3px;
+        }
+        .peak-card  { background: #fff8f0; }
+        .peak-card::before  { background: linear-gradient(90deg,#f57c00,#ffb74d); }
+        .solar-card { background: #f1f8e9; }
+        .solar-card::before { background: linear-gradient(90deg,#388e3c,#81c784); }
+        .total-card { background: linear-gradient(135deg,#e8f5e9 0%,#e3f2fd 100%); }
+        .total-card::before { background: linear-gradient(90deg,#1976d2,#43a047); }
+
+        .big-card-icon  { font-size: 1.5em; margin-bottom: 4px; }
+        .big-card-label {
+          font-size: .72em; font-weight: 700; text-transform: uppercase;
+          letter-spacing: .06em; color: var(--secondary-text-color, #757575);
+          margin-bottom: 6px;
+        }
+        .big-number {
+          font-size: 2em; font-weight: 800; line-height: 1.1;
+          color: var(--primary-text-color, #212121);
+        }
+        .total-number { color: #1565c0; }
+        .big-card-sub {
+          font-size: .72em; color: var(--secondary-text-color, #9e9e9e);
+          margin-top: 2px; margin-bottom: 10px;
+        }
+        .big-card-eur {
+          font-size: 1.15em; font-weight: 700;
+          color: #2e7d32;
+        }
+        .big-card-eur-label {
+          font-size: .7em; color: var(--secondary-text-color, #9e9e9e); margin-top: 2px;
+        }
+        .no-data { color: var(--secondary-text-color, #bdbdbd); }
+
+        /* Chart toggle */
+        .chart-toggle-row {
+          display: flex; gap: 8px; margin-bottom: 12px;
+        }
+        .chart-toggle-btn {
+          padding: 6px 16px; border-radius: 20px; border: none;
+          background: var(--secondary-background-color, #eeeeee);
+          color: var(--secondary-text-color, #757575);
+          font-size: .82em; font-weight: 600; cursor: pointer;
+          transition: background .15s, color .15s;
+        }
+        .chart-toggle-btn.active {
+          background: var(--primary-color, #03a9f4); color: #fff;
+        }
+        .chart-toggle-btn:hover:not(.active) {
+          background: var(--divider-color, #e0e0e0);
+          color: var(--primary-text-color, #212121);
+        }
+
+        /* Chart container */
+        .chart-container {
+          position: relative; width: 100%; height: 200px;
+          background: var(--card-background-color, #fff);
+          border-radius: 10px; overflow: hidden;
+          box-shadow: 0 1px 4px rgba(0,0,0,.06);
+        }
+        #savings-chart { display: block; width: 100%; height: 100%; }
+        .chart-no-data {
+          position: absolute; inset: 0; display: flex;
+          flex-direction: column; align-items: center; justify-content: center;
+          color: var(--secondary-text-color, #9e9e9e);
+          font-size: .9em; text-align: center; gap: 6px;
+        }
+        .chart-no-data-sub { font-size: .8em; opacity: .7; }
+
+        /* Events table */
+        .events-table-wrap {
+          width: 100%; overflow-x: auto;
+          border-radius: 10px; box-shadow: 0 1px 4px rgba(0,0,0,.06);
+        }
+        .events-table {
+          width: 100%; border-collapse: collapse;
+          background: var(--card-background-color, #fff);
+          font-size: .83em;
+        }
+        .events-table th {
+          padding: 10px 12px; text-align: left;
+          background: var(--secondary-background-color, #fafafa);
+          font-size: .78em; font-weight: 700; text-transform: uppercase;
+          letter-spacing: .05em; color: var(--secondary-text-color, #757575);
+          border-bottom: 2px solid var(--divider-color, #e0e0e0);
+          white-space: nowrap;
+        }
+        .events-table td {
+          padding: 9px 12px;
+          border-bottom: 1px solid var(--divider-color, #f0f0f0);
+          vertical-align: middle;
+        }
+        .events-table tr:last-child td { border-bottom: none; }
+        .events-table tr:hover td {
+          background: var(--secondary-background-color, #fafafa);
+        }
+        .ev-val  { font-family: monospace; font-weight: 600; }
+        .ev-eur  { font-weight: 700; color: #2e7d32; }
+        .ev-empty {
+          text-align: center; padding: 24px;
+          color: var(--secondary-text-color, #9e9e9e); font-style: italic;
+        }
+        .mode-badge {
+          display: inline-block; padding: 2px 9px; border-radius: 10px;
+          font-size: .78em; font-weight: 700; white-space: nowrap;
+        }
+        .mode-piek  { background: #fff3e0; color: #e65100; }
+        .mode-solar { background: #e8f5e9; color: #1b5e20; }
+
       </style>
     `;
   }
+
+  // ================================================================ //
+  //  Besparingen & Overzicht tab                                      //
+  // ================================================================ //
+
+  /**
+   * Hulpfunctie: haal sensorwaarde op uit hass.states.
+   * Geeft null terug als sensor ontbreekt of unknown is.
+   */
+  _sensorVal(entityId, decimals = 2) {
+    if (!this._hass || !entityId) return null;
+    const s = this._hass.states[entityId];
+    if (!s || s.state === "unknown" || s.state === "unavailable") return null;
+    const v = parseFloat(s.state);
+    return isNaN(v) ? null : parseFloat(v.toFixed(decimals));
+  }
+
+  _sensorStr(entityId, fallback = "—") {
+    const v = this._sensorVal(entityId);
+    return v !== null ? String(v) : fallback;
+  }
+
+  // ---------------------------------------------------------------- //
+  //  HTML-render van de volledige besparingen-tab                     //
+  // ---------------------------------------------------------------- //
+
+  _renderSavingsPanel() {
+    const s = (id, d = 2) => this._sensorVal(id, d);
+    const fmt = (v, unit = "") =>
+      v !== null ? `${v}${unit ? " " + unit : ""}` : `<span class="no-data">—</span>`;
+
+    // ---- Big numbers ophalen ----------------------------------- //
+    const peakKw   = s("sensor.peak_guard_peak_avoided_kw_this_month", 3);
+    const peakEur  = s("sensor.peak_guard_peak_savings_euro_this_month");
+    const peakYr   = s("sensor.peak_guard_peak_savings_euro_this_year");
+    const solarKwh = s("sensor.peak_guard_solar_verschoven_kwh_this_month", 3);
+    const solarEur = s("sensor.peak_guard_solar_savings_euro_this_month");
+    const solarYr  = s("sensor.peak_guard_solar_savings_euro_this_year");
+    const totalMth = (peakEur !== null || solarEur !== null)
+      ? parseFloat(((peakEur ?? 0) + (solarEur ?? 0)).toFixed(2))
+      : null;
+    const totalYr  = (peakYr !== null || solarYr !== null)
+      ? parseFloat(((peakYr ?? 0) + (solarYr ?? 0)).toFixed(2))
+      : null;
+
+    // ---- Events-log ophalen ------------------------------------ //
+    const peakEvents  = this._hass?.states["sensor.peak_guard_peak_avoided_events"]
+                          ?.attributes?.events ?? [];
+    const solarEvents = this._hass?.states["sensor.peak_guard_solar_avoided_events"]
+                          ?.attributes?.events ?? [];
+
+    // ---- Gecombineerde events gesorteerd op tijd ---------------- //
+    const allEvents = [
+      ...peakEvents.map(e => ({
+        ts:       e.timestamp_start_uitstel,
+        modus:    "Piek",
+        icon:     "⚡",
+        apparaat: e.apparaat,
+        duur:     e.gemeten_duur_min,
+        waarde:   `${e.vermeden_piek_kw} kW`,
+        eur:      e.besparing_eur,
+      })),
+      ...solarEvents.map(e => ({
+        ts:       e.timestamp_start_inschakeling,
+        modus:    "Solar",
+        icon:     "☀️",
+        apparaat: e.apparaat,
+        duur:     e.gemeten_duur_min,
+        waarde:   `${e.verschoven_kwh} kWh`,
+        eur:      e.besparing_eur,
+      })),
+    ].sort((a, b) => b.ts.localeCompare(a.ts)).slice(0, 10);
+
+    const fmtTs = (iso) => {
+      if (!iso) return "—";
+      // "2026-03-21T14:03:00+00:00" → "21 mrt 14:03"
+      const d = new Date(iso);
+      const maanden = ["jan","feb","mrt","apr","mei","jun","jul","aug","sep","okt","nov","dec"];
+      return `${d.getDate()} ${maanden[d.getMonth()]} ${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}`;
+    };
+
+    const eventsRows = allEvents.length === 0
+      ? `<tr><td colspan="6" class="ev-empty">Nog geen events deze maand</td></tr>`
+      : allEvents.map(e => `
+        <tr>
+          <td>${fmtTs(e.ts)}</td>
+          <td><span class="mode-badge mode-${e.modus.toLowerCase()}">${e.icon} ${e.modus}</span></td>
+          <td>${this._esc(e.apparaat)}</td>
+          <td>${e.duur} min</td>
+          <td class="ev-val">${e.waarde}</td>
+          <td class="ev-eur">€ ${e.eur}</td>
+        </tr>`
+      ).join("");
+
+    return `
+      <div class="panel savings-panel">
+
+        <!-- ======================================================= -->
+        <!-- Sectie 1: Big numbers                                     -->
+        <!-- ======================================================= -->
+        <div class="savings-section-title">📊 Huidige maand</div>
+
+        <div class="big-numbers-grid">
+
+          <div class="big-card peak-card">
+            <div class="big-card-icon">⚡</div>
+            <div class="big-card-label">Piekbeperking</div>
+            <div class="big-number">${fmt(peakKw, "kW")}</div>
+            <div class="big-card-sub">vermeden piekbijdrage</div>
+            <div class="big-card-eur">${fmt(peakEur, "€")}</div>
+            <div class="big-card-eur-label">bespaard op capaciteitstarief</div>
+          </div>
+
+          <div class="big-card solar-card">
+            <div class="big-card-icon">☀️</div>
+            <div class="big-card-label">Injectiepreventie</div>
+            <div class="big-number">${fmt(solarKwh, "kWh")}</div>
+            <div class="big-card-sub">verschoven energie</div>
+            <div class="big-card-eur">${fmt(solarEur, "€")}</div>
+            <div class="big-card-eur-label">bespaard via lokaal verbruik</div>
+          </div>
+
+          <div class="big-card total-card">
+            <div class="big-card-icon">💰</div>
+            <div class="big-card-label">Totaal bespaard</div>
+            <div class="big-number total-number">${fmt(totalMth, "€")}</div>
+            <div class="big-card-sub">deze maand</div>
+            <div class="big-card-eur">${fmt(totalYr, "€")}</div>
+            <div class="big-card-eur-label">dit jaar</div>
+          </div>
+
+        </div>
+
+        <!-- ======================================================= -->
+        <!-- Sectie 2: Grafieken (canvas bar chart)                    -->
+        <!-- ======================================================= -->
+        <div class="savings-section-title" style="margin-top:28px;">
+          📈 Maand-over-maand overzicht
+        </div>
+
+        <div class="chart-toggle-row">
+          <button class="chart-toggle-btn ${this._savingsChart === "peak" ? "active" : ""}"
+                  data-chart="peak">⚡ Piekbeperking</button>
+          <button class="chart-toggle-btn ${this._savingsChart === "solar" ? "active" : ""}"
+                  data-chart="solar">☀️ Injectiepreventie</button>
+        </div>
+
+        <div class="chart-container">
+          <canvas id="savings-chart" height="200"></canvas>
+          <div id="chart-no-data" class="chart-no-data" style="display:none;">
+            Nog niet genoeg historische data.<br>
+            <span class="chart-no-data-sub">
+              Grafieken vullen automatisch op naarmate de integratie draait.
+            </span>
+          </div>
+        </div>
+
+        <!-- ======================================================= -->
+        <!-- Sectie 3: Events-tabel                                   -->
+        <!-- ======================================================= -->
+        <div class="savings-section-title" style="margin-top:28px;">
+          📋 Recente gebeurtenissen (laatste 10)
+        </div>
+
+        <div class="events-table-wrap">
+          <table class="events-table">
+            <thead>
+              <tr>
+                <th>Datum</th>
+                <th>Modus</th>
+                <th>Apparaat</th>
+                <th>Duur</th>
+                <th>Resultaat</th>
+                <th>Besparing</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${eventsRows}
+            </tbody>
+          </table>
+        </div>
+
+      </div>
+    `;
+  }
+
+  // ---------------------------------------------------------------- //
+  //  Bar chart via Canvas API (geen externe dependencies)             //
+  // ---------------------------------------------------------------- //
+
+  _initSavingsCharts() {
+    if (this._activeTab !== "savings") return;
+    this._drawBarChart();
+  }
+
+  _drawBarChart() {
+    const canvas = this.shadowRoot.querySelector("#savings-chart");
+    const noData = this.shadowRoot.querySelector("#chart-no-data");
+    if (!canvas) return;
+
+    const isPeak = this._savingsChart === "peak";
+
+    // ---- Historische data ophalen uit statistics ----------------
+    // We gebruiken de sensor-attributen niet voor historische data;
+    // in plaats daarvan slaan we een interne rollende maandhistorie op
+    // via _monthlyHistory (gevuld bij elke hass-update).
+    const history = this._getMonthlyHistory(isPeak ? "peak" : "solar");
+
+    if (!history || history.length === 0) {
+      canvas.style.display = "none";
+      if (noData) noData.style.display = "flex";
+      return;
+    }
+
+    canvas.style.display = "block";
+    if (noData) noData.style.display = "none";
+
+    const ctx = canvas.getContext("2d");
+    const W = canvas.offsetWidth || 600;
+    const H = canvas.offsetHeight || 200;
+    canvas.width  = W;
+    canvas.height = H;
+
+    // Kleurenpalet
+    const accentA = isPeak ? "#f57c00" : "#2e7d32";
+    const accentB = isPeak ? "#ffb74d" : "#81c784";
+    const textColor = getComputedStyle(this).getPropertyValue("--primary-text-color").trim() || "#212121";
+    const gridColor = "rgba(128,128,128,0.15)";
+    const bgColor   = getComputedStyle(this).getPropertyValue("--card-background-color").trim() || "#fff";
+
+    ctx.clearRect(0, 0, W, H);
+
+    const PAD = { top: 20, right: 16, bottom: 48, left: 52 };
+    const chartW = W - PAD.left - PAD.right;
+    const chartH = H - PAD.top - PAD.bottom;
+
+    const labels    = history.map(h => h.label);
+    const valuesA   = history.map(h => h.valueA);  // kW of kWh
+    const valuesB   = history.map(h => h.valueB);  // EUR
+
+    const maxA = Math.max(...valuesA, 0.01);
+    const maxB = Math.max(...valuesB, 0.01);
+    const N    = labels.length;
+    const groupW = chartW / N;
+    const BAR_W  = Math.max(4, Math.min(22, groupW * 0.35));
+    const GAP    = 4;
+
+    // ---- Raster ------------------------------------------------
+    ctx.strokeStyle = gridColor;
+    ctx.lineWidth   = 1;
+    const gridLines = 4;
+    for (let i = 0; i <= gridLines; i++) {
+      const y = PAD.top + (i / gridLines) * chartH;
+      ctx.beginPath();
+      ctx.moveTo(PAD.left, y);
+      ctx.lineTo(W - PAD.right, y);
+      ctx.stroke();
+
+      // Linker y-as labels (kW of kWh)
+      const valLbl = ((1 - i / gridLines) * maxA).toFixed(1);
+      ctx.fillStyle = textColor;
+      ctx.font = `11px sans-serif`;
+      ctx.textAlign = "right";
+      ctx.fillText(valLbl, PAD.left - 6, y + 4);
+    }
+
+    // Rechter y-as label (EUR)
+    ctx.save();
+    ctx.translate(W - 8, PAD.top + chartH / 2);
+    ctx.rotate(-Math.PI / 2);
+    ctx.textAlign = "center";
+    ctx.fillStyle = accentB;
+    ctx.font = "11px sans-serif";
+    ctx.fillText("€ besparing", 0, 0);
+    ctx.restore();
+
+    // ---- Balken ------------------------------------------------
+    labels.forEach((lbl, i) => {
+      const cx = PAD.left + (i + 0.5) * groupW;
+
+      // Balk A: hoofdwaarde (kW / kWh)
+      const hA = (valuesA[i] / maxA) * chartH;
+      const xA = cx - BAR_W - GAP / 2;
+      const yA = PAD.top + chartH - hA;
+      ctx.fillStyle = accentA;
+      ctx.beginPath();
+      ctx.roundRect
+        ? ctx.roundRect(xA, yA, BAR_W, hA, [3, 3, 0, 0])
+        : ctx.rect(xA, yA, BAR_W, hA);
+      ctx.fill();
+
+      // Balk B: EUR
+      const hB = (valuesB[i] / maxB) * chartH;
+      const xB = cx + GAP / 2;
+      const yB = PAD.top + chartH - hB;
+      ctx.fillStyle = accentB;
+      ctx.beginPath();
+      ctx.roundRect
+        ? ctx.roundRect(xB, yB, BAR_W, hB, [3, 3, 0, 0])
+        : ctx.rect(xB, yB, BAR_W, hB);
+      ctx.fill();
+
+      // X-as label
+      ctx.fillStyle = textColor;
+      ctx.font = "11px sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText(lbl, cx, H - PAD.bottom + 16);
+    });
+
+    // ---- Legenda -----------------------------------------------
+    const legY = H - 10;
+    const unitA = isPeak ? "kW vermeden" : "kWh verschoven";
+    ctx.fillStyle = accentA;
+    ctx.fillRect(PAD.left, legY - 8, 10, 10);
+    ctx.fillStyle = textColor;
+    ctx.font = "11px sans-serif";
+    ctx.textAlign = "left";
+    ctx.fillText(unitA, PAD.left + 14, legY);
+
+    ctx.fillStyle = accentB;
+    ctx.fillRect(PAD.left + 130, legY - 8, 10, 10);
+    ctx.fillStyle = textColor;
+    ctx.fillText("€ bespaard", PAD.left + 144, legY);
+  }
+
+  /**
+   * Bouw een rollende maandhistorie op vanuit de huidige sensorwaarden.
+   * Elke keer dat de maand verandert, wordt de vorige maand opgeslagen.
+   * Geeft maximaal 12 maanden terug.
+   */
+  _getMonthlyHistory(mode) {
+    if (!this._monthlyHistory) this._monthlyHistory = {};
+    if (!this._monthlyHistory[mode]) this._monthlyHistory[mode] = [];
+
+    const now   = new Date();
+    const month = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+    const maanden = ["jan","feb","mrt","apr","mei","jun","jul","aug","sep","okt","nov","dec"];
+    const label = `${maanden[now.getMonth()]} '${String(now.getFullYear()).slice(2)}`;
+
+    const currentA = this._sensorVal(
+      mode === "peak"
+        ? "sensor.peak_guard_peak_avoided_kw_this_month"
+        : "sensor.peak_guard_solar_verschoven_kwh_this_month",
+      3
+    ) ?? 0;
+    const currentB = this._sensorVal(
+      mode === "peak"
+        ? "sensor.peak_guard_peak_savings_euro_this_month"
+        : "sensor.peak_guard_solar_savings_euro_this_month",
+      2
+    ) ?? 0;
+
+    const hist = this._monthlyHistory[mode];
+
+    // Maandwissel detecteren: als de laatste opgeslagen maand anders is
+    if (hist.length > 0 && hist[hist.length - 1].month !== month) {
+      // Huidige waarden zijn van een nieuwe maand — vorige maand is al opgeslagen
+    }
+
+    // Actualiseer of voeg toe voor de huidige maand
+    const idx = hist.findIndex(h => h.month === month);
+    if (idx >= 0) {
+      hist[idx].valueA = currentA;
+      hist[idx].valueB = currentB;
+      hist[idx].label  = label;
+    } else {
+      hist.push({ month, label, valueA: currentA, valueB: currentB });
+      if (hist.length > 12) hist.shift();
+    }
+
+    return hist.filter(h => h.valueA > 0 || h.valueB > 0);
+  }
+
+
 }
 
 customElements.define("peak-guard-panel", PeakGuardPanel);

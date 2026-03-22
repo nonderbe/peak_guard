@@ -1,10 +1,13 @@
 import asyncio
 import logging
 from dataclasses import dataclass, asdict
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
+
+from .avoided_peak_tracker import PeakAvoidTracker, SolarShiftTracker
 
 from .const import (
     DOMAIN,
@@ -14,8 +17,12 @@ from .const import (
     CONF_PEAK_SENSOR,
     CONF_BUFFER_WATTS,
     CONF_UPDATE_INTERVAL,
+    CONF_POWER_DETECTION_TOLERANCE_PERCENT,
+    CONF_SOLAR_NETTO_EUR_PER_KWH,
     DEFAULT_BUFFER_WATTS,
     DEFAULT_UPDATE_INTERVAL,
+    DEFAULT_POWER_DETECTION_TOLERANCE_PERCENT,
+    DEFAULT_SOLAR_NETTO_EUR_PER_KWH,
     ACTION_SWITCH_OFF,
     ACTION_SWITCH_ON,
     ACTION_THROTTLE,
@@ -67,6 +74,15 @@ class PeakGuardController:
         # verwijderd zodra het apparaat volledig hersteld is.
         self._peak_snapshots: Dict[str, DeviceSnapshot] = {}
         self._inject_snapshots: Dict[str, DeviceSnapshot] = {}
+
+        # ---- Modus 1: piekbeperking --------------------------------- #
+        self.peak_tracker = PeakAvoidTracker()
+
+        # ---- Modus 2: injectiepreventie ----------------------------- #
+        self.solar_tracker = SolarShiftTracker()
+
+        # Power-drop detectie: vorig verbruik per cyclus (W)
+        self._prev_consumption: Optional[float] = None
 
     # ------------------------------------------------------------------ #
     #  Opslaan en laden                                                    #
@@ -143,6 +159,9 @@ class PeakGuardController:
             try:
                 consumption = self._sensor_value(self.config.get(CONF_CONSUMPTION_SENSOR))
                 if consumption is not None:
+                    # ---- Power-drop detectie voor avoided tracking ---- #
+                    await self._check_power_drop(consumption)
+                    # ---- Bestaande cascade logica --------------------- #
                     if consumption > 0:
                         await self._check_peak(consumption)
                         await self._check_inject_restore(consumption)
@@ -153,6 +172,10 @@ class PeakGuardController:
                         # Verbruik = 0: herstel beide cascades volledig
                         await self._check_peak_restore(0.0)
                         await self._check_inject_restore(0.0)
+                    self._prev_consumption = consumption
+                else:
+                    # Sensor onbeschikbaar: reset om valse power-drop te vermijden
+                    self._prev_consumption = None
             except Exception:
                 _LOGGER.exception("Peak Guard: fout in monitoring loop")
             await asyncio.sleep(interval)
@@ -283,6 +306,12 @@ class PeakGuardController:
                     _LOGGER.info(
                         f"Peak Guard: '{device.name}' terug ingeschakeld"
                     )
+                    # Hook 2 (peak): start duurmeting voor kW-impact
+                    self.peak_tracker.start_measurement_on_turnon(
+                        device_id=device.id,
+                        device_name=device.name,
+                        ts=datetime.now(timezone.utc),
+                    )
                 return True
 
             if device.action_type == ACTION_SWITCH_ON:
@@ -293,6 +322,11 @@ class PeakGuardController:
                     )
                     _LOGGER.info(
                         f"Peak Guard: '{device.name}' terug uitgeschakeld"
+                    )
+                    # Hook B (solar): bereken kWh-verschuiving
+                    self.solar_tracker.complete_solar_calculation(
+                        device_id=device.id,
+                        now=datetime.now(timezone.utc),
                     )
                 return True
 
@@ -358,6 +392,13 @@ class PeakGuardController:
                 "switch", "turn_off", {"entity_id": device.entity_id}, blocking=True
             )
             _LOGGER.info(f"Peak Guard: '{device.name}' uitgeschakeld (–{device.power_watts} W)")
+            # Hook 1 (peak): registreer pending avoid
+            self.peak_tracker.record_pending_avoid(
+                device_id=device.id,
+                device_name=device.name,
+                nominal_kw=device.power_watts / 1000.0,
+                ts=datetime.now(timezone.utc),
+            )
             return excess - device.power_watts
 
         if device.action_type == ACTION_SWITCH_ON and state.state == "off":
@@ -370,6 +411,13 @@ class PeakGuardController:
                 "switch", "turn_on", {"entity_id": device.entity_id}, blocking=True
             )
             _LOGGER.info(f"Peak Guard: '{device.name}' ingeschakeld (–{device.power_watts} W)")
+            # Hook A (solar): start duurmeting voor kWh-verschuiving
+            self.solar_tracker.start_solar_measurement(
+                device_id=device.id,
+                device_name=device.name,
+                nominal_kw=device.power_watts / 1000.0,
+                ts=datetime.now(timezone.utc),
+            )
             return excess - device.power_watts
 
         if device.action_type == ACTION_THROTTLE:
@@ -400,6 +448,64 @@ class PeakGuardController:
                 _LOGGER.error(f"Peak Guard: fout bij throttle '{device.name}': {err}")
 
         return excess
+
+    # ------------------------------------------------------------------ #
+    #  Power-drop detectie — Hook 3                                        #
+    # ------------------------------------------------------------------ #
+
+    async def _check_power_drop(self, consumption: float) -> None:
+        """
+        Detecteer of een apparaat NATUURLIJK gestopt is met verbruiken
+        door te controleren of het totaalverbruik significant gedaald is
+        t.o.v. de vorige cyclus.
+
+        We controleren voor elk apparaat met een actieve meting of het
+        verbruik gedaald is met ≈ nominal_power (± tolerance van 20%).
+        Bij een match wordt complete_avoided_calculation() aangeroepen.
+        Tolerantie is configureerbaar via CONF_POWER_DETECTION_TOLERANCE_PERCENT.
+        """
+        if self._prev_consumption is None:
+            return
+
+        # Power-drop detectie enkel voor piek-modus
+        # (solar-modus gebruikt hook B in _restore_device)
+        active_ids = self.peak_tracker.get_active_ids()
+        if not active_ids:
+            return
+
+        drop = self._prev_consumption - consumption   # positief = verbruik daalde
+
+        # Zoek device bij elk actief id (enkel peak_cascade)
+        all_peak_devices = {d.id: d for d in self.peak_cascade}
+
+        now = datetime.now(timezone.utc)
+        for device_id in list(active_ids):
+            device = all_peak_devices.get(device_id)
+            if device is None:
+                continue
+
+            nominal_w = float(device.power_watts)
+            if nominal_w <= 0:
+                continue
+
+            tol_pct = float(self.config.get(
+                CONF_POWER_DETECTION_TOLERANCE_PERCENT,
+                DEFAULT_POWER_DETECTION_TOLERANCE_PERCENT,
+            )) / 100.0
+            tolerance = nominal_w * tol_pct
+            if drop >= (nominal_w - tolerance):
+                _LOGGER.info(
+                    "Peak Guard: power-drop %.0f W gedetecteerd — "
+                    "natural stop '%s' (nominaal %.0f W)",
+                    drop, device.name, nominal_w,
+                )
+                # Hook 3 (peak): complete_peak_calculation
+                self.peak_tracker.complete_peak_calculation(
+                    device_id=device_id,
+                    now=now,
+                )
+                # Één apparaat per cyclus om dubbeltelling te vermijden
+                break
 
     # ------------------------------------------------------------------ #
     #  Hulpfuncties                                                        #
