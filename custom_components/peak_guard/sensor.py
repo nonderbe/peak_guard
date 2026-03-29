@@ -645,7 +645,7 @@ class PeakSavingsEuroThisYearSensor(SensorEntity):
 
 
 class PeakAvoidedEventsSensor(SensorEntity):
-    """Log van de laatste 50 piek-vermijdings-events."""
+    """Log van de laatste 100 piek-vermijdings-events."""
     _attr_should_poll = False
 
     def __init__(self, shared: SharedCapacityState, tracker: PeakAvoidTracker) -> None:
@@ -750,7 +750,7 @@ class SolarSavingsEuroThisYearSensor(SensorEntity):
 
 
 class SolarAvoidedEventsSensor(SensorEntity):
-    """Log van de laatste 50 solar-shift-events."""
+    """Log van de laatste 100 solar-shift-events."""
     _attr_should_poll = False
 
     def __init__(self, shared: SharedCapacityState, tracker: SolarShiftTracker) -> None:
@@ -1202,7 +1202,7 @@ class OverviewRecentEventsSensor(_OverviewBase):
             return iso[:16].replace("T", " ")
 
     def _build_peak_table(self) -> str:
-        events = list(self._peak.events)[-10:]
+        events = list(self._peak.events)[-100:]
         if not events:
             return "Nog geen piek-events deze maand."
         header = (
@@ -1220,7 +1220,7 @@ class OverviewRecentEventsSensor(_OverviewBase):
         return f"{header}\n{rows}"
 
     def _build_solar_table(self) -> str:
-        events = list(self._solar.events)[-10:]
+        events = list(self._solar.events)[-100:]
         if not events:
             return "Nog geen solar-events deze maand."
         header = (
@@ -1259,7 +1259,7 @@ class OverviewRecentEventsSensor(_OverviewBase):
                 "besparing": e.savings_euro,
             })
         combined.sort(key=lambda x: x["ts"], reverse=True)
-        recent = combined[:10]
+        recent = combined[:100]
         if not recent:
             return "Nog geen events deze maand."
         header = (

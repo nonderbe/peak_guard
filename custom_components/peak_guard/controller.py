@@ -44,7 +44,8 @@ class CascadeDevice:
     Velden voor EV Charger (action_type == 'ev_charger'):
       ev_switch_entity  : entity_id van de oplaadschakelaar (switch)
       ev_current_entity : entity_id van de laadstroom-number entity
-      ev_max_soc        : maximaal batterijpercentage bij zonne-overschot (0-100)
+      ev_soc_entity     : entity_id van de SOC-limiet-number entity (optioneel)
+      ev_max_soc        : gewenst maximumpercentage bij zonne-overschot (0-100)
       ev_phases         : aantal fasen (1 of 3), default 1
       min_value         : minimale laadstroom (A), default 6
       max_value         : maximale laadstroom (A), default 32
@@ -69,6 +70,7 @@ class CascadeDevice:
     # EV-specifieke velden
     ev_switch_entity:   Optional[str] = None
     ev_current_entity:  Optional[str] = None
+    ev_soc_entity:      Optional[str] = None   # number-entity voor SOC-limiet
     ev_max_soc:         Optional[int] = None
     ev_phases:          int = 1       # aantal fasen: 1 (default) of 3
 
@@ -83,6 +85,8 @@ class DeviceSnapshot:
     original_state: str
     # Extra veld voor EV: de laadstroom voor de ingreep
     original_current: Optional[float] = None
+    # Extra veld voor EV: de SOC-limiet voor de ingreep
+    original_soc: Optional[float] = None
 
 
 class PeakGuardController:
@@ -391,7 +395,9 @@ class PeakGuardController:
             if snapshot.original_state == "off":
                 if sw_state.state != "off":
                     # 1. Verwijder SOC-override EERST (vóór uitschakelen)
-                    await self._set_ev_soc_override(device, override=False)
+                    await self._set_ev_soc_override(
+                        device, override=False, original_soc=snapshot.original_soc
+                    )
 
                     # 2. Herstel laadstroom naar originele waarde (of min_a)
                     if cur_entity:
@@ -429,49 +435,53 @@ class PeakGuardController:
 
         return False
 
-    async def _set_ev_soc_override(self, device: CascadeDevice, override: bool) -> None:
+    async def _set_ev_soc_override(self, device: CascadeDevice, override: bool,
+                                    original_soc: Optional[float] = None) -> None:
         """
-        Zet of verwijder een tijdelijke SOC-limiet-override voor de EV.
+        Zet of verwijder een tijdelijke SOC-limiet via de geconfigureerde
+        ev_soc_entity (number entity).
 
         override=True  → stel ev_max_soc in als tijdelijk maximaal laadpercentage
-        override=False → herstel naar de normaal door de auto zelf beheerde waarde
-                         (dit is de waarde die in de snapshot is opgeslagen, of de
-                          auto-standaard als die onbekend is)
-
-        Implementatie: Peak Guard zoekt een number-entity waarvan de naam
-        eindigt op "_charge_limit" of "_soc_limit" in de hass.states, of
-        gebruikt ev_soc_entity als dat in de toekomst wordt toegevoegd.
-
-        Huidige implementatie: loggen als informatieve melding.
-        Integreer hier je eigen EV-specifieke service-call als je een
-        specifiek platform gebruikt (bijv. tesla_custom_integration,
-        ev_smart_charging, enige andere integratie die een SOC-limiet
-        ondersteunt).
+        override=False → herstel naar original_soc (waarde vóór de ingreep),
+                         of naar 100 als die onbekend is
         """
         if device.ev_max_soc is None:
             return  # Geen SOC-override geconfigureerd
 
-        if override:
+        soc_entity = device.ev_soc_entity
+        if not soc_entity:
+            # Geen entity geconfigureerd — enkel loggen
             _LOGGER.info(
-                "Peak Guard EV: '%s' SOC-override ACTIEF: max %.0f%% "
-                "(auto laadt tijdelijk hoger door zonne-overschot)",
-                device.name, device.ev_max_soc,
+                "Peak Guard EV: '%s' SOC-override %s (geen soc_entity geconfigureerd, "
+                "geen service-call gedaan)",
+                device.name, "ACTIEF" if override else "VERWIJDERD",
+            )
+            return
+
+        if override:
+            target_soc = float(device.ev_max_soc)
+            _LOGGER.info(
+                "Peak Guard EV: '%s' SOC-limiet ingesteld op %.0f%% via '%s'",
+                device.name, target_soc, soc_entity,
             )
         else:
+            target_soc = float(original_soc) if original_soc is not None else 100.0
             _LOGGER.info(
-                "Peak Guard EV: '%s' SOC-override VERWIJDERD: "
-                "auto keert terug naar normale laadlimiet",
-                device.name,
+                "Peak Guard EV: '%s' SOC-limiet hersteld naar %.0f%% via '%s'",
+                device.name, target_soc, soc_entity,
             )
-        # TODO: voeg hier de specifieke service-call toe voor jouw EV-platform.
-        # Voorbeeld voor Tesla (tesla_custom_integration):
-        #   await self.hass.services.async_call(
-        #       "tesla_custom", "api",
-        #       {"entity_id": device.ev_switch_entity,
-        #        "command": "CHANGE_CHARGE_LIMIT",
-        #        "parameters": {"percent": device.ev_max_soc if override else 80}},
-        #       blocking=True,
-        #   )
+
+        try:
+            await self.hass.services.async_call(
+                "number", "set_value",
+                {"entity_id": soc_entity, "value": target_soc},
+                blocking=True,
+            )
+        except Exception as err:
+            _LOGGER.error(
+                "Peak Guard EV: fout bij instellen SOC-limiet voor '%s' via '%s': %s",
+                device.name, soc_entity, err,
+            )
 
     # ------------------------------------------------------------------ #
     #  Cascade uitvoering                                                  #
@@ -645,13 +655,24 @@ class PeakGuardController:
                 except (ValueError, TypeError):
                     current_a = None
 
-        # Snapshot bij eerste ingreep (bewaar originele staat + laadstroom)
+        # Lees huidige SOC-limiet (voor herstel na ingreep)
+        current_soc: Optional[float] = None
+        if device.ev_soc_entity:
+            soc_state = self.hass.states.get(device.ev_soc_entity)
+            if soc_state is not None:
+                try:
+                    current_soc = float(soc_state.state)
+                except (ValueError, TypeError):
+                    current_soc = None
+
+        # Snapshot bij eerste ingreep (bewaar originele staat + laadstroom + SOC)
         snap_key = device.entity_id
         if snap_key not in snapshots:
             snapshots[snap_key] = DeviceSnapshot(
                 entity_id=snap_key,
                 original_state=sw_state.state,
                 original_current=current_a,
+                original_soc=current_soc,
             )
 
         # ================================================================ #
@@ -751,7 +772,6 @@ class PeakGuardController:
                 )
             # SOC-override: zet batterijlimiet tijdelijk op ev_max_soc
             await self._set_ev_soc_override(device, override=True)
-
             actual_consumption_w = start_a * volts_per_phase
             _LOGGER.info(
                 "Peak Guard EV solar: '%s' ingeschakeld op %d A "

@@ -32,7 +32,7 @@ _LOGGER = logging.getLogger(__name__)
 _QUARTER_MIN = 15
 _QUARTER_H   = _QUARTER_MIN / 60.0   # 0.25 h
 
-MAX_EVENTS = 50   # maximale loglijst per tracker
+MAX_EVENTS = 100   # maximale loglijst per tracker
 
 
 def _quarter_start(dt: datetime) -> datetime:
