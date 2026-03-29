@@ -172,10 +172,32 @@ class PeakGuardPanel extends HTMLElement {
           el.textContent = text;
           el.className = `device-status ${cls}`;
         }
-        // EV live-detail (actuele A en W)
+        // EV live-detail (actuele A en W onder de kaart)
         const evEl = this.shadowRoot.querySelector(`#ev-live-${cascadeType}-${index}`);
         if (evEl) {
           evEl.textContent = this._evLiveDetail(device);
+        }
+        // EV SoC chips live bijwerken
+        if (device.action_type === "ev_charger" && this._hass) {
+          // Chip 1: huidig max laadniveau via ev_soc_entity
+          const limEl = this.shadowRoot.querySelector(`#ev-soc-lim-${cascadeType}-${index}`);
+          if (limEl && device.ev_soc_entity) {
+            const s = this._hass.states[device.ev_soc_entity];
+            if (s && s.state !== "unavailable" && s.state !== "unknown") {
+              const v = parseFloat(s.state);
+              if (!isNaN(v)) limEl.textContent = `⬆ ${v}%`;
+            }
+          }
+          // Chip 2: huidig batterijniveau via ev_battery_entity
+          const batEl = this.shadowRoot.querySelector(`#ev-soc-bat-${cascadeType}-${index}`);
+          if (batEl && device.ev_battery_entity) {
+            const s = this._hass.states[device.ev_battery_entity];
+            if (s && s.state !== "unavailable" && s.state !== "unknown") {
+              const v = parseFloat(s.state);
+              if (!isNaN(v)) batEl.textContent = `🔋 ${v}%`;
+            }
+          }
+          // Chip 3: doel bij zon is statisch (ev_max_soc), geen live update nodig
         }
       });
     });
@@ -345,35 +367,84 @@ class PeakGuardPanel extends HTMLElement {
       const phases = device.ev_phases || 1;
       const maxA   = device.max_value ?? 32;
       const calcW  = Math.round(maxA * 230 * phases);
-      powerChip = `<span class="chip">Max ${maxA} A · ${calcW} W · ${phases}F</span>`;
+      const phaseLabel = phases === 1 ? "1-fase" : "3-fasen";
+      powerChip = `<span class="chip" title="Maximum laadstroom: ${maxA} A — Maximum vermogen: ${calcW} W (${phaseLabel}, 230 V per fase)">Max ${maxA} A · ${calcW} W · ${phases}F</span>`;
     } else {
-      powerChip = device.power_watts ? `<span class="chip">${device.power_watts} W</span>` : "";
+      powerChip = device.power_watts
+        ? `<span class="chip" title="Nominaal opgenomen vermogen van dit apparaat. Gebruikt voor de besparingsberekening.">${device.power_watts} W</span>`
+        : "";
     }
 
-    const socChip = device.action_type === "ev_charger" && device.ev_max_soc != null
-      ? `<span class="chip">SOC ${device.ev_max_soc}%${device.ev_soc_entity ? " ✓" : " (geen entity)"}</span>`
-      : "";
+    // SoC chips — drie afzonderlijke waarden, elk met eigen live-update ID en tooltip
+    let socChips = "";
+    if (device.action_type === "ev_charger") {
+
+      // Chip 1: Huidig maximaal laadniveau (live via ev_soc_entity)
+      if (device.ev_soc_entity) {
+        let limDisplay = "—";
+        if (this._hass) {
+          const s = this._hass.states[device.ev_soc_entity];
+          if (s && s.state !== "unavailable" && s.state !== "unknown") {
+            const v = parseFloat(s.state);
+            if (!isNaN(v)) limDisplay = `${v}%`;
+          }
+        }
+        socChips += `<span id="ev-soc-lim-${type}-${index}" class="chip chip-soc-lim"
+          title="Huidig ingesteld maximaal laadniveau van de batterij. Dit is de actieve limiet op dit moment — Peak Guard past deze waarde tijdelijk aan bij zonne-overschot en herstelt ze nadien automatisch."
+          >⬆ ${limDisplay}</span>`;
+      }
+
+      // Chip 2: Huidig batterijniveau (live via ev_battery_entity)
+      if (device.ev_battery_entity) {
+        let batDisplay = "—";
+        if (this._hass) {
+          const s = this._hass.states[device.ev_battery_entity];
+          if (s && s.state !== "unavailable" && s.state !== "unknown") {
+            const v = parseFloat(s.state);
+            if (!isNaN(v)) batDisplay = `${v}%`;
+          }
+        }
+        socChips += `<span id="ev-soc-bat-${type}-${index}" class="chip chip-soc-bat"
+          title="Huidig batterijniveau van het voertuig (actuele laadtoestand). Enkel weergave — Peak Guard schrijft nooit naar deze sensor."
+          >🔋 ${batDisplay}</span>`;
+      }
+
+      // Chip 3: Gewenste max SoC bij zonne-overschot (statisch, uit configuratie)
+      if (device.ev_max_soc != null) {
+        const hasEntity = !!device.ev_soc_entity;
+        socChips += `<span class="chip chip-soc-target"
+          title="Maximaal gewenst laadniveau bij overtollige zonne-energie. Peak Guard stelt de batterijlimiet tijdelijk in op dit percentage wanneer er zonne-overschot is.${hasEntity ? "" : " Koppel een SoC-limiet entiteit om dit automatisch te laten werken."}"
+          >☀ ${device.ev_max_soc}%</span>`;
+      }
+    }
+
+    const actionTitles = {
+      switch_off:  "Dit apparaat wordt tijdelijk uitgeschakeld wanneer het verbruik de maandpiek dreigt te overschrijden.",
+      switch_on:   "Dit apparaat wordt ingeschakeld bij overtollige zonne-energie om de injectie naar het net te beperken.",
+      throttle:    "Het vermogen van dit apparaat wordt verminderd via een instelbare number-entiteit (legacy modus).",
+      ev_charger:  "Elektrisch voertuig met variabele laadstroom. Peak Guard past de laadsnelheid aan op basis van beschikbaar vermogen.",
+    };
 
     return `
       <div class="device-card">
         <div class="order-col">
           <button class="btn-order" data-action="up" data-index="${index}" data-type="${type}"
             ${index === 0 ? "disabled" : ""}>▲</button>
-          <div class="priority">${index + 1}</div>
+          <div class="priority" title="Prioriteit in de cascade: apparaten met lagere nummers worden eerst ingeschakeld of uitgeschakeld.">${index + 1}</div>
           <button class="btn-order" data-action="down" data-index="${index}" data-type="${type}"
             ${index === total - 1 ? "disabled" : ""}>▼</button>
         </div>
         <div class="device-info">
           <div class="device-name-row">
             <span class="device-name">${this._esc(device.name)}</span>
-            <span id="${statusId}" class="device-status ${statusCls}">${statusText}</span>
+            <span id="${statusId}" class="device-status ${statusCls}" title="Huidige status van dit apparaat in Home Assistant.">${statusText}</span>
           </div>
           <div class="device-entity">${this._esc(device.entity_id)}</div>
           <div class="chips">
-            <span class="chip action">${labels[device.action_type] || device.action_type}</span>
+            <span class="chip action" title="${actionTitles[device.action_type] || ""}">${labels[device.action_type] || device.action_type}</span>
             ${powerChip}
-            ${socChip}
-            ${!device.enabled ? `<span class="chip disabled">Uitgeschakeld</span>` : ""}
+            ${socChips}
+            ${!device.enabled ? `<span class="chip disabled" title="Dit apparaat is uitgeschakeld en wordt door Peak Guard genegeerd.">Uitgeschakeld</span>` : ""}
           </div>
           ${device.action_type === "ev_charger"
             ? `<div id="ev-live-${type}-${index}" class="ev-live-status"></div>`
@@ -392,14 +463,21 @@ class PeakGuardPanel extends HTMLElement {
   // Geeft de live statustext en CSS-klasse terug voor een apparaat
   _deviceStatus(device) {
     if (!this._hass) return { text: "—", cls: "status-unknown" };
-    const state = this._hass.states[device.entity_id];
+
+    // Voor EV: gebruik de schakelaar-entity (ev_switch_entity), niet de primaire entity_id
+    const entityId = (device.action_type === "ev_charger" && device.ev_switch_entity)
+      ? device.ev_switch_entity
+      : device.entity_id;
+
+    const state = this._hass.states[entityId];
     if (!state || state.state === "unavailable" || state.state === "unknown" || state.state === "") {
       return { text: "onbeschikbaar", cls: "status-unknown" };
     }
+
     if (device.action_type === "ev_charger") {
-      if (state.state === "on")  return { text: "laden", cls: "status-on" };
+      // "on" = lader actief; alles anders dan "off" (charging, connected, …) = ook actief
       if (state.state === "off") return { text: "gestopt", cls: "status-off" };
-      return { text: state.state, cls: "status-unknown" };
+      return { text: "laden", cls: "status-on" };
     }
     if (device.action_type === "throttle") {
       const val = parseFloat(state.state);
@@ -413,21 +491,41 @@ class PeakGuardPanel extends HTMLElement {
     return { text: state.state, cls: "status-unknown" };
   }
 
-  // Bouwt de live EV-detailregel: actuele A en berekend W
+  // Bouwt de live EV-detailregel: actuele A, berekend W, en huidige SoC-limiet
   _evLiveDetail(device) {
     if (!this._hass || device.action_type !== "ev_charger") return "";
-    const swState = this._hass.states[device.entity_id];
-    if (!swState || swState.state !== "on") return "";
 
+    const swEntity = device.ev_switch_entity || device.entity_id;
+    const swState  = this._hass.states[swEntity];
+    if (!swState || swState.state === "off") return "";
+
+    const parts = [];
+
+    // Actuele laadstroom
     const curEntity = device.ev_current_entity;
-    if (!curEntity) return "";
-    const curState = this._hass.states[curEntity];
-    if (!curState || curState.state === "unavailable" || curState.state === "unknown") return "";
-    const currentA = parseFloat(curState.state);
-    if (isNaN(currentA)) return "";
-    const phases = device.ev_phases || 1;
-    const currentW = Math.round(currentA * 230 * phases);
-    return `${currentA} A · ${currentW} W (${phases}F)`;
+    if (curEntity) {
+      const curState = this._hass.states[curEntity];
+      if (curState && curState.state !== "unavailable" && curState.state !== "unknown") {
+        const currentA = parseFloat(curState.state);
+        if (!isNaN(currentA)) {
+          const phases   = device.ev_phases || 1;
+          const currentW = Math.round(currentA * 230 * phases);
+          parts.push(`${currentA} A · ${currentW} W`);
+        }
+      }
+    }
+
+    // Huidige SoC-limiet (de ingestelde limietwaarde, niet de actuele SoC)
+    const socEntity = device.ev_soc_entity;
+    if (socEntity) {
+      const socState = this._hass.states[socEntity];
+      if (socState && socState.state !== "unavailable" && socState.state !== "unknown") {
+        const soc = parseFloat(socState.state);
+        if (!isNaN(soc)) parts.push(`limiet: ${soc}%`);
+      }
+    }
+
+    return parts.join(" · ");
   }
 
   // ------------------------------------------------------------------ //
@@ -681,7 +779,7 @@ class PeakGuardPanel extends HTMLElement {
     } else if (step === 3) {
       bodyHTML = `
         <div class="form-group">
-          <label>SOC-limiet entiteit <span style="font-weight:400;text-transform:none;">(optioneel)</span></label>
+          <label>SoC-limiet entiteit <span style="font-weight:400;text-transform:none;">(optioneel)</span></label>
           <div class="entity-picker">
             <input id="f-ev-soc-entity" type="text"
               value="${this._esc(d.ev_soc_entity || "")}"
@@ -689,22 +787,38 @@ class PeakGuardPanel extends HTMLElement {
             <div id="ev-soc-entity-dropdown" class="entity-dropdown" style="display:none;"></div>
           </div>
           <div class="field-hint">
-            De number-entiteit (number.*) waarmee het maximale laadpercentage van de batterij instelbaar is.
-            Vul dit in als uw laadpaal of voertuig-integratie deze entiteit beschikbaar stelt —
+            De number-entiteit (number.*) waarmee het maximale laadpercentage van de batterij instelbaar is —
             bijvoorbeeld <em>number.mijn_auto_charge_limit</em>.
-            Zonder deze entiteit kan Peak Guard de SOC-limiet niet automatisch aanpassen.
+            Peak Guard leest en schrijft deze waarde automatisch bij zonne-overschot.
+            Zonder deze entiteit wordt de limiet niet automatisch aangepast.
           </div>
         </div>
 
         <div class="form-group">
-          <label>Gewenst maximumpercentage bij zonne-overschot (%)</label>
+          <label>Batterijniveau-sensor <span style="font-weight:400;text-transform:none;">(optioneel)</span></label>
+          <div class="entity-picker">
+            <input id="f-ev-battery-entity" type="text"
+              value="${this._esc(d.ev_battery_entity || "")}"
+              placeholder="sensor.mijn_auto_batterij" autocomplete="off" />
+            <div id="ev-battery-entity-dropdown" class="entity-dropdown" style="display:none;"></div>
+          </div>
+          <div class="field-hint">
+            De sensor-entiteit (sensor.*) die het huidig laadniveau van de batterij toont (in %).
+            Wordt enkel gebruikt voor weergave in het paneel — Peak Guard schrijft hier nooit naar.
+            Voorbeeld: <em>sensor.mijn_auto_battery_level</em>.
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label>Gewenst maximum bij zonne-overschot (%)</label>
           <input id="f-ev-soc" type="number" min="1" max="100"
             value="${d.ev_max_soc ?? 100}" placeholder="100" />
           <div class="field-hint">
-            Wanneer er zonne-overschot is, stelt Peak Guard de batterijlimiet tijdelijk in op dit percentage —
-            zodat de auto meer energie opneemt dan normaal. Na de laadsessie wordt de originele limiet hersteld.
+            Peak Guard stelt de SoC-limiet tijdelijk in op dit percentage wanneer er overtollig zonne-energie
+            beschikbaar is — zodat de auto meer opneemt dan normaal.
             Stel dit hoger in dan uw dagelijkse limiet (bijv. 80% normaal → 100% bij zon).
-            Dit veld heeft alleen effect als u hierboven een SOC-limiet entiteit hebt ingevuld.
+            Na de laadsessie wordt de originele limiet automatisch hersteld.
+            Dit veld heeft alleen effect als u hierboven een SoC-limiet entiteit hebt ingevuld.
           </div>
         </div>
       `;
@@ -899,7 +1013,8 @@ class PeakGuardPanel extends HTMLElement {
         });
 
       } else if (step === 3) {
-        makeEntityPicker("#f-ev-soc-entity", "#ev-soc-entity-dropdown", (id) => id.startsWith("number."));
+        makeEntityPicker("#f-ev-soc-entity",     "#ev-soc-entity-dropdown",     (id) => id.startsWith("number."));
+        makeEntityPicker("#f-ev-battery-entity", "#ev-battery-entity-dropdown", (id) => id.startsWith("sensor."));
 
         root.querySelector("#wizard-prev")?.addEventListener("click", () => {
           this._editDevice = { ...(this._editDevice || {}) };
@@ -955,8 +1070,9 @@ class PeakGuardPanel extends HTMLElement {
       // Alle EV-velden werden stap voor stap bewaard in _editDevice.
       // Stap-3 velden (SOC-entity, SOC-percentage) lezen we nu uit het formulier.
       const d        = this._editDevice || {};
-      const evSocEntity = val("#f-ev-soc-entity") || null;
-      const evSoc    = parseInt(val("#f-ev-soc")) || 100;
+      const evSocEntity    = val("#f-ev-soc-entity") || null;
+      const evBattEntity   = val("#f-ev-battery-entity") || null;
+      const evSoc          = parseInt(val("#f-ev-soc")) || 100;
       const evMaxA   = d.max_value  ?? 32;
       const evPhases = d.ev_phases  ?? 1;
       const evSwitch = d.ev_switch_entity || d.entity_id || "";
@@ -980,6 +1096,7 @@ class PeakGuardPanel extends HTMLElement {
         ev_switch_entity: evSwitch,
         ev_current_entity: d.ev_current_entity || null,
         ev_soc_entity:    evSocEntity,
+        ev_battery_entity: evBattEntity,
         ev_max_soc:       evSoc,
         ev_phases:        evPhases,
       };
@@ -1009,6 +1126,7 @@ class PeakGuardPanel extends HTMLElement {
         ev_switch_entity:  null,
         ev_current_entity: null,
         ev_soc_entity:     null,
+        ev_battery_entity: null,
         ev_max_soc:        null,
         ev_phases:         null,
       };
@@ -1270,6 +1388,9 @@ class PeakGuardPanel extends HTMLElement {
         .chip { font-size: .72em; padding: 2px 9px; border-radius: 10px; background: var(--primary-color, #03a9f4); color: #fff; font-weight: 500; }
         .chip.action { background: #fb8c00; }
         .chip.disabled { background: #9e9e9e; }
+        .chip.chip-soc-lim    { background: #5c6bc0; }   /* paars-blauw: huidige limiet */
+        .chip.chip-soc-bat    { background: #43a047; }   /* groen: huidig batterijniveau */
+        .chip.chip-soc-target { background: #f57c00; }   /* oranje: doel bij zon */
         .device-actions { display: flex; gap: 4px; }
 
         .btn {
