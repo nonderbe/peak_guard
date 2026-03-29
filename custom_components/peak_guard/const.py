@@ -14,7 +14,7 @@ CONF_POWER_DETECTION_TOLERANCE_PERCENT = "power_detection_tolerance_percent"
 CONF_SOLAR_NETTO_EUR_PER_KWH = "netto_besparing_per_kwh_verschoven"
 
 # ------------------------------------------------------------------ #
-#  Fluvius netgebieden + tarieven 2026 (€/kW/jaar, excl. BTW)         #
+#  Fluvius netgebieden + tarieven 2026 (euro/kW/jaar, excl. BTW)      #
 # ------------------------------------------------------------------ #
 
 FLUVIUS_REGIO_TARIEVEN: dict[str, float] = {
@@ -47,6 +47,11 @@ DEFAULT_UPDATE_INTERVAL = 5
 DEFAULT_POWER_DETECTION_TOLERANCE_PERCENT = 10
 DEFAULT_SOLAR_NETTO_EUR_PER_KWH = 0.25
 
+# EV Charger standaardwaarden
+DEFAULT_EV_MIN_AMPERE = 6
+DEFAULT_EV_MAX_AMPERE = 32
+DEFAULT_EV_MAX_SOC = 100   # % - maximaal batterijpercentage bij zonne-overschot
+
 # ------------------------------------------------------------------ #
 #  Panel / frontend                                                    #
 # ------------------------------------------------------------------ #
@@ -76,9 +81,10 @@ STORAGE_VERSION_SOLAR_SAVINGS = 1
 #  Cascade actietypes                                                  #
 # ------------------------------------------------------------------ #
 
-ACTION_SWITCH_OFF = "switch_off"
-ACTION_SWITCH_ON  = "switch_on"
-ACTION_THROTTLE   = "throttle"
+ACTION_SWITCH_OFF  = "switch_off"
+ACTION_SWITCH_ON   = "switch_on"
+ACTION_THROTTLE    = "throttle"      # behouden voor backwards-compat met bestaande data
+ACTION_EV_CHARGER  = "ev_charger"   # nieuw: elektrisch voertuig
 
 # ------------------------------------------------------------------ #
 #  Device-identifiers voor HA device registry                         #

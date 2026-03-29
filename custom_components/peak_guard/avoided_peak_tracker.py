@@ -134,11 +134,31 @@ class PeakAvoidTracker:
                     actual_monthly_peak: float) -> None:
         self._actual_quarters     = actual_quarters
         self._actual_monthly_peak = actual_monthly_peak
+        _LOGGER.debug(
+            "PeakAvoidTracker.set_context: %d kwartieren, maandpiek=%.3f kW",
+            len(actual_quarters), actual_monthly_peak,
+        )
 
     def set_tarief(self, tarief: float) -> None:
         self._tarief = tarief
+        _LOGGER.debug("PeakAvoidTracker.set_tarief: %.4f €/kW/jaar", tarief)
 
     def reset_month(self) -> None:
+        # Waarschuw als er nog actieve metingen lopen bij de maandwissel
+        if self._pending:
+            _LOGGER.warning(
+                "PeakAvoidTracker reset_month: %d pending meting(en) weggegooid bij maandwissel: %s",
+                len(self._pending),
+                list(self._pending.keys()),
+            )
+        if self._active:
+            _LOGGER.warning(
+                "PeakAvoidTracker reset_month: %d actieve meting(en) weggegooid bij maandwissel: %s",
+                len(self._active),
+                list(self._active.keys()),
+            )
+        self._pending.clear()
+        self._active.clear()
         self.extra_dict.clear()
         self.events.clear()
         self.avoided_kw_this_month  = 0.0
@@ -211,6 +231,12 @@ class PeakAvoidTracker:
         hypo     = self.hypothetical_monthly_peak_kw or 0.0
         avoided  = round(max(0.0, hypo - self._actual_monthly_peak), 4)
         savings  = round(max(0.0, hypo - self._actual_monthly_peak) * self._tarief / 12.0, 4)
+
+        _LOGGER.debug(
+            "PeakAvoidTracker.complete_peak_calculation '%s': "
+            "hypo=%.3f kW, actual=%.3f kW, avoided=%.4f kW, tarief=%.4f, savings=€%.4f",
+            meas.device_name, hypo, self._actual_monthly_peak, avoided, self._tarief, savings,
+        )
 
         self.avoided_kw_this_month   = round(self.avoided_kw_this_month + avoided, 4)
         self.savings_euro_this_month  = round(self.savings_euro_this_month + savings, 4)
@@ -294,8 +320,16 @@ class SolarShiftTracker:
 
     def set_netto_eur_per_kwh(self, value: float) -> None:
         self._netto_eur_per_kwh = value
+        _LOGGER.debug("SolarShiftTracker.set_netto_eur_per_kwh: %.4f €/kWh", value)
 
     def reset_month(self) -> None:
+        if self._active:
+            _LOGGER.warning(
+                "SolarShiftTracker reset_month: %d actieve meting(en) weggegooid bij maandwissel: %s",
+                len(self._active),
+                list(self._active.keys()),
+            )
+        self._active.clear()
         self.events.clear()
         self.shifted_kwh_this_month  = 0.0
         self.savings_euro_this_month = 0.0

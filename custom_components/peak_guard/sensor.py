@@ -585,6 +585,7 @@ class PeakAvoidedKwThisMonthSensor(SensorEntity):
         self._shared = shared; self._tracker = tracker
         self._attr_unique_id = f"{DOMAIN}_peak_avoided_kw_this_month"
         self._attr_name = "Peak Guard Vermeden Piek Deze Maand"
+        self.entity_id = f"sensor.{DOMAIN}_peak_avoided_kw_this_month"
         self._attr_native_unit_of_measurement = "kW"
         self._attr_device_class = SensorDeviceClass.POWER
         self._attr_state_class  = SensorStateClass.MEASUREMENT
@@ -604,6 +605,7 @@ class PeakSavingsEuroThisMonthSensor(SensorEntity):
         self._shared = shared; self._tracker = tracker
         self._attr_unique_id = f"{DOMAIN}_peak_savings_euro_this_month"
         self._attr_name = "Peak Guard Piek Besparing Deze Maand"
+        self.entity_id = f"sensor.{DOMAIN}_peak_savings_euro_this_month"
         self._attr_native_unit_of_measurement = "EUR"
         self._attr_device_class = SensorDeviceClass.MONETARY
         self._attr_state_class  = SensorStateClass.TOTAL
@@ -630,6 +632,7 @@ class PeakSavingsEuroThisYearSensor(SensorEntity):
         self._shared = shared; self._tracker = tracker
         self._attr_unique_id = f"{DOMAIN}_peak_savings_euro_this_year"
         self._attr_name = "Peak Guard Piek Besparing Dit Jaar"
+        self.entity_id = f"sensor.{DOMAIN}_peak_savings_euro_this_year"
         self._attr_native_unit_of_measurement = "EUR"
         self._attr_device_class = SensorDeviceClass.MONETARY
         self._attr_state_class  = SensorStateClass.TOTAL
@@ -649,6 +652,7 @@ class PeakAvoidedEventsSensor(SensorEntity):
         self._shared = shared; self._tracker = tracker
         self._attr_unique_id = f"{DOMAIN}_peak_avoided_events"
         self._attr_name = "Peak Guard Piek Events Log"
+        self.entity_id = f"sensor.{DOMAIN}_peak_avoided_events"
         self._attr_native_unit_of_measurement = "events"
         self._attr_state_class = SensorStateClass.MEASUREMENT
         self._attr_icon = "mdi:format-list-bulleted-type"
@@ -686,6 +690,7 @@ class SolarShiftedKwhThisMonthSensor(SensorEntity):
         self._shared = shared; self._tracker = tracker
         self._attr_unique_id = f"{DOMAIN}_solar_verschoven_kwh_this_month"
         self._attr_name = "Peak Guard Solar Verschoven kWh Deze Maand"
+        self.entity_id = f"sensor.{DOMAIN}_solar_verschoven_kwh_this_month"
         self._attr_native_unit_of_measurement = "kWh"
         self._attr_device_class = SensorDeviceClass.ENERGY
         self._attr_state_class  = SensorStateClass.TOTAL_INCREASING
@@ -705,6 +710,7 @@ class SolarSavingsEuroThisMonthSensor(SensorEntity):
         self._shared = shared; self._tracker = tracker
         self._attr_unique_id = f"{DOMAIN}_solar_savings_euro_this_month"
         self._attr_name = "Peak Guard Solar Besparing Deze Maand"
+        self.entity_id = f"sensor.{DOMAIN}_solar_savings_euro_this_month"
         self._attr_native_unit_of_measurement = "EUR"
         self._attr_device_class = SensorDeviceClass.MONETARY
         self._attr_state_class  = SensorStateClass.TOTAL
@@ -731,6 +737,7 @@ class SolarSavingsEuroThisYearSensor(SensorEntity):
         self._shared = shared; self._tracker = tracker
         self._attr_unique_id = f"{DOMAIN}_solar_savings_euro_this_year"
         self._attr_name = "Peak Guard Solar Besparing Dit Jaar"
+        self.entity_id = f"sensor.{DOMAIN}_solar_savings_euro_this_year"
         self._attr_native_unit_of_measurement = "EUR"
         self._attr_device_class = SensorDeviceClass.MONETARY
         self._attr_state_class  = SensorStateClass.TOTAL
@@ -750,6 +757,7 @@ class SolarAvoidedEventsSensor(SensorEntity):
         self._shared = shared; self._tracker = tracker
         self._attr_unique_id = f"{DOMAIN}_solar_avoided_events"
         self._attr_name = "Peak Guard Solar Events Log"
+        self.entity_id = f"sensor.{DOMAIN}_solar_avoided_events"
         self._attr_native_unit_of_measurement = "events"
         self._attr_state_class = SensorStateClass.MEASUREMENT
         self._attr_icon = "mdi:format-list-bulleted-type"
@@ -883,6 +891,7 @@ class _OverviewBase(SensorEntity, RestoreEntity):
 
     async def _restore_from_state(self, last_state) -> None:
         """Override in subklassen om specifieke restore-logica toe te voegen."""
+        pass
 
 
 # ------------------------------------------------------------------ #
