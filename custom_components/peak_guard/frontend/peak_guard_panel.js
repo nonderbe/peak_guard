@@ -161,15 +161,22 @@ class PeakGuardPanel extends HTMLElement {
       isInjecting ? "warning" : "ok"
     );
 
-    // Update live statusbadges van alle apparaten in beide cascades
+    // Update live statusbadges en EV-details van alle apparaten in beide cascades
     ["peak", "inject"].forEach((cascadeType) => {
       const devices = this._data?.[cascadeType] || [];
       devices.forEach((device, index) => {
+        // Status badge (aan/uit/laden/gestopt)
         const el = this.shadowRoot.querySelector(`#device-status-${cascadeType}-${index}`);
-        if (!el) return;
-        const { text, cls } = this._deviceStatus(device);
-        el.textContent = text;
-        el.className = `device-status ${cls}`;
+        if (el) {
+          const { text, cls } = this._deviceStatus(device);
+          el.textContent = text;
+          el.className = `device-status ${cls}`;
+        }
+        // EV live-detail (actuele A en W)
+        const evEl = this.shadowRoot.querySelector(`#ev-live-${cascadeType}-${index}`);
+        if (evEl) {
+          evEl.textContent = this._evLiveDetail(device);
+        }
       });
     });
   }
@@ -368,6 +375,9 @@ class PeakGuardPanel extends HTMLElement {
             ${socChip}
             ${!device.enabled ? `<span class="chip disabled">Uitgeschakeld</span>` : ""}
           </div>
+          ${device.action_type === "ev_charger"
+            ? `<div id="ev-live-${type}-${index}" class="ev-live-status"></div>`
+            : ""}
         </div>
         <div class="device-actions">
           <button class="btn-icon" data-action="edit"
@@ -386,6 +396,11 @@ class PeakGuardPanel extends HTMLElement {
     if (!state || state.state === "unavailable" || state.state === "unknown" || state.state === "") {
       return { text: "onbeschikbaar", cls: "status-unknown" };
     }
+    if (device.action_type === "ev_charger") {
+      if (state.state === "on")  return { text: "laden", cls: "status-on" };
+      if (state.state === "off") return { text: "gestopt", cls: "status-off" };
+      return { text: state.state, cls: "status-unknown" };
+    }
     if (device.action_type === "throttle") {
       const val = parseFloat(state.state);
       const unit = state.attributes?.unit_of_measurement || "A";
@@ -396,6 +411,23 @@ class PeakGuardPanel extends HTMLElement {
     if (state.state === "on") return { text: "aan", cls: "status-on" };
     if (state.state === "off") return { text: "uit", cls: "status-off" };
     return { text: state.state, cls: "status-unknown" };
+  }
+
+  // Bouwt de live EV-detailregel: actuele A en berekend W
+  _evLiveDetail(device) {
+    if (!this._hass || device.action_type !== "ev_charger") return "";
+    const swState = this._hass.states[device.entity_id];
+    if (!swState || swState.state !== "on") return "";
+
+    const curEntity = device.ev_current_entity;
+    if (!curEntity) return "";
+    const curState = this._hass.states[curEntity];
+    if (!curState || curState.state === "unavailable" || curState.state === "unknown") return "";
+    const currentA = parseFloat(curState.state);
+    if (isNaN(currentA)) return "";
+    const phases = device.ev_phases || 1;
+    const currentW = Math.round(currentA * 230 * phases);
+    return `${currentA} A · ${currentW} W (${phases}F)`;
   }
 
   // ------------------------------------------------------------------ //
@@ -1229,6 +1261,11 @@ class PeakGuardPanel extends HTMLElement {
         .status-throttle { background: #e3f2fd; color: #1565c0; }
         .status-unknown { background: #fafafa; color: #bdbdbd; border: 1px solid #e0e0e0; }
         .device-entity { font-size: .78em; color: var(--secondary-text-color, #9e9e9e); margin: 0 0 6px; word-break: break-all; }
+        .ev-live-status {
+          font-size: .78em; font-family: monospace;
+          color: var(--primary-color, #03a9f4);
+          margin-top: 4px; min-height: 1em;
+        }
         .chips { display: flex; flex-wrap: wrap; gap: 6px; }
         .chip { font-size: .72em; padding: 2px 9px; border-radius: 10px; background: var(--primary-color, #03a9f4); color: #fff; font-weight: 500; }
         .chip.action { background: #fb8c00; }
