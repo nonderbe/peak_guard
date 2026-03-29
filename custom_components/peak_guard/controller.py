@@ -290,12 +290,30 @@ class PeakGuardController:
                     await self.hass.services.async_call(
                         "switch", "turn_on", {"entity_id": device.entity_id}, blocking=True
                     )
-                    _LOGGER.info("Peak Guard: '%s' terug ingeschakeld", device.name)
+                    _LOGGER.info(
+                        "Peak Guard: '%s' terug ingeschakeld na piekbeperking "
+                        "(originele staat: %s)",
+                        device.name, snapshot.original_state,
+                    )
                     self.peak_tracker.start_measurement_on_turnon(
                         device_id=device.id,
                         device_name=device.name,
                         ts=datetime.now(timezone.utc),
                     )
+                elif snapshot.original_state == "on" and state.state == "on":
+                    # Apparaat al terug aan (bv. handmatig hersteld of al in meting):
+                    # sluit eventuele lopende meting af als event
+                    now_ts = datetime.now(timezone.utc)
+                    event = self.peak_tracker.complete_peak_calculation(
+                        device_id=device.id, now=now_ts
+                    )
+                    if event:
+                        _LOGGER.info(
+                            "Peak Guard: piek-event afgerond voor '%s' — "
+                            "duur=%.1f min, vermeden=%.3f kW, besparing=€%.4f",
+                            device.name, event.measured_duration_min,
+                            event.avoided_peak_kw, event.savings_euro,
+                        )
                 return True
 
             if device.action_type == ACTION_SWITCH_ON:
@@ -303,11 +321,21 @@ class PeakGuardController:
                     await self.hass.services.async_call(
                         "switch", "turn_off", {"entity_id": device.entity_id}, blocking=True
                     )
-                    _LOGGER.info("Peak Guard: '%s' terug uitgeschakeld", device.name)
-                    self.solar_tracker.complete_solar_calculation(
+                    _LOGGER.info(
+                        "Peak Guard: '%s' terug uitgeschakeld na injectiepreventie",
+                        device.name,
+                    )
+                    event = self.solar_tracker.complete_solar_calculation(
                         device_id=device.id,
                         now=datetime.now(timezone.utc),
                     )
+                    if event:
+                        _LOGGER.info(
+                            "Peak Guard: solar-event afgerond voor '%s' — "
+                            "duur=%.1f min, verschoven=%.4f kWh, besparing=€%.4f",
+                            device.name, event.measured_duration_min,
+                            event.shifted_kwh, event.savings_euro,
+                        )
                 return True
 
             if device.action_type == ACTION_THROTTLE:
@@ -423,10 +451,17 @@ class PeakGuardController:
                     _LOGGER.info("Peak Guard EV solar: '%s' schakelaar uitgeschakeld", device.name)
 
                     # 4. Voltooi solar-meting (berekent verschoven kWh)
-                    self.solar_tracker.complete_solar_calculation(
+                    ev_event = self.solar_tracker.complete_solar_calculation(
                         device_id=device.id,
                         now=datetime.now(timezone.utc),
                     )
+                    if ev_event:
+                        _LOGGER.info(
+                            "Peak Guard EV solar: event afgerond voor '%s' — "
+                            "duur=%.1f min, verschoven=%.4f kWh, besparing=€%.4f",
+                            device.name, ev_event.measured_duration_min,
+                            ev_event.shifted_kwh, ev_event.savings_euro,
+                        )
                 return True
 
         except (ValueError, TypeError) as err:
@@ -837,10 +872,20 @@ class PeakGuardController:
             tolerance = nominal_w * tol_pct
             if drop >= (nominal_w - tolerance):
                 _LOGGER.info(
-                    "Peak Guard: power-drop %.0f W — natural stop '%s' (nominaal %.0f W)",
-                    drop, device.name, nominal_w,
+                    "Peak Guard: power-drop %.0f W gedetecteerd — naturlijke stop '%s' "
+                    "(nominaal %.0f W, tolerantie %.0f W)",
+                    drop, device.name, nominal_w, tolerance,
                 )
-                self.peak_tracker.complete_peak_calculation(device_id=device_id, now=now)
+                event = self.peak_tracker.complete_peak_calculation(
+                    device_id=device_id, now=now
+                )
+                if event:
+                    _LOGGER.info(
+                        "Peak Guard: piek-event afgerond voor '%s' via power-drop — "
+                        "duur=%.1f min, vermeden=%.3f kW, besparing=€%.4f",
+                        device.name, event.measured_duration_min,
+                        event.avoided_peak_kw, event.savings_euro,
+                    )
                 break
 
     # ------------------------------------------------------------------ #

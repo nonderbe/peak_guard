@@ -59,6 +59,11 @@ _LOGGER = logging.getLogger(__name__)
 # Sensorupdate-interval: elke minuut
 _UPDATE_INTERVAL = timedelta(minutes=1)
 
+# Persistente opslag voor events en maandstatistieken
+_STORAGE_KEY_PEAK_STATE   = f"peak_guard.peak_state"
+_STORAGE_KEY_SOLAR_STATE  = f"peak_guard.solar_state"
+_STORAGE_VERSION_STATE    = 1
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -117,6 +122,72 @@ async def async_setup_entry(
                 solar_saved.get("savings_euro_this_year", 0.0)
             )
 
+    # Laad persistente events en maandstatistieken — piek
+    peak_state_store = Store(hass, _STORAGE_VERSION_STATE, _STORAGE_KEY_PEAK_STATE)
+    peak_state = await peak_state_store.async_load()
+    if peak_state:
+        current_month = datetime.now(timezone.utc).month
+        current_year  = datetime.now(timezone.utc).year
+        if (peak_state.get("year") == current_year
+                and peak_state.get("month") == current_month):
+            peak_tracker.avoided_kw_this_month   = float(peak_state.get("avoided_kw_this_month", 0.0))
+            peak_tracker.savings_euro_this_month  = float(peak_state.get("savings_euro_this_month", 0.0))
+            # Herstel events
+            from .avoided_peak_tracker import PeakEvent
+            from dataclasses import fields
+            for ev_dict in peak_state.get("events", []):
+                try:
+                    ev = PeakEvent(
+                        device_id=ev_dict["device_id"],
+                        device_name=ev_dict["device_name"],
+                        nominal_kw=float(ev_dict["nominal_kw"]),
+                        avoid_ts=datetime.fromisoformat(ev_dict["avoid_ts"]),
+                        turnon_ts=datetime.fromisoformat(ev_dict["turnon_ts"]),
+                        natural_stop_ts=datetime.fromisoformat(ev_dict["natural_stop_ts"]),
+                        measured_duration_min=float(ev_dict["measured_duration_min"]),
+                        added_energy_kwh=float(ev_dict["added_energy_kwh"]),
+                        avoided_peak_kw=float(ev_dict["avoided_peak_kw"]),
+                        savings_euro=float(ev_dict["savings_euro"]),
+                    )
+                    peak_tracker.events.append(ev)
+                except (KeyError, ValueError):
+                    pass
+            _LOGGER.info(
+                "Peak Guard: %d piek-events hersteld vanuit opslag",
+                len(peak_tracker.events),
+            )
+
+    # Laad persistente events en maandstatistieken — solar
+    solar_state_store = Store(hass, _STORAGE_VERSION_STATE, _STORAGE_KEY_SOLAR_STATE)
+    solar_state = await solar_state_store.async_load()
+    if solar_state:
+        current_month = datetime.now(timezone.utc).month
+        current_year  = datetime.now(timezone.utc).year
+        if (solar_state.get("year") == current_year
+                and solar_state.get("month") == current_month):
+            solar_tracker.shifted_kwh_this_month  = float(solar_state.get("shifted_kwh_this_month", 0.0))
+            solar_tracker.savings_euro_this_month = float(solar_state.get("savings_euro_this_month", 0.0))
+            from .avoided_peak_tracker import SolarEvent
+            for ev_dict in solar_state.get("events", []):
+                try:
+                    ev = SolarEvent(
+                        device_id=ev_dict["device_id"],
+                        device_name=ev_dict["device_name"],
+                        nominal_kw=float(ev_dict["nominal_kw"]),
+                        turnon_ts=datetime.fromisoformat(ev_dict["turnon_ts"]),
+                        restore_ts=datetime.fromisoformat(ev_dict["restore_ts"]),
+                        measured_duration_min=float(ev_dict["measured_duration_min"]),
+                        shifted_kwh=float(ev_dict["shifted_kwh"]),
+                        savings_euro=float(ev_dict["savings_euro"]),
+                    )
+                    solar_tracker.events.append(ev)
+                except (KeyError, ValueError):
+                    pass
+            _LOGGER.info(
+                "Peak Guard: %d solar-events hersteld vanuit opslag",
+                len(solar_tracker.events),
+            )
+
     entities = [
         # ---- Capaciteitstarief-sensoren (ongewijzigd) ----------------
         QuarterPeakSensor(shared),
@@ -156,6 +227,8 @@ async def async_setup_entry(
     shared.set_solar_tracker(solar_tracker)
     shared.set_savings_store(savings_store)
     shared.set_solar_savings_store(solar_savings_store)
+    shared.set_peak_state_store(peak_state_store)
+    shared.set_solar_state_store(solar_state_store)
     await shared.async_start(entities)
 
 
@@ -197,8 +270,14 @@ class SharedCapacityState:
         self._current_year:  Optional[int] = None
         self._savings_store = None
         self._solar_savings_store = None
-        self._last_persisted_peak_savings:  float = 0.0
-        self._last_persisted_solar_savings: float = 0.0
+        self._peak_state_store = None
+        self._solar_state_store = None
+        self._last_persisted_peak_savings:       float = 0.0
+        self._last_persisted_solar_savings:      float = 0.0
+        self._last_peak_events_count:            int   = -1
+        self._last_solar_events_count:           int   = -1
+        self._last_persisted_peak_month_savings: float = -1.0
+        self._last_persisted_solar_month_savings:float = -1.0
 
     async def async_start(self, entities: list) -> None:
         """Registreer listeners en start de minuut-timer."""
@@ -221,6 +300,12 @@ class SharedCapacityState:
 
     def set_solar_savings_store(self, store) -> None:
         self._solar_savings_store = store
+
+    def set_peak_state_store(self, store) -> None:
+        self._peak_state_store = store
+
+    def set_solar_state_store(self, store) -> None:
+        self._solar_state_store = store
 
     def stop(self) -> None:
         """Stop de timer (bij unload)."""
@@ -280,6 +365,11 @@ class SharedCapacityState:
                 self._peak_tracker.reset_month()
             if self._solar_tracker:
                 self._solar_tracker.reset_month()
+            # Forceer persist van de lege staat voor de nieuwe maand
+            self._last_peak_events_count            = -1
+            self._last_solar_events_count           = -1
+            self._last_persisted_peak_month_savings = -1.0
+            self._last_persisted_solar_month_savings= -1.0
             _LOGGER.info("Peak Guard: nieuwe maand — trackers gereset")
         self._current_month = current_month
 
@@ -312,6 +402,64 @@ class SharedCapacityState:
                     "year": now.year, "savings_euro_this_year": val,
                 })
                 self._last_persisted_solar_savings = val
+
+        # Persist piek-events en maandstatistieken bij wijziging
+        if self._peak_tracker and self._peak_state_store:
+            n   = len(self._peak_tracker.events)
+            msv = self._peak_tracker.savings_euro_this_month
+            if n != self._last_peak_events_count or msv != self._last_persisted_peak_month_savings:
+                events_data = [
+                    {
+                        "device_id":            e.device_id,
+                        "device_name":          e.device_name,
+                        "nominal_kw":           e.nominal_kw,
+                        "avoid_ts":             e.avoid_ts.isoformat(),
+                        "turnon_ts":            e.turnon_ts.isoformat(),
+                        "natural_stop_ts":      e.natural_stop_ts.isoformat(),
+                        "measured_duration_min": e.measured_duration_min,
+                        "added_energy_kwh":     e.added_energy_kwh,
+                        "avoided_peak_kw":      e.avoided_peak_kw,
+                        "savings_euro":         e.savings_euro,
+                    }
+                    for e in self._peak_tracker.events
+                ]
+                await self._peak_state_store.async_save({
+                    "year":                  now.year,
+                    "month":                 now.month,
+                    "avoided_kw_this_month": self._peak_tracker.avoided_kw_this_month,
+                    "savings_euro_this_month": msv,
+                    "events":                events_data,
+                })
+                self._last_peak_events_count            = n
+                self._last_persisted_peak_month_savings = msv
+
+        # Persist solar-events en maandstatistieken bij wijziging
+        if self._solar_tracker and self._solar_state_store:
+            n   = len(self._solar_tracker.events)
+            msv = self._solar_tracker.savings_euro_this_month
+            if n != self._last_solar_events_count or msv != self._last_persisted_solar_month_savings:
+                events_data = [
+                    {
+                        "device_id":            e.device_id,
+                        "device_name":          e.device_name,
+                        "nominal_kw":           e.nominal_kw,
+                        "turnon_ts":            e.turnon_ts.isoformat(),
+                        "restore_ts":           e.restore_ts.isoformat(),
+                        "measured_duration_min": e.measured_duration_min,
+                        "shifted_kwh":          e.shifted_kwh,
+                        "savings_euro":         e.savings_euro,
+                    }
+                    for e in self._solar_tracker.events
+                ]
+                await self._solar_state_store.async_save({
+                    "year":                   now.year,
+                    "month":                  now.month,
+                    "shifted_kwh_this_month": self._solar_tracker.shifted_kwh_this_month,
+                    "savings_euro_this_month": msv,
+                    "events":                 events_data,
+                })
+                self._last_solar_events_count            = n
+                self._last_persisted_solar_month_savings = msv
 
         # Alle sensoren laten weten dat ze kunnen updaten
         for entity in self._listeners:
