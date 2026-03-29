@@ -45,6 +45,7 @@ class CascadeDevice:
       ev_switch_entity  : entity_id van de oplaadschakelaar (switch)
       ev_current_entity : entity_id van de laadstroom-number entity
       ev_soc_entity     : entity_id van de SOC-limiet-number entity (optioneel)
+      ev_battery_entity : entity_id van de sensor die het huidig batterijniveau toont (optioneel)
       ev_max_soc        : gewenst maximumpercentage bij zonne-overschot (0-100)
       ev_phases         : aantal fasen (1 of 3), default 1
       min_value         : minimale laadstroom (A), default 6
@@ -71,6 +72,7 @@ class CascadeDevice:
     ev_switch_entity:   Optional[str] = None
     ev_current_entity:  Optional[str] = None
     ev_soc_entity:      Optional[str] = None   # number-entity voor SOC-limiet
+    ev_battery_entity:  Optional[str] = None   # sensor-entity voor huidig batterijniveau
     ev_max_soc:         Optional[int] = None
     ev_phases:          int = 1       # aantal fasen: 1 (default) of 3
 
