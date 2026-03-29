@@ -6,6 +6,7 @@ class PeakGuardPanel extends HTMLElement {
     this._data = null;
     this._activeTab = "peak";
     this._savingsChart = "peak";  // welke grafiek zichtbaar in savings-tab
+    this._evMode = false;          // houdt bij of de modal in EV-modus staat
     this._editDevice = null;
     this._editCascadeType = "peak";
     this._lastStatusUpdate = 0;
@@ -13,6 +14,9 @@ class PeakGuardPanel extends HTMLElement {
     // De modal leeft als een persistente DOM-node, buiten de render-cyclus
     this._modalEl = null;
     this._modalVisible = false;
+
+    // Debug logger
+    this._log = (msg, ...args) => console.log(`[PeakGuard DEBUG] ${msg}`, ...args);
   }
 
   // ------------------------------------------------------------------ //
@@ -35,15 +39,15 @@ class PeakGuardPanel extends HTMLElement {
     if (!this._data) {
       // Voorkom parallelle fetches terwijl de eerste nog bezig is
       if (this._fetchInProgress) {
-        console.log('[PeakGuard DEBUG] hass setter: fetch al bezig, overgeslagen');
+        this._log('hass setter: fetch al bezig, overgeslagen');
         return;
       }
-      console.log('[PeakGuard DEBUG] hass setter: _data=null => _fetchData(). modalVisible=' + this._modalVisible);
+      this._log('hass setter: _data=null => _fetchData(). modalVisible=' + this._modalVisible);
       this._fetchData();
       return;
     }
     if (this._modalVisible) {
-      console.log('[PeakGuard DEBUG] hass setter: modal open, geblokkeerd OK');
+      this._log('hass setter: modal open, geblokkeerd OK');
       return;
     }
     const now = Date.now();
@@ -58,18 +62,18 @@ class PeakGuardPanel extends HTMLElement {
   // ------------------------------------------------------------------ //
 
   async _fetchData() {
-    console.log('[PeakGuard DEBUG] _fetchData() gestart. modalVisible=' + this._modalVisible);
+    this._log('_fetchData() gestart. modalVisible=' + this._modalVisible);
     this._fetchInProgress = true;
     try {
       const resp = await this._hass.fetchWithAuth("/api/peak_guard/cascade");
       if (resp.ok) {
         this._data = await resp.json();
-        console.log('[PeakGuard DEBUG] _fetchData() data ontvangen. modalVisible=' + this._modalVisible);
+        this._log('_fetchData() data ontvangen. modalVisible=' + this._modalVisible);
         if (!this._modalVisible) {
-          console.log('[PeakGuard DEBUG] _fetchData() => _render() aanroepen');
+          this._log('_fetchData() => _render() aanroepen');
           this._render();
         } else {
-          console.log('[PeakGuard DEBUG] _fetchData() => render GEBLOKKEERD (modal open) OK');
+          this._log('_fetchData() => render GEBLOKKEERD (modal open) OK');
         }
       } else {
         this._renderError(`API fout: ${resp.status}`);
@@ -158,7 +162,7 @@ class PeakGuardPanel extends HTMLElement {
   // ------------------------------------------------------------------ //
 
   _render() {
-    console.log("[PeakGuard DEBUG] _render() aangeroepen. modalVisible=" + this._modalVisible);
+    this._log("_render() aangeroepen. modalVisible=" + this._modalVisible);
     if (!this._data) return;
 
     // Bewaar de modal-node zodat innerHTML hem niet vernietigt
@@ -301,14 +305,26 @@ class PeakGuardPanel extends HTMLElement {
 
   _renderDeviceCard(device, index, total, type) {
     const labels = {
-      switch_off: "Uitschakelen",
-      switch_on: "Inschakelen",
-      throttle: "Vermogen verminderen",
+      switch_off:  "Uitschakelen",
+      switch_on:   "Inschakelen",
+      throttle:    "Vermogen verminderen",
+      ev_charger:  "EV Charger",
     };
 
     const { text: statusText, cls: statusCls } = this._deviceStatus(device);
     // Unieke ID voor de live status badge zodat _updateLiveStatus hem kan vinden
     const statusId = `device-status-${type}-${index}`;
+
+    // Vermogenschip: voor EV dynamisch berekend, voor andere types opgeslagen power_watts
+    let powerChip;
+    if (device.action_type === "ev_charger") {
+      const phases = device.ev_phases || 1;
+      const maxA   = device.max_value ?? 32;
+      const calcW  = Math.round(maxA * 230 * phases);
+      powerChip = `<span class="chip">Max ${maxA} A · ${calcW} W · ${phases}F</span>`;
+    } else {
+      powerChip = device.power_watts ? `<span class="chip">${device.power_watts} W</span>` : "";
+    }
 
     return `
       <div class="device-card">
@@ -321,14 +337,15 @@ class PeakGuardPanel extends HTMLElement {
         </div>
         <div class="device-info">
           <div class="device-name-row">
-            <span class="device-name">${device.name}</span>
+            <span class="device-name">${this._esc(device.name)}</span>
             <span id="${statusId}" class="device-status ${statusCls}">${statusText}</span>
           </div>
-          <div class="device-entity">${device.entity_id}</div>
+          <div class="device-entity">${this._esc(device.entity_id)}</div>
           <div class="chips">
             <span class="chip action">${labels[device.action_type] || device.action_type}</span>
-            ${device.power_watts ? `<span class="chip">${device.power_watts} W</span>` : ""}
-            ${device.max_value != null ? `<span class="chip">Max ${device.max_value} A</span>` : ""}
+            ${powerChip}
+            ${device.action_type === "ev_charger" && device.ev_max_soc != null
+              ? `<span class="chip">SOC ${device.ev_max_soc}%</span>` : ""}
             ${!device.enabled ? `<span class="chip disabled">Uitgeschakeld</span>` : ""}
           </div>
         </div>
@@ -366,7 +383,7 @@ class PeakGuardPanel extends HTMLElement {
   // ------------------------------------------------------------------ //
 
   _openModal(device, cascadeType) {
-    console.log("[PeakGuard DEBUG] _openModal() aangeroepen. type=" + cascadeType);
+    this._log("_openModal() aangeroepen. type=" + cascadeType);
     this._editDevice = device || null;
     this._editCascadeType = cascadeType;
     this._modalVisible = true;
@@ -390,7 +407,9 @@ class PeakGuardPanel extends HTMLElement {
     }
 
     const d = this._editDevice || {};
+    const isEV       = d.action_type === "ev_charger";
     const isThrottle = d.action_type === "throttle";
+    this._evMode = isEV;
 
     // innerHTML van de modal-node instellen (niet van de shadow root!)
     this._modalEl.innerHTML = `
@@ -400,48 +419,134 @@ class PeakGuardPanel extends HTMLElement {
         <div class="form-group">
           <label>Naam</label>
           <input id="f-name" type="text" value="${this._esc(d.name || "")}"
-            placeholder="bijv. Keukenboiler" autocomplete="off" />
+            placeholder="bijv. Mijn Laadpaal" autocomplete="off" />
         </div>
 
         <div class="form-group">
-          <label>Entity ID</label>
-          <div class="entity-picker">
-            <input id="f-entity" type="text" value="${this._esc(d.entity_id || "")}"
-              placeholder="Zoek op naam of entity ID..." autocomplete="off" />
-            <div id="entity-dropdown" class="entity-dropdown" style="display:none;"></div>
-          </div>
-        </div>
-
-        <div class="form-group">
-          <label>Actie</label>
+          <label>Type apparaat</label>
           <select id="f-action">
-            <option value="switch_off" ${d.action_type === "switch_off" ? "selected" : ""}>Uitschakelen (switch)</option>
-            <option value="switch_on"  ${d.action_type === "switch_on"  ? "selected" : ""}>Inschakelen (switch)</option>
-            <option value="throttle"   ${d.action_type === "throttle"   ? "selected" : ""}>Vermogen verminderen (number)</option>
+            <option value="switch_off"  ${d.action_type === "switch_off"  ? "selected" : ""}>Uitschakelen (switch)</option>
+            <option value="switch_on"   ${d.action_type === "switch_on"   ? "selected" : ""}>Inschakelen bij zonne-overschot (switch)</option>
+            <option value="ev_charger"  ${d.action_type === "ev_charger"  ? "selected" : ""}>Elektrisch Voertuig (EV Charger)</option>
+            <option value="throttle"    ${d.action_type === "throttle"    ? "selected" : ""}>Vermogen verminderen — legacy (number)</option>
           </select>
         </div>
 
-        <div class="form-group">
-          <label>Nominaal vermogen (W)</label>
-          <input id="f-power" type="number" min="0" value="${d.power_watts || 0}" placeholder="bijv. 2000" />
+        <!-- Nominaal vermogen: alleen voor switch_off / switch_on / throttle, niet voor EV -->
+        <div id="power-field" ${isEV ? 'style="display:none"' : ""}>
+          <div class="form-group">
+            <label>Nominaal vermogen (W)</label>
+            <input id="f-power" type="number" min="0" value="${d.power_watts || 0}"
+              placeholder="bijv. 2000" />
+            <div class="field-hint">Totaal opgenomen vermogen. Gebruikt voor besparingsberekening.</div>
+          </div>
         </div>
 
+        <!-- ======================================================= -->
+        <!-- Gewone switch / throttle velden (verborgen bij EV)       -->
+        <!-- ======================================================= -->
+        <div id="standard-entity-row" ${isEV ? 'style="display:none"' : ""}>
+          <div class="form-group">
+            <label>Entity ID</label>
+            <div class="entity-picker">
+              <input id="f-entity" type="text" value="${this._esc(d.entity_id || "")}"
+                placeholder="Zoek op naam of entity ID..." autocomplete="off" />
+              <div id="entity-dropdown" class="entity-dropdown" style="display:none;"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Throttle legacy velden -->
         <div id="throttle-fields" ${isThrottle ? "" : 'style="display:none"'}>
           <div class="form-row">
             <div class="form-group">
-              <label>Min. laadstroom (A)</label>
+              <label>Min. waarde</label>
               <input id="f-min" type="number" min="0" value="${d.min_value ?? 6}" />
             </div>
             <div class="form-group">
-              <label>Max. laadstroom (A)</label>
+              <label>Max. waarde</label>
               <input id="f-max" type="number" min="0" value="${d.max_value ?? 32}" />
             </div>
           </div>
           <div class="form-group">
-            <label>Watt per ampere (bijv. 690 W/A voor 3-fase 230V)</label>
+            <label>Watt per eenheid</label>
             <input id="f-ppu" type="number" min="1" value="${d.power_per_unit ?? 690}" />
           </div>
         </div>
+
+        <!-- ======================================================= -->
+        <!-- EV Charger velden                                        -->
+        <!-- ======================================================= -->
+        <div id="ev-fields" ${isEV ? "" : 'style="display:none"'}>
+
+          <div class="ev-section-title">EV Charger instellingen</div>
+
+          <div class="form-group">
+            <label>Oplaadschakelaar (switch entity)</label>
+            <div class="entity-picker">
+              <input id="f-ev-switch" type="text"
+                value="${this._esc(d.ev_switch_entity || d.entity_id || "")}"
+                placeholder="switch.laadpaal_schakelaar"
+                autocomplete="off" />
+              <div id="ev-switch-dropdown" class="entity-dropdown" style="display:none;"></div>
+            </div>
+            <div class="field-hint">Schakelaar die het opladen van de auto start of stopt.</div>
+          </div>
+
+          <div class="form-group">
+            <label>Laadsnelheid-sensor (number entity)</label>
+            <div class="entity-picker">
+              <input id="f-ev-current" type="text"
+                value="${this._esc(d.ev_current_entity || "")}"
+                placeholder="number.laadpaal_stroom"
+                autocomplete="off" />
+              <div id="ev-current-dropdown" class="entity-dropdown" style="display:none;"></div>
+            </div>
+            <div class="field-hint">Entiteit waarmee de laadstroom in ampere (A) kan worden aangepast.</div>
+          </div>
+
+          <div class="form-group">
+            <label>Maximaal batterijpercentage bij zonne-overschot (%)</label>
+            <input id="f-ev-soc" type="number" min="0" max="100"
+              value="${d.ev_max_soc ?? 100}"
+              placeholder="bijv. 100" />
+            <div class="field-hint">
+              Tijdelijk maximum bij overtollige zonne-energie. Normaal laadt de auto tot een lager percentage
+              (bijv. 80%), maar bij zonne-overschot laadt hij tijdelijk tot dit hogere percentage (bijv. 90% of 100%).
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label>Aantal fasen</label>
+            <select id="f-ev-phases">
+              <option value="1" ${(d.ev_phases ?? 1) == 1 ? "selected" : ""}>1 fase (standaard, 230 V)</option>
+              <option value="3" ${(d.ev_phases ?? 1) == 3 ? "selected" : ""}>3 fasen (400 V effectief)</option>
+            </select>
+            <div class="field-hint">
+              1-fase: vermogen = A × 230 V. 3-fasen: vermogen = A × 230 V × 3.
+              Voorbeeld: 16 A op 3 fasen = 11 040 W.
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label>Minimum laadsnelheid (A)</label>
+              <input id="f-ev-min-a" type="number" min="0" max="32"
+                value="${d.min_value ?? 6}"
+                placeholder="6" />
+              <div class="field-hint">Minimale stroomsterkte die de lader mag gebruiken.</div>
+            </div>
+            <div class="form-group">
+              <label>Maximum laadsnelheid (A)</label>
+              <input id="f-ev-max-a" type="number" min="0" max="125"
+                value="${d.max_value ?? 32}"
+                placeholder="32" />
+              <div class="field-hint">Maximale stroomsterkte die de lader mag gebruiken.</div>
+            </div>
+          </div>
+
+        </div>
+        <!-- /ev-fields -->
 
         <div class="modal-actions">
           <button class="btn btn-secondary" id="modal-cancel">Annuleren</button>
@@ -454,7 +559,7 @@ class PeakGuardPanel extends HTMLElement {
   }
 
   _closeModal() {
-    console.log("[PeakGuard DEBUG] _closeModal() aangeroepen");
+    this._log("_closeModal() aangeroepen");
     this._modalVisible = false;
     this._editDevice = null;
     if (this._modalEl) {
@@ -463,7 +568,9 @@ class PeakGuardPanel extends HTMLElement {
   }
 
   _esc(str) {
-    return String(str).replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+    const el = document.createElement("span");
+    el.textContent = String(str);
+    return el.innerHTML;
   }
 
   // ------------------------------------------------------------------ //
@@ -472,88 +579,78 @@ class PeakGuardPanel extends HTMLElement {
 
   _attachModalEvents() {
     const root = this._modalEl;
+    const allEntities = Object.keys(this._hass.states).sort();
 
-    // ---- Entity picker ----
-    const entityInput = root.querySelector("#f-entity");
-    const entityDropdown = root.querySelector("#entity-dropdown");
+    // ---- Helper: maak een autocomplete-dropdown aan voor een input ----
+    const makeEntityPicker = (inputId, dropdownId, filterFn) => {
+      const inp  = root.querySelector(inputId);
+      const drop = root.querySelector(dropdownId);
+      if (!inp || !drop) return;
 
-    console.log('[PeakGuard DEBUG] _attachModalEvents: entityInput gevonden=' + !!entityInput + ', entityDropdown gevonden=' + !!entityDropdown);
-    if (entityInput && entityDropdown) {
-      const allEntities = Object.keys(this._hass.states).sort();
-      console.log('[PeakGuard DEBUG] Aantal entiteiten beschikbaar: ' + allEntities.length);
-
-      const showDropdown = (filter) => {
-        console.log('[PeakGuard DEBUG] showDropdown aangeroepen, filter="' + filter + '"');
-        if (!filter) {
-          entityDropdown.style.display = "none";
-          return;
-        }
+      const show = (filter) => {
+        if (!filter) { drop.style.display = "none"; return; }
         const lower = filter.toLowerCase();
         const matches = allEntities
           .filter((id) => {
+            if (filterFn && !filterFn(id)) return false;
             const name = this._hass.states[id]?.attributes?.friendly_name || "";
             return id.toLowerCase().includes(lower) || name.toLowerCase().includes(lower);
           })
           .slice(0, 50);
-
-        if (matches.length === 0) {
-          entityDropdown.style.display = "none";
-          return;
-        }
-
-        entityDropdown.innerHTML = matches
-          .map((id) => {
-            const name = this._hass.states[id]?.attributes?.friendly_name || "";
-            return `<div class="entity-option" data-id="${id}">
-              <span class="eo-id">${id}</span>
-              ${name ? `<span class="eo-name">${name}</span>` : ""}
-            </div>`;
-          })
-          .join("");
-
-        entityDropdown.style.display = "block";
-
-        entityDropdown.querySelectorAll(".entity-option").forEach((opt) => {
+        if (matches.length === 0) { drop.style.display = "none"; return; }
+        drop.innerHTML = matches.map((id) => {
+          const name = this._hass.states[id]?.attributes?.friendly_name || "";
+          return `<div class="entity-option" data-id="${id}">
+            <span class="eo-id">${id}</span>
+            ${name ? `<span class="eo-name">${name}</span>` : ""}
+          </div>`;
+        }).join("");
+        drop.style.display = "block";
+        drop.querySelectorAll(".entity-option").forEach((opt) => {
           opt.addEventListener("mousedown", (e) => {
-            e.preventDefault();   // blur triggert niet vóór de waarde gezet is
+            e.preventDefault();
             e.stopPropagation();
-            entityInput.value = opt.dataset.id;
-            entityDropdown.style.display = "none";
-            entityInput.focus();
+            inp.value = opt.dataset.id;
+            drop.style.display = "none";
+            inp.focus();
           });
         });
       };
+      inp.addEventListener("input",  () => show(inp.value));
+      inp.addEventListener("focus",  () => { if (inp.value) show(inp.value); });
+      inp.addEventListener("blur",   () => setTimeout(() => { drop.style.display = "none"; }, 250));
+    };
 
-      // Alleen het entity-veld triggert de dropdown
-      entityInput.addEventListener("input", () => {
-        console.log('[PeakGuard DEBUG] entity input event, value="' + entityInput.value + '"');
-        showDropdown(entityInput.value);
-      });
-      entityInput.addEventListener("focus", () => {
-        if (entityInput.value) showDropdown(entityInput.value);
-      });
-      entityInput.addEventListener("blur", () => {
-        setTimeout(() => { entityDropdown.style.display = "none"; }, 250);
-      });
-    }
+    // Standaard entity picker (switch_off / switch_on / throttle)
+    makeEntityPicker("#f-entity",      "#entity-dropdown",      null);
+    // EV: schakelaar picker (filter op switch.*)
+    makeEntityPicker("#f-ev-switch",   "#ev-switch-dropdown",   (id) => id.startsWith("switch."));
+    // EV: stroom-entity picker (filter op number.*)
+    makeEntityPicker("#f-ev-current",  "#ev-current-dropdown",  (id) => id.startsWith("number."));
 
-    // ---- Throttle-velden ----
+    // ---- Actie-select: toon/verberg de juiste veldgroepen ----
     const actionSelect = root.querySelector("#f-action");
+    const updateFieldVisibility = (val) => {
+      const evRow       = root.querySelector("#ev-fields");
+      const stdRow      = root.querySelector("#standard-entity-row");
+      const throttleRow = root.querySelector("#throttle-fields");
+      const powerRow    = root.querySelector("#power-field");
+      const isEV       = val === "ev_charger";
+      const isThrottle = val === "throttle";
+      if (evRow)       evRow.style.display       = isEV       ? ""      : "none";
+      if (stdRow)      stdRow.style.display      = isEV       ? "none"  : "";
+      if (throttleRow) throttleRow.style.display = isThrottle ? ""      : "none";
+      if (powerRow)    powerRow.style.display    = isEV       ? "none"  : "";
+      this._evMode = isEV;
+    };
     if (actionSelect) {
-      actionSelect.addEventListener("change", () => {
-        const fields = root.querySelector("#throttle-fields");
-        if (fields) fields.style.display = actionSelect.value === "throttle" ? "" : "none";
-      });
+      actionSelect.addEventListener("change", () => updateFieldVisibility(actionSelect.value));
     }
 
     // ---- Knoppen ----
-    root.querySelector("#modal-save")?.addEventListener("click", () => this._handleSave());
+    root.querySelector("#modal-save")?.addEventListener("click",   () => this._handleSave());
     root.querySelector("#modal-cancel")?.addEventListener("click", () => this._closeModal());
-
-    // Klik op de backdrop (niet op de modal zelf) sluit de modal
-    root.addEventListener("click", (e) => {
-      if (e.target === root) this._closeModal();
-    });
+    root.addEventListener("click", (e) => { if (e.target === root) this._closeModal(); });
     root.querySelector("#modal-box")?.addEventListener("click", (e) => e.stopPropagation());
   }
 
@@ -562,36 +659,86 @@ class PeakGuardPanel extends HTMLElement {
   // ------------------------------------------------------------------ //
 
   _handleSave() {
-    if (this._saving) return;   // dubbele klik blokkeren
+    if (this._saving) return;
     const root = this._modalEl;
-    const get = (id) => root.querySelector(id);
-    const name = get("#f-name").value.trim();
-    const entity_id = get("#f-entity").value.trim();
-    const action_type = get("#f-action").value;
-    const power_watts = parseInt(get("#f-power").value) || 0;
+    const get  = (id) => root.querySelector(id);
+    const val  = (id) => get(id)?.value?.trim() ?? "";
 
-    if (!name || !entity_id) {
-      alert("Naam en Entity ID zijn verplicht.");
+    const name        = val("#f-name");
+    const action_type = val("#f-action");
+    const isEV        = action_type === "ev_charger";
+    const isThrottle  = action_type === "throttle";
+
+    // Validatie: naam altijd verplicht
+    if (!name) {
+      alert("Naam is verplicht.");
       return;
     }
 
-    const isThrottle = action_type === "throttle";
-    const device = {
-      id: this._editDevice?.id || `dev_${Date.now()}`,
-      name,
-      entity_id,
-      action_type,
-      power_watts,
-      min_value: isThrottle ? (parseFloat(get("#f-min")?.value) || 0) : null,
-      max_value: isThrottle ? (parseFloat(get("#f-max")?.value) || 32) : null,
-      power_per_unit: isThrottle ? (parseFloat(get("#f-ppu")?.value) || 690) : null,
-      priority: this._editDevice?.priority ?? 999,
-      enabled: true,
-    };
+    let entity_id;
+    let device;
+    let power_watts;
+
+    if (isEV) {
+      // EV: entity_id is de schakelaar (primary key voor snapshots)
+      const evSwitch  = val("#f-ev-switch");
+      const evCurrent = val("#f-ev-current");
+      const evSoc     = parseInt(val("#f-ev-soc")) || 100;
+      const evMinA    = parseFloat(val("#f-ev-min-a")) || 6;
+      const evMaxA    = parseFloat(val("#f-ev-max-a")) || 32;
+      const evPhases  = parseInt(val("#f-ev-phases")) || 1;
+
+      if (!evSwitch) {
+        alert("Oplaadschakelaar (switch entity) is verplicht voor een EV Charger.");
+        return;
+      }
+      entity_id = evSwitch;
+
+      // Vermogen dynamisch berekend: max_ampere × 230 V × fasen
+      power_watts = Math.round(evMaxA * 230 * evPhases);
+      device = {
+        id:                 this._editDevice?.id || `dev_${Date.now()}`,
+        name,
+        entity_id,          // = ev_switch_entity (snapshot-sleutel)
+        action_type:        "ev_charger",
+        power_watts,        // berekend, niet handmatig ingevoerd
+        min_value:          evMinA,
+        max_value:          evMaxA,
+        power_per_unit:     null,
+        enabled:            true,
+        priority:           this._editDevice?.priority ?? 999,
+        ev_switch_entity:   evSwitch,
+        ev_current_entity:  evCurrent || null,
+        ev_max_soc:         evSoc,
+        ev_phases:          evPhases,
+      };
+    } else {
+      entity_id = val("#f-entity");
+      if (!entity_id) {
+        alert("Entity ID is verplicht.");
+        return;
+      }
+      power_watts = parseInt(val("#f-power")) || 0;
+      device = {
+        id:             this._editDevice?.id || `dev_${Date.now()}`,
+        name,
+        entity_id,
+        action_type,
+        power_watts,
+        min_value:      isThrottle ? (parseFloat(val("#f-min")) || 0)   : null,
+        max_value:      isThrottle ? (parseFloat(val("#f-max")) || 32)  : null,
+        power_per_unit: isThrottle ? (parseFloat(val("#f-ppu")) || 690) : null,
+        enabled:        true,
+        priority:       this._editDevice?.priority ?? 999,
+        ev_switch_entity:  null,
+        ev_current_entity: null,
+        ev_max_soc:        null,
+        ev_phases:         null,
+      };
+    }
 
     const devices = [...(this._data?.[this._editCascadeType] || [])];
     const existingIdx = devices.findIndex((d) => d.id === device.id);
-
     if (existingIdx >= 0) {
       devices[existingIdx] = device;
     } else {
@@ -1027,7 +1174,19 @@ class PeakGuardPanel extends HTMLElement {
         .mode-piek  { background: #fff3e0; color: #e65100; }
         .mode-solar { background: #e8f5e9; color: #1b5e20; }
 
-      </style>
+
+        /* EV Charger modal */
+        .ev-section-title {
+          font-size: .78em; font-weight: 700; text-transform: uppercase;
+          letter-spacing: .07em; color: var(--primary-color, #03a9f4);
+          margin: 18px 0 10px; padding-bottom: 6px;
+          border-bottom: 2px solid var(--primary-color, #03a9f4);
+        }
+        .field-hint {
+          font-size: .76em; color: var(--secondary-text-color, #9e9e9e);
+          margin-top: 5px; line-height: 1.45;
+        }
+            </style>
     `;
   }
 
@@ -1105,10 +1264,11 @@ class PeakGuardPanel extends HTMLElement {
 
     const fmtTs = (iso) => {
       if (!iso) return "—";
-      // "2026-03-21T14:03:00+00:00" → "21 mrt 14:03"
+      // "2026-03-21T14:03:00+00:00" → "21 mrt 14:03" (altijd UTC, consistent met server)
       const d = new Date(iso);
+      if (isNaN(d.getTime())) return iso.slice(0, 16).replace("T", " ");
       const maanden = ["jan","feb","mrt","apr","mei","jun","jul","aug","sep","okt","nov","dec"];
-      return `${d.getDate()} ${maanden[d.getMonth()]} ${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}`;
+      return `${d.getUTCDate()} ${maanden[d.getUTCMonth()]} ${String(d.getUTCHours()).padStart(2,"0")}:${String(d.getUTCMinutes()).padStart(2,"0")}`;
     };
 
     const eventsRows = allEvents.length === 0
@@ -1359,9 +1519,22 @@ class PeakGuardPanel extends HTMLElement {
    * Bouw een rollende maandhistorie op vanuit de huidige sensorwaarden.
    * Elke keer dat de maand verandert, wordt de vorige maand opgeslagen.
    * Geeft maximaal 12 maanden terug.
+   * History wordt persistent opgeslagen in localStorage zodat een page
+   * reload de historiek niet wist.
    */
   _getMonthlyHistory(mode) {
-    if (!this._monthlyHistory) this._monthlyHistory = {};
+    if (!this._monthlyHistory) {
+      this._monthlyHistory = {};
+      // Herstel vanuit localStorage bij eerste aanroep — laad beide modes in één keer
+      for (const m of ["peak", "solar"]) {
+        try {
+          const stored = localStorage.getItem(`peak_guard_monthly_history_${m}`);
+          if (stored) this._monthlyHistory[m] = JSON.parse(stored);
+        } catch (e) {
+          console.warn("[PeakGuard] localStorage lezen mislukt voor mode " + m + ":", e);
+        }
+      }
+    }
     if (!this._monthlyHistory[mode]) this._monthlyHistory[mode] = [];
 
     const now   = new Date();
@@ -1384,9 +1557,15 @@ class PeakGuardPanel extends HTMLElement {
 
     const hist = this._monthlyHistory[mode];
 
-    // Maandwissel detecteren: als de laatste opgeslagen maand anders is
-    if (hist.length > 0 && hist[hist.length - 1].month !== month) {
-      // Huidige waarden zijn van een nieuwe maand — vorige maand is al opgeslagen
+    // Maandwissel detecteren: als de laatste opgeslagen maand anders is,
+    // bewaar de vorige maanddata definitief (was al in hist), en log dit.
+    if (hist.length > 0) {
+      const lastEntry = hist[hist.length - 1];
+      if (lastEntry.month !== month) {
+        // Vorige maand is al in hist opgeslagen met de eindwaarden van die maand.
+        // We hoeven enkel te zorgen dat de nieuwe maand hieronder wordt toegevoegd.
+        this._log("Maandwissel gedetecteerd: " + lastEntry.month + " → " + month);
+      }
     }
 
     // Actualiseer of voeg toe voor de huidige maand
@@ -1398,6 +1577,13 @@ class PeakGuardPanel extends HTMLElement {
     } else {
       hist.push({ month, label, valueA: currentA, valueB: currentB });
       if (hist.length > 12) hist.shift();
+    }
+
+    // Persist naar localStorage
+    try {
+      localStorage.setItem(`peak_guard_monthly_history_${mode}`, JSON.stringify(hist));
+    } catch (e) {
+      console.warn("[PeakGuard] localStorage schrijven mislukt:", e);
     }
 
     return hist.filter(h => h.valueA > 0 || h.valueB > 0);
