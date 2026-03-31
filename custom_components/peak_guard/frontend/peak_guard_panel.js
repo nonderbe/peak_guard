@@ -18,6 +18,9 @@ class PeakGuardPanel extends HTMLElement {
 
     // Debug logger
     this._log = (msg, ...args) => console.log(`[PeakGuard DEBUG] ${msg}`, ...args);
+
+    // EV spanning: 1-fase = 230 V, 3-fasen = 400 V
+    this._evVoltage = (phases) => phases === 3 ? 400 : 230;
   }
 
   // ------------------------------------------------------------------ //
@@ -364,11 +367,12 @@ class PeakGuardPanel extends HTMLElement {
     // Vermogenschip: voor EV dynamisch berekend, voor andere types opgeslagen power_watts
     let powerChip;
     if (device.action_type === "ev_charger") {
-      const phases = device.ev_phases || 1;
-      const maxA   = device.max_value ?? 32;
-      const calcW  = Math.round(maxA * 230 * phases);
-      const phaseLabel = phases === 1 ? "1-fase" : "3-fasen";
-      powerChip = `<span class="chip" title="Maximum laadstroom: ${maxA} A — Maximum vermogen: ${calcW} W (${phaseLabel}, 230 V per fase)">Max ${maxA} A · ${calcW} W · ${phases}F</span>`;
+      const phases    = device.ev_phases || 1;
+      const maxA      = device.max_value ?? 32;
+      const voltage   = this._evVoltage(phases);
+      const calcW     = Math.round(maxA * voltage);
+      const phaseLabel = phases === 1 ? "1-fase (230 V)" : "3-fasen (400 V)";
+      powerChip = `<span class="chip" title="Maximum laadstroom: ${maxA} A — Maximum vermogen: ${calcW} W (${phaseLabel})">Max ${maxA} A · ${calcW} W · ${phases}F</span>`;
     } else {
       powerChip = device.power_watts
         ? `<span class="chip" title="Nominaal opgenomen vermogen van dit apparaat. Gebruikt voor de besparingsberekening.">${device.power_watts} W</span>`
@@ -509,7 +513,8 @@ class PeakGuardPanel extends HTMLElement {
         const currentA = parseFloat(curState.state);
         if (!isNaN(currentA)) {
           const phases   = device.ev_phases || 1;
-          const currentW = Math.round(currentA * 230 * phases);
+          const voltage  = this._evVoltage(phases);
+          const currentW = Math.round(currentA * voltage);
           parts.push(`${currentA} A · ${currentW} W`);
         }
       }
@@ -738,12 +743,12 @@ class PeakGuardPanel extends HTMLElement {
         <div class="form-group">
           <label>Aantal fasen</label>
           <select id="f-ev-phases">
-            <option value="1" ${(d.ev_phases ?? 1) == 1 ? "selected" : ""}>1 fase — 230 V per fase</option>
-            <option value="3" ${(d.ev_phases ?? 1) == 3 ? "selected" : ""}>3 fasen — 230 V × 3 per fase</option>
+            <option value="1" ${(d.ev_phases ?? 1) == 1 ? "selected" : ""}>1 fase — 230 V</option>
+            <option value="3" ${(d.ev_phases ?? 1) == 3 ? "selected" : ""}>3 fasen — 400 V</option>
           </select>
           <div class="field-hint">
-            De meeste thuisladers laden 1-fasig. Controleer het typeplaatje of de handleiding van uw laadpaal.
-            Het maximale vermogen wordt automatisch berekend op basis van de laadstroom en het aantal fasen.
+            De meeste thuisladers laden 1-fasig (230 V). Controleer het typeplaatje of de handleiding van uw laadpaal.
+            Het maximale vermogen wordt automatisch berekend: 1-fase = A × 230 V, 3-fasen = A × 400 V.
           </div>
         </div>
 
@@ -975,14 +980,15 @@ class PeakGuardPanel extends HTMLElement {
       } else if (step === 2) {
         // Live preview van het berekende vermogen
         const updatePreview = () => {
-          const minA   = parseFloat(root.querySelector("#f-ev-min-a")?.value) || 6;
-          const maxA   = parseFloat(root.querySelector("#f-ev-max-a")?.value) || 32;
-          const phases = parseInt(root.querySelector("#f-ev-phases")?.value)  || 1;
-          const minW   = Math.round(minA * 230 * phases);
-          const maxW   = Math.round(maxA * 230 * phases);
-          const prev   = root.querySelector("#ev-power-preview");
+          const minA    = parseFloat(root.querySelector("#f-ev-min-a")?.value) || 6;
+          const maxA    = parseFloat(root.querySelector("#f-ev-max-a")?.value) || 32;
+          const phases  = parseInt(root.querySelector("#f-ev-phases")?.value)  || 1;
+          const voltage = this._evVoltage(phases);
+          const minW    = Math.round(minA * voltage);
+          const maxW    = Math.round(maxA * voltage);
+          const prev    = root.querySelector("#ev-power-preview");
           if (prev) prev.textContent =
-            `Vermogensbereik: ${minW} W (min) – ${maxW} W (max) bij ${phases} fase${phases > 1 ? "n" : ""} × 230 V`;
+            `Vermogensbereik: ${minW} W (min) – ${maxW} W (max) · ${voltage} V (${phases === 3 ? "3-fasen" : "1-fase"})`;
         };
         root.querySelector("#f-ev-min-a")?.addEventListener("input", updatePreview);
         root.querySelector("#f-ev-max-a")?.addEventListener("input", updatePreview);
@@ -1080,7 +1086,7 @@ class PeakGuardPanel extends HTMLElement {
       if (!d.name)    { alert("Naam is verplicht."); return; }
       if (!evSwitch)  { alert("Oplaadschakelaar is verplicht."); return; }
 
-      const power_watts = Math.round(evMaxA * 230 * evPhases);
+      const power_watts = Math.round(evMaxA * this._evVoltage(evPhases));
 
       device = {
         id:               d.id || `dev_${Date.now()}`,
