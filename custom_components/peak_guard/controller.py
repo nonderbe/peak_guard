@@ -30,8 +30,11 @@ from .const import (
     ACTION_EV_CHARGER,
 )
 
-# EV: vast voltage (1-fase 230 V). Altijd A * EV_VOLTS = W.
-EV_VOLTS: float = 230.0
+# EV: spanning afhankelijk van het aantal fasen.
+# 1-fase: U = 230 V  →  P = A × 230
+# 3-fasen: U = 400 V  →  P = A × 400
+EV_VOLTS_1PHASE: float = 230.0
+EV_VOLTS_3PHASE: float = 400.0
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -51,9 +54,9 @@ class CascadeDevice:
       min_value         : minimale laadstroom (A), default 6
       max_value         : maximale laadstroom (A), default 32
 
-      Vermogenformule EV: ampere x EV_VOLTS x ev_phases
-        1-fase 32A: 32 x 230 x 1 = 7360 W
-        3-fase 16A: 16 x 230 x 3 = 11040 W
+      Vermogenformule EV:
+        1-fase: P = A × 230 V  (bv. 32 A → 7 360 W)
+        3-fasen: P = A × 400 V  (bv. 16 A → 6 400 W)
 
     Velden voor throttle (legacy, backwards-compat):
       min_value, max_value, power_per_unit
@@ -188,10 +191,12 @@ class PeakGuardController:
                     await self._check_power_drop(consumption)
                     if consumption > 0:
                         await self._check_peak(consumption)
+                        await self._check_peak_restore(consumption)   # ook bij positief verbruik!
                         await self._check_inject_restore(consumption)
                     elif consumption < 0:
                         await self._check_injection(consumption)
                         await self._check_peak_restore(consumption)
+                        await self._check_inject_restore(consumption)
                     else:
                         await self._check_peak_restore(0.0)
                         await self._check_inject_restore(0.0)
@@ -209,9 +214,14 @@ class PeakGuardController:
     async def _check_peak(self, consumption: float):
         peak = self._sensor_value(self.config.get(CONF_PEAK_SENSOR))
         if peak is None:
+            _LOGGER.debug("Peak Guard: piek-sensor niet beschikbaar, check overgeslagen")
             return
         buffer = float(self.config.get(CONF_BUFFER_WATTS, DEFAULT_BUFFER_WATTS))
         excess = consumption - peak + buffer
+        _LOGGER.debug(
+            "Peak Guard _check_peak: verbruik=%.0f W, piek=%.0f W, buffer=%.0f W, overschot=%.0f W",
+            consumption, peak, buffer, excess,
+        )
         if excess > 0:
             _LOGGER.warning(
                 "Peak Guard: piekverbruik overschreden met %.0f W – cascade gestart", excess
@@ -221,6 +231,10 @@ class PeakGuardController:
     async def _check_injection(self, consumption: float):
         injection = abs(consumption)
         buffer = float(self.config.get(CONF_BUFFER_WATTS, DEFAULT_BUFFER_WATTS))
+        _LOGGER.debug(
+            "Peak Guard _check_injection: injectie=%.0f W, buffer=%.0f W, actief=%d snapshot(s)",
+            injection, buffer, len(self._inject_snapshots),
+        )
         if injection > buffer:
             _LOGGER.info(
                 "Peak Guard: stroominjectie van %.0f W gedetecteerd – cascade gestart", injection
@@ -238,7 +252,15 @@ class PeakGuardController:
         if peak is None:
             return
         buffer = float(self.config.get(CONF_BUFFER_WATTS, DEFAULT_BUFFER_WATTS))
-        if consumption >= peak - buffer:
+        # Herstel pas als het huidig verbruik NIET meer boven de piekgrens zit.
+        # Ingreep-conditie was: consumption > peak - buffer
+        # Herstel-conditie is:  consumption <= peak - buffer
+        if consumption > peak - buffer:
+            _LOGGER.debug(
+                "Peak Guard herstel geblokkeerd: verbruik %.0f W > piekgrens %.0f W "
+                "(piek=%.0f W, buffer=%.0f W)",
+                consumption, peak - buffer, peak, buffer,
+            )
             return
         snapshots_to_restore = self._get_restore_candidates(
             self.peak_cascade, self._peak_snapshots, reverse=True
@@ -254,7 +276,12 @@ class PeakGuardController:
     async def _check_inject_restore(self, consumption: float):
         if not self._inject_snapshots:
             return
+        _LOGGER.debug(
+            "Peak Guard _check_inject_restore: verbruik=%.0f W, %d snapshot(s) actief",
+            consumption, len(self._inject_snapshots),
+        )
         if consumption < 0:
+            _LOGGER.debug("Peak Guard: inject-herstel geblokkeerd — verbruik nog negatief (%.0f W)", consumption)
             return
         snapshots_to_restore = self._get_restore_candidates(
             self.inject_cascade, self._inject_snapshots, reverse=True
@@ -565,7 +592,10 @@ class PeakGuardController:
             await self.hass.services.async_call(
                 "switch", "turn_off", {"entity_id": device.entity_id}, blocking=True
             )
-            _LOGGER.info("Peak Guard: '%s' uitgeschakeld (-%d W)", device.name, device.power_watts)
+            _LOGGER.info(
+                "Peak Guard: '%s' UITGESCHAKELD wegens piekbeperking (-%d W, overschot was %.0f W)",
+                device.name, device.power_watts, excess,
+            )
             self.peak_tracker.record_pending_avoid(
                 device_id=device.id,
                 device_name=device.name,
@@ -584,7 +614,10 @@ class PeakGuardController:
             await self.hass.services.async_call(
                 "switch", "turn_on", {"entity_id": device.entity_id}, blocking=True
             )
-            _LOGGER.info("Peak Guard: '%s' ingeschakeld (-%d W)", device.name, device.power_watts)
+            _LOGGER.info(
+                "Peak Guard: '%s' INGESCHAKELD wegens injectiepreventie (+%d W, overschot was %.0f W)",
+                device.name, device.power_watts, excess,
+            )
             self.solar_tracker.start_solar_measurement(
                 device_id=device.id,
                 device_name=device.name,
@@ -636,8 +669,9 @@ class PeakGuardController:
         """
         EV Charger cascade-ingreep.
 
-        Vermogenformule: altijd  ampere * EV_VOLTS (230 V)
-          → W = A * 230
+        Vermogenformule: P = A × U
+          1-fase: U = 230 V  →  W = A × 230
+          3-fasen: U = 400 V  →  W = A × 400
 
         Piekbeperking  (cascade_type == "peak"):
           Laadstroom naar BENEDEN afronden (floor) zodat het verbruik
@@ -645,9 +679,9 @@ class PeakGuardController:
 
           Formule:
             needed_reduction_W  = excess  (te veel vermogen)
-            current_W           = current_a * EV_VOLTS
+            current_W           = current_a × U  (U = 230 of 400 V)
             target_W            = current_W - needed_reduction_W
-            target_a_raw        = target_W / EV_VOLTS
+            target_a_raw        = target_W / U
             new_a               = floor(target_a_raw)         ← altijd naar beneden
             new_a               = clamp(new_a, min_a, max_a)
 
@@ -658,19 +692,21 @@ class PeakGuardController:
           zonne-energie lokaal verbruikt wordt.
 
           Formule:
-            available_a_raw     = excess / EV_VOLTS
+            available_a_raw     = excess / U
             new_a               = ceil(available_a_raw)       ← altijd naar boven
             new_a               = clamp(new_a, min_a, max_a)
 
-          Als schakelaar uit is én excess >= min_a * EV_VOLTS * ev_phases → schakelaar aan.
+          Als schakelaar uit is én ceil(excess / U) >= min_a → schakelaar aan.
           SOC-override: zet ev_max_soc tijdelijk als batterijlimiet (indien entity aanwezig).
         """
         min_a = device.min_value if device.min_value is not None else DEFAULT_EV_MIN_AMPERE
         max_a = device.max_value if device.max_value is not None else DEFAULT_EV_MAX_AMPERE
         phases = int(device.ev_phases) if device.ev_phases else 1
 
-        # EV vermogen = A * EV_VOLTS * fasen. power_per_unit wordt GENEGEERD voor EV.
-        volts_per_phase = EV_VOLTS * phases
+        # Spanning afhankelijk van het aantal fasen:
+        # 1 fase → 230 V,  3 fasen → 400 V
+        # Vermogen = A × voltage (niet A × fasen × 230)
+        voltage = EV_VOLTS_3PHASE if phases == 3 else EV_VOLTS_1PHASE
 
         sw_entity  = device.ev_switch_entity or device.entity_id
         cur_entity = device.ev_current_entity
@@ -722,13 +758,13 @@ class PeakGuardController:
 
             # Huidige verbruik van de EV (W)
             eff_current_a = current_a if current_a is not None else max_a
-            current_w = eff_current_a * volts_per_phase
+            current_w = eff_current_a * voltage
 
             # Hoeveel watt moet de EV inleveren?
             needed_reduction_w = min(excess, current_w)
 
             # Nieuwe laadstroom na verlaging (FLOOR → nooit meer dan nodig)
-            target_a_raw = (current_w - needed_reduction_w) / volts_per_phase
+            target_a_raw = (current_w - needed_reduction_w) / voltage
             # floor: altijd naar beneden afronden op hele ampère
             new_a = math.floor(target_a_raw)
             new_a = max(0, min(int(max_a), new_a))   # clamp op [0, max_a]
@@ -762,7 +798,7 @@ class PeakGuardController:
 
             else:
                 # Laadstroom verlagen naar new_a
-                actual_reduction_w = (eff_current_a - new_a) * volts_per_phase
+                actual_reduction_w = (eff_current_a - new_a) * voltage
                 if cur_entity and new_a != int(eff_current_a):
                     await self.hass.services.async_call(
                         "number", "set_value",
@@ -778,28 +814,29 @@ class PeakGuardController:
                 return excess - actual_reduction_w
 
         # ================================================================ #
-        #  INJECTIEPREVENTIE — ceil, laadstroom verhogen                   #
+        #  INJECTIEPREVENTIE — laadstroom instellen op beschikbaar overschot #
         # ================================================================ #
         # cascade_type == "solar"
 
-        # Hoeveel ampere past er in het overschot?
-        # CEIL → altijd naar boven afronden zodat zoveel mogelijk verbruikt wordt
-        available_a_raw = excess / volts_per_phase
-        new_a_ceil = math.ceil(available_a_raw)
-        # Clamp op [min_a, max_a]
-        new_a = max(int(min_a), min(int(max_a), new_a_ceil))
+        # Laadstroom: I = P / U  (U = 230 V voor 1-fase, 400 V voor 3-fasen)
+        # Afgerond naar boven (ceil) conform gebruikersvraag.
+        available_a_raw = excess / voltage
+        new_a = max(int(min_a), min(int(max_a), math.ceil(available_a_raw)))
+
+        # Drempel: is er genoeg overschot voor de minimale laadstroom?
+        if math.ceil(available_a_raw) < min_a:
+            _LOGGER.debug(
+                "Peak Guard EV solar: '%s' onvoldoende overschot voor minimale laadstroom "
+                "(overschot=%.0f W, beschikbaar=%.2f A, min=%.0f A)",
+                device.name, excess, available_a_raw, min_a,
+            )
+            return excess
 
         if not sw_on:
-            # EV staat uit → aanzetten als overschot groot genoeg is
-            if excess < min_a * volts_per_phase:
-                # Onvoldoende overschot voor zelfs de minimale laadstroom
-                return excess
-
-            # Schakelaar aan
+            # EV staat uit → aanzetten
             await self.hass.services.async_call(
                 "switch", "turn_on", {"entity_id": sw_entity}, blocking=True
             )
-            # Laadstroom instellen op new_a (ceil van beschikbaar, maar clamp op max)
             start_a = new_a
             if cur_entity:
                 await self.hass.services.async_call(
@@ -807,9 +844,8 @@ class PeakGuardController:
                     {"entity_id": cur_entity, "value": float(start_a)},
                     blocking=True,
                 )
-            # SOC-override: zet batterijlimiet tijdelijk op ev_max_soc
             await self._set_ev_soc_override(device, override=True)
-            actual_consumption_w = start_a * volts_per_phase
+            actual_consumption_w = start_a * voltage
             _LOGGER.info(
                 "Peak Guard EV solar: '%s' ingeschakeld op %d A "
                 "(ceil van %.2f A, verbruik %.0f W, %d fase(n), SOC-override: %s%%)",
@@ -826,9 +862,9 @@ class PeakGuardController:
             return excess - actual_consumption_w
 
         else:
-            # EV staat al aan → laadstroom aanpassen naar new_a (ceil)
-            actual_consumption_w = new_a * volts_per_phase
-            if cur_entity and current_a is not None and new_a != math.floor(current_a):
+            # EV staat al aan → laadstroom aanpassen
+            actual_consumption_w = new_a * voltage
+            if cur_entity and current_a is not None and new_a != math.ceil(current_a):
                 await self.hass.services.async_call(
                     "number", "set_value",
                     {"entity_id": cur_entity, "value": float(new_a)},
