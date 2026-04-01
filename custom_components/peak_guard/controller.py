@@ -375,7 +375,42 @@ class PeakGuardController:
     async def start_monitoring(self):
         self._monitoring = True
         self._task = self.hass.loop.create_task(self._monitor_loop())
-        _LOGGER.info("Peak Guard: monitoring gestart")
+        # Startup diagnostic: validate sensor configuration
+        consumption_id = self.config.get(CONF_CONSUMPTION_SENSOR)
+        peak_id = self.config.get(CONF_PEAK_SENSOR)
+        consumption_state = self.hass.states.get(consumption_id) if consumption_id else None
+        peak_state = self.hass.states.get(peak_id) if peak_id else None
+        _LOGGER.info(
+            "Peak Guard: monitoring gestart — "
+            "verbruikssensor='%s' (huidig: %s), piek-sensor='%s' (huidig: %s), "
+            "piek-cascade: %d apparaat/apparaten, inject-cascade: %d apparaat/apparaten",
+            consumption_id,
+            consumption_state.state if consumption_state else "NIET GEVONDEN",
+            peak_id,
+            peak_state.state if peak_state else "NIET GEVONDEN",
+            len([d for d in self.peak_cascade if d.enabled]),
+            len([d for d in self.inject_cascade if d.enabled]),
+        )
+        if consumption_state is None:
+            _LOGGER.error(
+                "Peak Guard: ⚠️  verbruikssensor '%s' NIET GEVONDEN in HA! "
+                "Controleer de configuratie — monitoring werkt niet correct.",
+                consumption_id,
+            )
+        else:
+            try:
+                val = float(consumption_state.state)
+                if val >= 0:
+                    _LOGGER.info(
+                        "Peak Guard: verbruikssensor geeft %.0f W (positief = import). "
+                        "Solar surplus detectie werkt alleen als deze sensor NEGATIEF wordt bij export.",
+                        val,
+                    )
+            except (ValueError, TypeError):
+                _LOGGER.warning(
+                    "Peak Guard: verbruikssensor '%s' heeft ongeldige waarde '%s'",
+                    consumption_id, consumption_state.state,
+                )
 
     async def stop_monitoring(self):
         self._monitoring = False
@@ -406,12 +441,22 @@ class PeakGuardController:
             try:
                 consumption = self._sensor_value(self.config.get(CONF_CONSUMPTION_SENSOR))
                 if consumption is not None:
+                    _LOGGER.debug(
+                        "Peak Guard loop: verbruikssensor=%.0f W (positief=import, negatief=export)",
+                        consumption,
+                    )
                     await self._check_power_drop(consumption)
                     if consumption > 0:
                         await self._check_peak(consumption)
                         await self._check_peak_restore(consumption)
                         await self._check_inject_restore(consumption)
                     elif consumption < 0:
+                        # Negatief verbruik = export naar net (zonne-overschot)
+                        _LOGGER.info(
+                            "Peak Guard: zonne-overschot gedetecteerd — sensor=%.0f W "
+                            "(export %.0f W) — solar cascade wordt gecontroleerd",
+                            consumption, abs(consumption),
+                        )
                         await self._check_injection(consumption)
                         await self._check_peak_restore(consumption)
                         await self._check_inject_restore(consumption)
@@ -420,6 +465,12 @@ class PeakGuardController:
                         await self._check_inject_restore(0.0)
                     self._prev_consumption = consumption
                 else:
+                    sensor_id = self.config.get(CONF_CONSUMPTION_SENSOR)
+                    _LOGGER.warning(
+                        "Peak Guard: verbruikssensor '%s' niet beschikbaar of onbekend — "
+                        "loop overgeslagen",
+                        sensor_id,
+                    )
                     self._prev_consumption = None
             except Exception:
                 _LOGGER.exception("Peak Guard: fout in monitoring loop")
@@ -432,7 +483,10 @@ class PeakGuardController:
     async def _check_peak(self, consumption: float):
         peak = self._sensor_value(self.config.get(CONF_PEAK_SENSOR))
         if peak is None:
-            _LOGGER.debug("Peak Guard: piek-sensor niet beschikbaar, check overgeslagen")
+            _LOGGER.warning(
+                "Peak Guard: piek-sensor '%s' niet beschikbaar — piekcheck overgeslagen",
+                self.config.get(CONF_PEAK_SENSOR),
+            )
             return
         buffer = float(self.config.get(CONF_BUFFER_WATTS, DEFAULT_BUFFER_WATTS))
         excess = consumption - peak + buffer
@@ -441,9 +495,14 @@ class PeakGuardController:
             consumption, peak, buffer, excess,
         )
         if excess > 0:
+            enabled_devices = [d for d in self.peak_cascade if d.enabled]
             _LOGGER.warning(
-                "Peak Guard: piekverbruik overschreden met %.0f W – cascade gestart", excess
+                "Peak Guard: piekverbruik overschreden met %.0f W — cascade gestart "
+                "(verbruik=%.0f W, piekgrens=%.0f W, buffer=%.0f W, %d apparaat/apparaten in cascade)",
+                excess, consumption, peak, buffer, len(enabled_devices),
             )
+            if not enabled_devices:
+                _LOGGER.warning("Peak Guard: geen actieve apparaten in piek-cascade — niets te doen!")
             await self._run_cascade(self.peak_cascade, excess, self._peak_snapshots, "peak")
 
     async def _check_injection(self, consumption: float):
@@ -454,10 +513,24 @@ class PeakGuardController:
             injection, buffer, len(self._inject_snapshots),
         )
         if injection > buffer:
+            enabled_devices = [d for d in self.inject_cascade if d.enabled]
             _LOGGER.info(
-                "Peak Guard: stroominjectie van %.0f W gedetecteerd – cascade gestart", injection
+                "Peak Guard: ☀️  solar surplus %.0f W > buffer %.0f W — inject-cascade gestart "
+                "(%d apparaat/apparaten beschikbaar)",
+                injection, buffer, len(enabled_devices),
             )
+            if not enabled_devices:
+                _LOGGER.warning(
+                    "Peak Guard: geen actieve apparaten in inject-cascade — "
+                    "%.0f W wordt teruggeleverd aan het net zonder actie!",
+                    injection,
+                )
             await self._run_cascade(self.inject_cascade, injection, self._inject_snapshots, "solar")
+        else:
+            _LOGGER.debug(
+                "Peak Guard: injectie %.0f W ≤ buffer %.0f W — geen actie vereist",
+                injection, buffer,
+            )
 
     # ------------------------------------------------------------------ #
     #  Cascade logica — herstel                                            #
@@ -796,10 +869,46 @@ class PeakGuardController:
         sorted_devices = sorted(
             [d for d in cascade if d.enabled], key=lambda x: x.priority
         )
+        label = "PIEK" if cascade_type == "peak" else "SOLAR"
+        _LOGGER.info(
+            "Peak Guard [%s cascade]: start — overschot=%.0f W, %d apparaat/apparaten (prioriteitsvolgorde: %s)",
+            label, excess,
+            len(sorted_devices),
+            ", ".join(f"'{d.name}'[{d.action_type}]" for d in sorted_devices) or "–",
+        )
+        remaining = excess
         for device in sorted_devices:
-            if excess <= 0:
+            if remaining <= 0:
+                _LOGGER.info(
+                    "Peak Guard [%s cascade]: overschot opgelost (0 W resterend) — "
+                    "verdere apparaten niet verwerkt",
+                    label,
+                )
                 break
-            excess = await self._apply_action(device, excess, snapshots, cascade_type)
+            before = remaining
+            remaining = await self._apply_action(device, remaining, snapshots, cascade_type)
+            handled = before - remaining
+            if handled > 0:
+                _LOGGER.info(
+                    "Peak Guard [%s cascade]:   ✓ '%s' verwerkte %.0f W — resterend overschot: %.0f W",
+                    label, device.name, handled, remaining,
+                )
+            else:
+                _LOGGER.info(
+                    "Peak Guard [%s cascade]:   · '%s' kon niets doen — resterend overschot: %.0f W",
+                    label, device.name, remaining,
+                )
+        if remaining > 0:
+            _LOGGER.warning(
+                "Peak Guard [%s cascade]: klaar — nog %.0f W overschot onverwerkt "
+                "(alle apparaten doorlopen)",
+                label, remaining,
+            )
+        else:
+            _LOGGER.info(
+                "Peak Guard [%s cascade]: klaar — overschot volledig verwerkt ✓",
+                label,
+            )
 
     async def _apply_action(
         self,
@@ -810,54 +919,69 @@ class PeakGuardController:
     ) -> float:
         state = self.hass.states.get(device.entity_id)
         if state is None:
-            _LOGGER.warning("Peak Guard: entity '%s' niet gevonden", device.entity_id)
+            _LOGGER.warning(
+                "Peak Guard: entity '%s' ('%s') niet gevonden in HA — apparaat overgeslagen",
+                device.entity_id, device.name,
+            )
             return excess
 
         # ---- Switch OFF (piekbeperking) -------------------------------- #
-        if device.action_type == ACTION_SWITCH_OFF and state.state == "on":
-            if device.entity_id not in snapshots:
-                snapshots[device.entity_id] = DeviceSnapshot(
-                    entity_id=device.entity_id,
-                    original_state=state.state,
+        if device.action_type == ACTION_SWITCH_OFF:
+            if state.state == "on":
+                if device.entity_id not in snapshots:
+                    snapshots[device.entity_id] = DeviceSnapshot(
+                        entity_id=device.entity_id,
+                        original_state=state.state,
+                    )
+                await self.hass.services.async_call(
+                    "switch", "turn_off", {"entity_id": device.entity_id}, blocking=True
                 )
-            await self.hass.services.async_call(
-                "switch", "turn_off", {"entity_id": device.entity_id}, blocking=True
-            )
-            _LOGGER.info(
-                "Peak Guard: '%s' UITGESCHAKELD wegens piekbeperking "
-                "(-%d W, overschot was %.0f W)",
-                device.name, device.power_watts, excess,
-            )
-            self.peak_tracker.record_pending_avoid(
-                device_id=device.id,
-                device_name=device.name,
-                nominal_kw=device.power_watts / 1000.0,
-                ts=datetime.now(timezone.utc),
-            )
-            return excess - device.power_watts
+                _LOGGER.info(
+                    "Peak Guard: → '%s' UITgeschakeld (piekbeperking, -%d W, overschot was %.0f W)",
+                    device.name, device.power_watts, excess,
+                )
+                self.peak_tracker.record_pending_avoid(
+                    device_id=device.id,
+                    device_name=device.name,
+                    nominal_kw=device.power_watts / 1000.0,
+                    ts=datetime.now(timezone.utc),
+                )
+                return excess - device.power_watts
+            else:
+                _LOGGER.info(
+                    "Peak Guard: → '%s' al UIT — overgeslagen (piekbeperking, staat=%s)",
+                    device.name, state.state,
+                )
+                return excess
 
         # ---- Switch ON (injectiepreventie) ----------------------------- #
-        if device.action_type == ACTION_SWITCH_ON and state.state == "off":
-            if device.entity_id not in snapshots:
-                snapshots[device.entity_id] = DeviceSnapshot(
-                    entity_id=device.entity_id,
-                    original_state=state.state,
+        if device.action_type == ACTION_SWITCH_ON:
+            if state.state == "off":
+                if device.entity_id not in snapshots:
+                    snapshots[device.entity_id] = DeviceSnapshot(
+                        entity_id=device.entity_id,
+                        original_state=state.state,
+                    )
+                await self.hass.services.async_call(
+                    "switch", "turn_on", {"entity_id": device.entity_id}, blocking=True
                 )
-            await self.hass.services.async_call(
-                "switch", "turn_on", {"entity_id": device.entity_id}, blocking=True
-            )
-            _LOGGER.info(
-                "Peak Guard: '%s' INGESCHAKELD wegens injectiepreventie "
-                "(+%d W, overschot was %.0f W)",
-                device.name, device.power_watts, excess,
-            )
-            self.solar_tracker.start_solar_measurement(
-                device_id=device.id,
-                device_name=device.name,
-                nominal_kw=device.power_watts / 1000.0,
-                ts=datetime.now(timezone.utc),
-            )
-            return excess - device.power_watts
+                _LOGGER.info(
+                    "Peak Guard: → '%s' AANgeschakeld (injectiepreventie, +%d W, overschot was %.0f W)",
+                    device.name, device.power_watts, excess,
+                )
+                self.solar_tracker.start_solar_measurement(
+                    device_id=device.id,
+                    device_name=device.name,
+                    nominal_kw=device.power_watts / 1000.0,
+                    ts=datetime.now(timezone.utc),
+                )
+                return excess - device.power_watts
+            else:
+                _LOGGER.info(
+                    "Peak Guard: → '%s' al AAN — overgeslagen (injectiepreventie, staat=%s)",
+                    device.name, state.state,
+                )
+                return excess
 
         # ---- Throttle (legacy) ----------------------------------------- #
         if device.action_type == ACTION_THROTTLE:
@@ -1116,29 +1240,49 @@ class PeakGuardController:
         available_a_raw = excess / voltage
         new_a = max(int(min_a), min(int(max_a), math.ceil(available_a_raw)))
 
+        _LOGGER.info(
+            "Peak Guard EV solar: → '%s' evalueren — "
+            "overschot=%.0f W, spanning=%dV (%d fase(n)), "
+            "beschikbaar=%.2f A, doel=%d A (min=%d, max=%d), "
+            "schakelaar=%s, laadstroom=%s A, guard-state=%s",
+            device.name, excess, int(voltage), phases,
+            available_a_raw, new_a, int(min_a), int(max_a),
+            "AAN" if sw_on else "UIT",
+            f"{current_a:.1f}" if current_a is not None else "onbekend",
+            guard.state.value,
+        )
+
         # ── GATE: threshold check — enough surplus for minimum charging? ─ #
         if math.ceil(available_a_raw) < min_a:
-            _LOGGER.debug(
-                "Peak Guard EV solar: '%s' onvoldoende overschot voor minimale laadstroom "
-                "(overschot=%.0f W, beschikbaar=%.2f A, min=%.0f A)",
-                device.name, excess, available_a_raw, min_a,
+            _LOGGER.warning(
+                "Peak Guard EV solar: → '%s' NIET geactiveerd — "
+                "onvoldoende overschot voor minimale laadstroom "
+                "(overschot=%.0f W, beschikbaar=%.2f A, minimum=%.0f A = %.0f W op %d fase(n)). "
+                "Tip: vergroot het overschot of verlaag min_value.",
+                device.name, excess, available_a_raw, min_a, min_a * voltage, phases,
             )
             return excess
 
         # ── GATE: debounce — surplus must be stable before we act ──────── #
         if not self._ev_surplus_is_stable(guard, excess, now):
+            history_secs = 0.0
+            if guard.surplus_history:
+                oldest = guard.surplus_history[0][0]
+                history_secs = (now - oldest).total_seconds()
             if guard.state != EVState.WAITING_FOR_STABLE:
                 guard.state = EVState.WAITING_FOR_STABLE
                 _LOGGER.info(
-                    "Peak Guard EV solar: '%s' wacht op stabiel overschot "
-                    "(huidig: %.0f W, debounce: %.0f s) — geen service call",
-                    device.name, excess, EV_DEBOUNCE_STABLE_S,
+                    "Peak Guard EV solar: → '%s' NIET geactiveerd — wacht op stabiel overschot "
+                    "(huidig=%.0f W, debounce=%.0f s vereist, tot nu toe=%.0f s, "
+                    "tolerantie=±%.0f W)",
+                    device.name, excess, EV_DEBOUNCE_STABLE_S, history_secs,
+                    EV_DEBOUNCE_TOLERANCE_W,
                 )
             else:
-                _LOGGER.debug(
-                    "Peak Guard EV solar: '%s' nog wachtend op stabiel overschot "
-                    "(huidig: %.0f W)",
-                    device.name, excess,
+                _LOGGER.info(
+                    "Peak Guard EV solar: → '%s' nog wachtend op stabiel overschot "
+                    "(huidig=%.0f W, %.0f/%.0f s verstreken)",
+                    device.name, excess, history_secs, EV_DEBOUNCE_STABLE_S,
                 )
             # Return unchanged excess (we don't count unconfirmed surplus as consumed)
             return excess
@@ -1208,7 +1352,7 @@ class PeakGuardController:
 
                 actual_consumption_w = new_a * voltage
                 _LOGGER.info(
-                    "Peak Guard EV solar: '%s' ingeschakeld op %d A "
+                    "Peak Guard EV solar: → '%s' AANgeschakeld op %d A "
                     "(ceil van %.2f A, verbruik %.0f W, %d fase(n), SOC-override: %s%%, "
                     "rate-limiter: %d/%d calls in %.0f s)",
                     device.name, new_a, available_a_raw,
