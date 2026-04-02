@@ -124,7 +124,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Verwijder Peak Guard."""
-    # Unload sensor-platform
+    # Stop de minuut-timer van SharedCapacityState voor unload van de platforms
+    shared = hass.data.get(DOMAIN, {}).get("shared")
+    if shared:
+        shared.stop()
+
+    # Unload sensor- en button-platforms
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
     controller = hass.data[DOMAIN].pop("controller", None)
