@@ -52,6 +52,16 @@ DEFAULT_EV_MIN_AMPERE = 6
 DEFAULT_EV_MAX_AMPERE = 32
 DEFAULT_EV_MAX_SOC = 100   # % - maximaal batterijpercentage bij zonne-overschot
 
+# EV Solar-cascade drempelwaarden
+# Start-drempel: minimale injectie (W) vooraleer de EV-lader mag starten.
+# Dit is LOSGEKOPPELD van het hardware-minimum (min_value/min_current_ev).
+# 230 W ≈ 1 A @ 230 V — laagste zinvolle drempel voor Tesla hardware.
+DEFAULT_EV_SOLAR_START_THRESHOLD_W: float = 230.0
+
+# Stop-drempel: de EV stopt alleen als surplus ná uitschakelen ≤ 0 W zou zijn.
+# Hysteresis: voorkomt constant aan/uit schakelen bij borderline surplus.
+DEFAULT_EV_SOLAR_STOP_THRESHOLD_W: float = 0.0
+
 # ------------------------------------------------------------------ #
 #  Panel / frontend                                                    #
 # ------------------------------------------------------------------ #
