@@ -174,6 +174,9 @@ class CascadeDevice:
       ev_battery_entity : entity_id van de sensor die het huidig batterijniveau toont (optioneel)
       ev_max_soc        : gewenst maximumpercentage bij zonne-overschot (0-100)
       ev_phases         : aantal fasen (1 of 3), default 1
+      ev_min_current    : hardware-minimum laadstroom (A) — de Tesla accepteert NOOIT minder.
+                          Verschilt van min_value (die ook als floor voor peak-cascade dient).
+                          Standaard gelijk aan DEFAULT_EV_MIN_AMPERE (6 A) als niet ingesteld.
       min_value         : minimale laadstroom (A), default 6
       max_value         : maximale laadstroom (A), default 32
 
@@ -201,6 +204,8 @@ class CascadeDevice:
     ev_battery_entity:  Optional[str] = None
     ev_max_soc:         Optional[int] = None
     ev_phases:          int = 1
+    ev_min_current:     Optional[float] = None   # hardware-minimum laadstroom (A)
+    start_threshold_w:  Optional[float] = None   # solar start-drempel (W), default 230
 
     def to_dict(self) -> dict:
         return asdict(self)
