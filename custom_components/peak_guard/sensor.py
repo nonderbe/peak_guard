@@ -231,6 +231,9 @@ async def async_setup_entry(
     shared.set_solar_state_store(solar_state_store)
     await shared.async_start(entities)
 
+    # Sla shared op zodat async_unload_entry de timer kan stoppen
+    hass.data[DOMAIN]["shared"] = shared
+
 
 class SharedCapacityState:
     """
