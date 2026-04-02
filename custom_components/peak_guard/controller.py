@@ -771,6 +771,7 @@ class PeakGuardController:
                 # Clear guard state so fresh debounce starts
                 guard = self._ev_guard(device.id)
                 guard.state = EVState.CHARGING
+                guard.last_switch_state = True   # schakelaar is nu (weer) aan
                 guard.turned_on_at = datetime.now(timezone.utc)
                 guard.surplus_history.clear()
                 return True
@@ -824,6 +825,21 @@ class PeakGuardController:
                     guard = self._ev_guard(device.id)
                     guard.state = EVState.IDLE
                     guard.turned_off_at = datetime.now(timezone.utc)
+                    guard.surplus_history.clear()
+                else:
+                    # Schakelaar staat al uit — snapshot opruimen zonder extra actie.
+                    # (Kan optreden na HA-herstart of als de lader zelf al gestopt is.)
+                    _LOGGER.debug(
+                        "Peak Guard EV solar: '%s' schakelaar al uit bij herstel — "
+                        "snapshot opgeruimd zonder service-call",
+                        device.name,
+                    )
+                    self.solar_tracker.complete_solar_calculation(
+                        device_id=device.id,
+                        now=datetime.now(timezone.utc),
+                    )
+                    guard = self._ev_guard(device.id)
+                    guard.state = EVState.IDLE
                     guard.surplus_history.clear()
                 return True
 
@@ -1324,6 +1340,8 @@ class PeakGuardController:
                 surplus_after_stop = excess - ev_current_w
                 if surplus_after_stop > DEFAULT_EV_SOLAR_STOP_THRESHOLD_W:
                     # Er blijft nog voldoende surplus over na uitschakelen → doorladen.
+                    # Houd de surplus_history bij zodat de debounce-buffer actueel blijft.
+                    self._ev_surplus_is_stable(guard, excess, now)
                     _LOGGER.debug(
                         "Peak Guard [SOLAR]: '%s' draait — surplus %.0f W < start-drempel %.0f W "
                         "maar surplus na stop zou %.0f W zijn (> stop-drempel %.0f W) → doorladen",
