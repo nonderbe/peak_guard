@@ -26,6 +26,7 @@ from .const import (
     DEFAULT_POWER_DETECTION_TOLERANCE_PERCENT,
     DEFAULT_EV_MIN_AMPERE,
     DEFAULT_EV_MAX_AMPERE,
+    DEFAULT_EV_CABLE_ENTITY,
     DEFAULT_EV_SOLAR_START_THRESHOLD_W,
     DEFAULT_EV_SOLAR_STOP_THRESHOLD_W,
     ACTION_SWITCH_OFF,
@@ -80,6 +81,7 @@ class EVState(Enum):
     IDLE                    = "idle"
     CHARGING                = "charging"
     WAITING_FOR_STABLE      = "waiting_for_stable_surplus"
+    CABLE_DISCONNECTED      = "cable_disconnected"   # laadkabel niet aangesloten
 
 
 # ──────────────────────────────────────────────────────────────────────────── #
@@ -179,6 +181,10 @@ class CascadeDevice:
       ev_min_current    : hardware-minimum laadstroom (A) — de Tesla accepteert NOOIT minder.
                           Verschilt van min_value (die ook als floor voor peak-cascade dient).
                           Standaard gelijk aan DEFAULT_EV_MIN_AMPERE (6 A) als niet ingesteld.
+      ev_cable_entity   : sensor die aangeeft of de laadkabel aangesloten is.
+                          Laden start alleen als de sensor een truthy-state heeft ("on", "true",
+                          "connected", of een numerieke waarde ≠ 0).
+                          Standaard: DEFAULT_EV_CABLE_ENTITY ("sensor.tesla_opladen").
       min_value         : minimale laadstroom (A), default 6
       max_value         : maximale laadstroom (A), default 32
 
@@ -208,6 +214,7 @@ class CascadeDevice:
     ev_phases:          int = 1
     ev_min_current:     Optional[float] = None   # hardware-minimum laadstroom (A)
     start_threshold_w:  Optional[float] = None   # solar start-drempel (W), default 230
+    ev_cable_entity:    Optional[str]   = None   # sensor die kabelaansluiting detecteert
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -284,6 +291,52 @@ class PeakGuardController:
     def _ev_record_call(self) -> None:
         """Register that we just made an EV service call."""
         self._ev_rate_limiter.record()
+
+    # ------------------------------------------------------------------ #
+    #  Kabeldetectie helper                                                 #
+    # ------------------------------------------------------------------ #
+
+    def _ev_cable_connected(self, device: "CascadeDevice") -> bool:
+        """
+        Geeft True als de laadkabel aangesloten is (of als er geen kabelentity is geconfigureerd).
+
+        Een sensor wordt als "kabel aangesloten" beschouwd als de state een van de
+        volgende truthy-waarden heeft: "on", "true", "connected", "charging",
+        "complete", "1", of een numerieke waarde > 0.
+        Bij "off", "false", "disconnected", "unavailable", "unknown" of een lege
+        state wordt False teruggegeven.
+        """
+        cable_entity = device.ev_cable_entity or DEFAULT_EV_CABLE_ENTITY
+        if not cable_entity:
+            return True  # geen entiteit geconfigureerd → neem aan dat kabel ok is
+
+        state = self.hass.states.get(cable_entity)
+        if state is None:
+            _LOGGER.debug(
+                "Peak Guard EV: kabelentity '%s' niet gevonden voor '%s' — "
+                "kabelcheck overgeslagen (aanname: aangesloten)",
+                cable_entity, device.name,
+            )
+            return True  # entity onbekend → niet blokkeren
+
+        s = state.state.lower().strip()
+        if s in ("unavailable", "unknown", ""):
+            return True  # tijdelijk onbeschikbaar → niet blokkeren
+
+        # Truthy-states: kabel is aangesloten / laden loopt / volledig geladen
+        CABLE_ON = {"on", "true", "connected", "charging", "complete",
+                    "fully_charged", "pending", "1"}
+        if s in CABLE_ON:
+            return True
+
+        # Numerieke waarde > 0 → ook aangesloten
+        try:
+            return float(s) > 0
+        except (ValueError, TypeError):
+            pass
+
+        # Alles anders (off, false, disconnected, …) → kabel los
+        return False
 
     # ------------------------------------------------------------------ #
     #  Debounce helper                                                     #
@@ -382,42 +435,22 @@ class PeakGuardController:
     async def start_monitoring(self):
         self._monitoring = True
         self._task = self.hass.loop.create_task(self._monitor_loop())
-        # Startup diagnostic: validate sensor configuration
+        # Startup diagnostic: alleen configuratie loggen.
+        # Sensorwaarden worden NIET gecontroleerd bij opstarten omdat HA-entities
+        # bij het laden van de integratie nog in staat unknown/unavailable kunnen
+        # zijn — ook al zijn ze in de UI al zichtbaar. De monitor-loop handelt
+        # sensor-beschikbaarheid zelf af na de initiële opstart-vertraging.
         consumption_id = self.config.get(CONF_CONSUMPTION_SENSOR)
         peak_id = self.config.get(CONF_PEAK_SENSOR)
-        consumption_state = self.hass.states.get(consumption_id) if consumption_id else None
-        peak_state = self.hass.states.get(peak_id) if peak_id else None
         _LOGGER.info(
             "Peak Guard: monitoring gestart — "
-            "verbruikssensor='%s' (huidig: %s), piek-sensor='%s' (huidig: %s), "
+            "verbruikssensor='%s', piek-sensor='%s', "
             "piek-cascade: %d apparaat/apparaten, inject-cascade: %d apparaat/apparaten",
             consumption_id,
-            consumption_state.state if consumption_state else "NIET GEVONDEN",
             peak_id,
-            peak_state.state if peak_state else "NIET GEVONDEN",
             len([d for d in self.peak_cascade if d.enabled]),
             len([d for d in self.inject_cascade if d.enabled]),
         )
-        if consumption_state is None:
-            _LOGGER.error(
-                "Peak Guard: ⚠️  verbruikssensor '%s' NIET GEVONDEN in HA! "
-                "Controleer de configuratie — monitoring werkt niet correct.",
-                consumption_id,
-            )
-        else:
-            try:
-                val = float(consumption_state.state)
-                if val >= 0:
-                    _LOGGER.info(
-                        "Peak Guard: verbruikssensor geeft %.0f W (positief = import). "
-                        "Solar surplus detectie werkt alleen als deze sensor NEGATIEF wordt bij export.",
-                        val,
-                    )
-            except (ValueError, TypeError):
-                _LOGGER.warning(
-                    "Peak Guard: verbruikssensor '%s' heeft ongeldige waarde '%s'",
-                    consumption_id, consumption_state.state,
-                )
 
     async def stop_monitoring(self):
         self._monitoring = False
@@ -444,10 +477,20 @@ class PeakGuardController:
                 raw_interval,
             )
 
+        # Opstart-vertraging: HA-entities zijn bij het laden van de integratie
+        # soms nog in staat unknown/unavailable. Na 10 s zijn ze normaal gezien
+        # beschikbaar. Zo vermijden we valse "sensor niet beschikbaar"-warnings
+        # in het logboek direct na het opstarten.
+        _LOGGER.debug("Peak Guard: wacht 10 s op HA-opstart vóór eerste loop-iteratie")
+        await asyncio.sleep(10.0)
+
+        _sensor_unavailable_count = 0   # teller voor herhaalde warnings
+
         while self._monitoring:
             try:
                 consumption = self._sensor_value(self.config.get(CONF_CONSUMPTION_SENSOR))
                 if consumption is not None:
+                    _sensor_unavailable_count = 0   # reset bij succesvolle lezing
                     _LOGGER.debug(
                         "Peak Guard loop: verbruikssensor=%.0f W (positief=import, negatief=export)",
                         consumption,
@@ -473,11 +516,21 @@ class PeakGuardController:
                     self._prev_consumption = consumption
                 else:
                     sensor_id = self.config.get(CONF_CONSUMPTION_SENSOR)
-                    _LOGGER.warning(
-                        "Peak Guard: verbruikssensor '%s' niet beschikbaar of onbekend — "
-                        "loop overgeslagen",
-                        sensor_id,
-                    )
+                    _sensor_unavailable_count += 1
+                    # Eerste keer: debug (kan normaal zijn bij opstart of korte onderbreking).
+                    # Herhaaldelijk: warning zodat echte problemen zichtbaar blijven.
+                    if _sensor_unavailable_count == 1:
+                        _LOGGER.debug(
+                            "Peak Guard: verbruikssensor '%s' nog niet beschikbaar — "
+                            "loop overgeslagen (kan normaal zijn bij opstart)",
+                            sensor_id,
+                        )
+                    elif _sensor_unavailable_count % 5 == 0:
+                        _LOGGER.warning(
+                            "Peak Guard: verbruikssensor '%s' al %d loop-iteraties niet beschikbaar — "
+                            "controleer de sensor-configuratie",
+                            sensor_id, _sensor_unavailable_count,
+                        )
                     self._prev_consumption = None
             except Exception:
                 _LOGGER.exception("Peak Guard: fout in monitoring loop")
@@ -1324,6 +1377,34 @@ class PeakGuardController:
             f"{current_a:.1f}" if current_a is not None else "onbekend",
             guard.state.value,
         )
+
+        # ── GATE: kabeldetectie ─────────────────────────────────────────── #
+        # Als de laadkabel niet aangesloten is, kan het laden niet starten.
+        # We blokkeren alleen het STARTEN, niet het stoppen van een lopende sessie
+        # (de kabel kan niet losgaan terwijl er geladen wordt).
+        cable_entity = device.ev_cable_entity or DEFAULT_EV_CABLE_ENTITY
+        if not sw_on and not self._ev_cable_connected(device):
+            if guard.state != EVState.CABLE_DISCONNECTED:
+                guard.state = EVState.CABLE_DISCONNECTED
+                _LOGGER.info(
+                    "Peak Guard [SOLAR]: '%s' — laadkabel NIET aangesloten "
+                    "('%s' = '%s') — laden geblokkeerd",
+                    device.name, cable_entity,
+                    (self.hass.states.get(cable_entity) or type("", (), {"state": "??"})()).state,
+                )
+            else:
+                _LOGGER.debug(
+                    "Peak Guard [SOLAR]: '%s' — kabel nog steeds niet aangesloten, wachten",
+                    device.name,
+                )
+            return excess
+        if guard.state == EVState.CABLE_DISCONNECTED:
+            _LOGGER.info(
+                "Peak Guard [SOLAR]: '%s' — laadkabel nu aangesloten — doorgang hersteld",
+                device.name,
+            )
+            guard.state = EVState.IDLE
+            guard.surplus_history.clear()
 
         # ── GATE: start-drempel check ───────────────────────────────────── #
         # Twee scenario's:
