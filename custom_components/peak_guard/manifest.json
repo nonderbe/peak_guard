@@ -3,10 +3,16 @@
   "name": "Peak Guard",
   "documentation": "https://github.com/nonderbe/peak_guard",
   "issue_tracker": "https://github.com/nonderbe/peak_guard/issues",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "config_flow": true,
   "requirements": [],
-  "dependencies": ["frontend", "http", "panel_custom"],
-  "codeowners": ["@nonderbe"],
+  "dependencies": [
+    "frontend",
+    "http",
+    "panel_custom"
+  ],
+  "codeowners": [
+    "@nonderbe"
+  ],
   "iot_class": "local_polling"
 }
