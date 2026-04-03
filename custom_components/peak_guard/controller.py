@@ -631,7 +631,7 @@ class PeakGuardController:
                 "(verbruik=%.0f W, piekgrens=%.0f W, buffer=%.0f W, "
                 "%d apparaat/apparaten: %s)",
                 excess, consumption, peak, buffer, len(enabled_devices),
-                ", ".join(f"'%s'" % d.name for d in enabled_devices) or "–",
+                ", ".join(f"'{d.name}'" for d in enabled_devices) or "–",
             )
             if not enabled_devices:
                 _LOGGER.warning("Peak Guard: geen actieve apparaten in piek-cascade — niets te doen!")
@@ -650,7 +650,7 @@ class PeakGuardController:
                 "Peak Guard [SOLAR cascade]: gestart — overschot = %.0f W "
                 "(buffer=%.0f W, %d apparaat/apparaten: %s)",
                 injection, buffer, len(enabled_devices),
-                ", ".join(f"'%s'" % d.name for d in enabled_devices) or "–",
+                ", ".join(f"'{d.name}'" for d in enabled_devices) or "–",
             )
             if not enabled_devices:
                 _LOGGER.warning(
@@ -1490,11 +1490,12 @@ class PeakGuardController:
         # en wachten tot de EV verbonden is. Blokkering geldt alleen voor STARTEN,
         # niet voor een al lopende laadsessie.
         if not sw_on and device.ev_wake_button and not self._ev_is_connected(device):
-            status_entity = device.ev_status_sensor or "(onbekend)"
-            status_val = ""
+            status_entity = device.ev_status_sensor or "(geen sensor)"
             if device.ev_status_sensor:
                 st = self.hass.states.get(device.ev_status_sensor)
                 status_val = st.state if st else "niet gevonden"
+            else:
+                status_val = "geen sensor geconfigureerd"
             if guard.state != EVState.SLEEPING:
                 guard.state = EVState.SLEEPING
                 guard.wake_requested_at = now
