@@ -28,6 +28,7 @@ from typing import Any, Optional
 from homeassistant.components.switch import SwitchEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN, ACTION_EV_CHARGER
@@ -190,8 +191,9 @@ class PeakGuardDeviceSwitch(SwitchEntity):
     async def async_added_to_hass(self) -> None:
         """Luister naar state-changes van de onderliggende entity."""
         self.async_on_remove(
-            self._hass.bus.async_listen(
-                "state_changed",
+            async_track_state_change_event(
+                self._hass,
+                [self._target_entity],
                 self._on_state_changed,
             )
         )
@@ -199,5 +201,4 @@ class PeakGuardDeviceSwitch(SwitchEntity):
     @callback
     def _on_state_changed(self, event: Any) -> None:
         """Update de HA-state als de onderliggende entiteit verandert."""
-        if event.data.get("entity_id") == self._target_entity:
-            self.async_write_ha_state()
+        self.async_write_ha_state()
