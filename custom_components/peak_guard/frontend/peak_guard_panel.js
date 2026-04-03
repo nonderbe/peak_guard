@@ -679,11 +679,11 @@ class PeakGuardPanel extends HTMLElement {
     const step = this._wizardStep;
     const isNew = !d.id;
 
-    const stepLabel = ["Identificatie", "Laadconfiguratie", "Zonne-overschot"];
+    const stepLabel = ["Identificatie", "Laadconfiguratie", "Zonne & Wake-up"];
     const stepDesc  = [
       "Naam en hardware-koppeling",
       "Fasen, stroomsterkte en vermogen",
-      "Batterijlimiet bij zonne-energie",
+      "Batterijlimiet, wake-up en status",
     ];
 
     const stepsHTML = stepLabel.map((lbl, i) => {
@@ -851,6 +851,42 @@ class PeakGuardPanel extends HTMLElement {
             Stel dit hoger in dan uw dagelijkse limiet (bijv. 80% normaal → 100% bij zon).
             Na de laadsessie wordt de originele limiet automatisch hersteld.
             Dit veld heeft alleen effect als u hierboven een SoC-limiet entiteit hebt ingevuld.
+          </div>
+        </div>
+
+        <hr style="border:none;border-top:1px solid var(--divider-color,#e0e0e0);margin:16px 0;" />
+        <div style="font-size:.8em;font-weight:700;text-transform:uppercase;letter-spacing:.06em;
+                    color:var(--secondary-text-color,#757575);margin-bottom:12px;">
+          Wake-up (optioneel — voor auto's die in slaapstand gaan)
+        </div>
+
+        <div class="form-group">
+          <label>Status-sensor <span style="font-weight:400;text-transform:none;">(optioneel)</span></label>
+          <div class="entity-picker">
+            <input id="f-ev-status-sensor" type="text"
+              value="${this._esc(d.ev_status_sensor || '')}"
+              placeholder="binary_sensor.tesla_status" autocomplete="off" />
+            <div id="ev-status-sensor-dropdown" class="entity-dropdown" style="display:none;"></div>
+          </div>
+          <div class="field-hint">
+            Sensor die aangeeft of de auto verbonden is (bijv. <em>binary_sensor.tesla_status</em>).
+            "on" / "connected" / "online" = verbonden; alles anders = slapend.
+            Als deze sensor "verbroken" toont, roept Peak Guard de wake-up knop aan voor het laden start.
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label>Wake-up knop <span style="font-weight:400;text-transform:none;">(optioneel)</span></label>
+          <div class="entity-picker">
+            <input id="f-ev-wake-button" type="text"
+              value="${this._esc(d.ev_wake_button || '')}"
+              placeholder="button.tesla_wakker" autocomplete="off" />
+            <div id="ev-wake-button-dropdown" class="entity-dropdown" style="display:none;"></div>
+          </div>
+          <div class="field-hint">
+            Knop (button.*) om de auto wakker te maken voor het laden.
+            Peak Guard roept deze knop aan als de status-sensor "verbroken" toont,
+            en wacht daarna tot de auto verbonden is.
           </div>
         </div>
       `;
@@ -1048,8 +1084,10 @@ class PeakGuardPanel extends HTMLElement {
         });
 
       } else if (step === 3) {
-        makeEntityPicker("#f-ev-soc-entity",     "#ev-soc-entity-dropdown",     (id) => id.startsWith("number."));
-        makeEntityPicker("#f-ev-battery-entity", "#ev-battery-entity-dropdown", (id) => id.startsWith("sensor."));
+        makeEntityPicker("#f-ev-soc-entity",       "#ev-soc-entity-dropdown",       (id) => id.startsWith("number."));
+        makeEntityPicker("#f-ev-battery-entity",   "#ev-battery-entity-dropdown",   (id) => id.startsWith("sensor."));
+        makeEntityPicker("#f-ev-status-sensor",    "#ev-status-sensor-dropdown",    (id) => id.startsWith("binary_sensor.") || id.startsWith("sensor."));
+        makeEntityPicker("#f-ev-wake-button",      "#ev-wake-button-dropdown",      (id) => id.startsWith("button."));
 
         root.querySelector("#wizard-prev")?.addEventListener("click", () => {
           this._editDevice = { ...(this._editDevice || {}) };
@@ -1117,6 +1155,9 @@ class PeakGuardPanel extends HTMLElement {
 
       const power_watts = Math.round(evMaxA * this._evVoltage(evPhases));
 
+      const evStatusSensor = val("#f-ev-status-sensor") || d.ev_status_sensor || null;
+      const evWakeButton   = val("#f-ev-wake-button")   || d.ev_wake_button   || null;
+
       device = {
         id:               d.id || `dev_${Date.now()}`,
         name:             d.name,
@@ -1133,8 +1174,10 @@ class PeakGuardPanel extends HTMLElement {
         ev_cable_entity:   (d.ev_cable_entity != null && d.ev_cable_entity !== "") ? d.ev_cable_entity : "sensor.tesla_opladen",
         ev_soc_entity:     evSocEntity,
         ev_battery_entity: evBattEntity,
-        ev_max_soc:       evSoc,
-        ev_phases:        evPhases,
+        ev_max_soc:        evSoc,
+        ev_phases:         evPhases,
+        ev_status_sensor:  evStatusSensor,
+        ev_wake_button:    evWakeButton,
       };
 
     } else {
@@ -1166,6 +1209,8 @@ class PeakGuardPanel extends HTMLElement {
         ev_battery_entity: null,
         ev_max_soc:        null,
         ev_phases:         null,
+        ev_status_sensor:  null,
+        ev_wake_button:    null,
       };
     }
 
