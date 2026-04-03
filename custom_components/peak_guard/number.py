@@ -24,6 +24,7 @@ from typing import Any, Optional
 from homeassistant.components.number import NumberEntity, NumberMode
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN, ACTION_EV_CHARGER, DEFAULT_EV_MIN_AMPERE, DEFAULT_EV_MAX_AMPERE
@@ -188,13 +189,13 @@ class PeakGuardEVCurrentNumber(NumberEntity):
 
     async def async_added_to_hass(self) -> None:
         self.async_on_remove(
-            self._hass.bus.async_listen(
-                "state_changed",
+            async_track_state_change_event(
+                self._hass,
+                [self._current_entity],
                 self._on_state_changed,
             )
         )
 
     @callback
     def _on_state_changed(self, event: Any) -> None:
-        if event.data.get("entity_id") == self._current_entity:
-            self.async_write_ha_state()
+        self.async_write_ha_state()
