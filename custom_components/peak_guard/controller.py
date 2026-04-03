@@ -68,6 +68,9 @@ EV_MIN_ON_DURATION_S: float = 360.0     # 6 minutes
 # After turning the charger OFF we refuse to turn it ON again for this long.
 EV_MIN_OFF_DURATION_S: float = 300.0    # 5 minutes
 
+# Maximale wachttijd voor EV wake-up voordat een nieuwe poging wordt gedaan.
+EV_WAKE_TIMEOUT_S: float = 90.0
+
 # Global rate limiter: maximum EV-related service calls per rolling window.
 EV_RATE_LIMIT_MAX_CALLS: int = 12
 EV_RATE_LIMIT_WINDOW_S: float = 600.0   # 10 minutes
@@ -82,6 +85,7 @@ class EVState(Enum):
     CHARGING                = "charging"
     WAITING_FOR_STABLE      = "waiting_for_stable_surplus"
     CABLE_DISCONNECTED      = "cable_disconnected"   # laadkabel niet aangesloten
+    SLEEPING                = "sleeping"              # EV in slaapstand, wake-up bezig
 
 
 # ──────────────────────────────────────────────────────────────────────────── #
@@ -105,8 +109,9 @@ class EVDeviceGuard:
 
     # ---- timestamps --------------------------------------------------- #
     last_current_update: Optional[datetime] = None   # last set_value call
-    turned_on_at:  Optional[datetime] = None         # when we last turned ON
-    turned_off_at: Optional[datetime] = None         # when we last turned OFF
+    turned_on_at:      Optional[datetime] = None     # when we last turned ON
+    turned_off_at:     Optional[datetime] = None     # when we last turned OFF
+    wake_requested_at: Optional[datetime] = None     # wanneer wake-up button is aangeroepen
 
     # ---- debounce ring buffer ----------------------------------------- #
     # Stores (timestamp, surplus_W) tuples for stability check
@@ -182,9 +187,11 @@ class CascadeDevice:
                           Verschilt van min_value (die ook als floor voor peak-cascade dient).
                           Standaard gelijk aan DEFAULT_EV_MIN_AMPERE (6 A) als niet ingesteld.
       ev_cable_entity   : sensor die aangeeft of de laadkabel aangesloten is.
-                          Laden start alleen als de sensor een truthy-state heeft ("on", "true",
-                          "connected", of een numerieke waarde ≠ 0).
-                          Standaard: DEFAULT_EV_CABLE_ENTITY ("sensor.tesla_opladen").
+      ev_wake_button    : button-entity om de EV uit slaapstand te halen (bijv. button.tesla_wakker).
+                          Optioneel; als niet ingesteld wordt wake-up overgeslagen.
+      ev_status_sensor  : sensor die verbindingsstatus toont (bijv. binary_sensor.tesla_status).
+                          "connected"/"online"/"on" = verbonden, anders = slapend.
+                          Optioneel; als niet ingesteld wordt wake-up check overgeslagen.
       min_value         : minimale laadstroom (A), default 6
       max_value         : maximale laadstroom (A), default 32
 
@@ -215,6 +222,8 @@ class CascadeDevice:
     ev_min_current:     Optional[float] = None   # hardware-minimum laadstroom (A)
     start_threshold_w:  Optional[float] = None   # solar start-drempel (W), default 230
     ev_cable_entity:    Optional[str]   = None   # sensor die kabelaansluiting detecteert
+    ev_wake_button:     Optional[str]   = None   # button.* om EV wakker te maken
+    ev_status_sensor:   Optional[str]   = None   # sensor verbindingsstatus EV
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -259,6 +268,11 @@ class PeakGuardController:
         self._ev_guards: Dict[str, EVDeviceGuard] = {}
         # One shared global rate limiter for all EV service calls.
         self._ev_rate_limiter = EVRateLimiter()
+
+        # ── Entity listeners: callbacks die worden aangeroepen na elke
+        # update_cascade() aanroep, zodat switch/number platforms
+        # dynamisch nieuwe entities kunnen aanmaken.
+        self._entity_listeners: list = []
 
     # ------------------------------------------------------------------ #
     #  EV guard helpers                                                    #
@@ -337,6 +351,48 @@ class PeakGuardController:
 
         # Alles anders (off, false, disconnected, …) → kabel los
         return False
+
+    # ------------------------------------------------------------------ #
+    #  EV verbindingsstatus helper (wake-up check)                         #
+    # ------------------------------------------------------------------ #
+
+    def _ev_is_connected(self, device: "CascadeDevice") -> bool:
+        """
+        Geeft True als de EV verbonden/online is, of als er geen status-sensor is.
+
+        Gebruikt om te bepalen of de auto wakker is voor het starten van laden.
+        States die als "verbonden" worden beschouwd:
+          "on", "true", "connected", "online", "home", "charging", "1"
+        Bij ontbrekende of unavailable sensor: True (geen blokkering).
+        """
+        status_entity = device.ev_status_sensor
+        if not status_entity:
+            return True
+
+        state = self.hass.states.get(status_entity)
+        if state is None:
+            _LOGGER.debug(
+                "Peak Guard EV: status-sensor '%s' niet gevonden voor '%s' — "
+                "wake-up check overgeslagen (aanname: verbonden)",
+                status_entity, device.name,
+            )
+            return True
+
+        s = state.state.lower().strip()
+        if s in ("unavailable", "unknown", ""):
+            return True  # tijdelijk onbeschikbaar → niet blokkeren
+
+        CONNECTED = {"on", "true", "connected", "online", "home",
+                     "charging", "complete", "fully_charged", "pending", "1"}
+        if s in CONNECTED:
+            return True
+
+        try:
+            return float(s) > 0
+        except (ValueError, TypeError):
+            pass
+
+        return False  # off, false, disconnected, offline, asleep, …
 
     # ------------------------------------------------------------------ #
     #  Debounce helper                                                     #
@@ -427,6 +483,20 @@ class PeakGuardController:
             self.peak_cascade = parsed
         elif cascade_type == "inject":
             self.inject_cascade = parsed
+        # Notificeer entity-platforms zodat nieuwe apparaten een entity krijgen
+        for cb in self._entity_listeners:
+            try:
+                cb()
+            except Exception:
+                pass
+
+    def register_entity_listener(self, callback) -> None:
+        """Registreer een callback die wordt aangeroepen na elke cascade-update.
+
+        Gebruikt door switch.py en number.py om dynamisch nieuwe entities
+        aan te maken wanneer apparaten worden toegevoegd via de UI.
+        """
+        self._entity_listeners.append(callback)
 
     # ------------------------------------------------------------------ #
     #  Monitoring loop                                                     #
@@ -557,9 +627,11 @@ class PeakGuardController:
         if excess > 0:
             enabled_devices = [d for d in self.peak_cascade if d.enabled]
             _LOGGER.warning(
-                "Peak Guard: piekverbruik overschreden met %.0f W — cascade gestart "
-                "(verbruik=%.0f W, piekgrens=%.0f W, buffer=%.0f W, %d apparaat/apparaten in cascade)",
+                "Peak Guard [PIEK cascade]: gestart — piek overschreden met %.0f W "
+                "(verbruik=%.0f W, piekgrens=%.0f W, buffer=%.0f W, "
+                "%d apparaat/apparaten: %s)",
                 excess, consumption, peak, buffer, len(enabled_devices),
+                ", ".join(f"'%s'" % d.name for d in enabled_devices) or "–",
             )
             if not enabled_devices:
                 _LOGGER.warning("Peak Guard: geen actieve apparaten in piek-cascade — niets te doen!")
@@ -575,9 +647,10 @@ class PeakGuardController:
         if injection > buffer:
             enabled_devices = [d for d in self.inject_cascade if d.enabled]
             _LOGGER.info(
-                "Peak Guard: ☀️  solar surplus %.0f W > buffer %.0f W — inject-cascade gestart "
-                "(%d apparaat/apparaten beschikbaar)",
+                "Peak Guard [SOLAR cascade]: gestart — overschot = %.0f W "
+                "(buffer=%.0f W, %d apparaat/apparaten: %s)",
                 injection, buffer, len(enabled_devices),
+                ", ".join(f"'%s'" % d.name for d in enabled_devices) or "–",
             )
             if not enabled_devices:
                 _LOGGER.warning(
@@ -623,9 +696,9 @@ class PeakGuardController:
         # een nieuwe piekovertreding zodra het apparaat weer aan gaat.
         nominal_w = float(device.power_watts) if device.power_watts else 0.0
         if nominal_w > 0 and headroom < nominal_w:
-            _LOGGER.debug(
-                "Peak Guard [PEAK] herstel '%s' OVERGESLAGEN — "
-                "headroom %.0f W < nominaal vermogen %.0f W (te weinig marge)",
+            _LOGGER.info(
+                "Peak Guard [PIEK]:   · '%s' herstel GEBLOKKEERD — "
+                "headroom %.0f W < nominaal %.0f W (te weinig marge voor herinschakeling)",
                 device.name, headroom, nominal_w,
             )
             return
@@ -984,13 +1057,18 @@ class PeakGuardController:
             handled = before - remaining
             if handled > 0:
                 _LOGGER.info(
-                    "Peak Guard [%s cascade]:   ✓ '%s' verwerkte %.0f W — resterend overschot: %.0f W",
+                    "Peak Guard [%s cascade]:   ✓ '%s' — %.0f W verwerkt, resterend: %.0f W",
                     label, device.name, handled, remaining,
+                )
+            elif handled < 0:
+                _LOGGER.info(
+                    "Peak Guard [%s cascade]:   ✓ '%s' — gestart (%.0f W > surplus), resterend: %.0f W",
+                    label, device.name, abs(handled), remaining,
                 )
             else:
                 _LOGGER.info(
-                    "Peak Guard [%s cascade]:   · '%s' kon niets doen — resterend overschot: %.0f W",
-                    label, device.name, remaining,
+                    "Peak Guard [%s cascade]:   · '%s' — geen actie (zie logs hierboven voor reden)",
+                    label, device.name,
                 )
         if remaining > 0:
             _LOGGER.warning(
@@ -1401,6 +1479,73 @@ class PeakGuardController:
         if guard.state == EVState.CABLE_DISCONNECTED:
             _LOGGER.info(
                 "Peak Guard [SOLAR]: '%s' — laadkabel nu aangesloten — doorgang hersteld",
+                device.name,
+            )
+            guard.state = EVState.IDLE
+            guard.surplus_history.clear()
+
+        # ── GATE: wake-up check ─────────────────────────────────────────── #
+        # Als de EV in slaapstand staat (ev_status_sensor = disconnected/offline)
+        # én er een wake-up button geconfigureerd is, roepen we de button aan
+        # en wachten tot de EV verbonden is. Blokkering geldt alleen voor STARTEN,
+        # niet voor een al lopende laadsessie.
+        if not sw_on and device.ev_wake_button and not self._ev_is_connected(device):
+            status_entity = device.ev_status_sensor or "(onbekend)"
+            status_val = ""
+            if device.ev_status_sensor:
+                st = self.hass.states.get(device.ev_status_sensor)
+                status_val = st.state if st else "niet gevonden"
+            if guard.state != EVState.SLEEPING:
+                guard.state = EVState.SLEEPING
+                guard.wake_requested_at = now
+                _LOGGER.info(
+                    "Peak Guard [SOLAR]: '%s' — EV niet verbonden "
+                    "('%s' = '%s') — wake-up button '%s' aanroepen",
+                    device.name, status_entity, status_val, device.ev_wake_button,
+                )
+                try:
+                    await self.hass.services.async_call(
+                        "button", "press",
+                        {"entity_id": device.ev_wake_button},
+                        blocking=False,
+                    )
+                except Exception as wake_err:
+                    _LOGGER.warning(
+                        "Peak Guard [SOLAR]: '%s' — wake-up aanroep mislukt: %s",
+                        device.name, wake_err,
+                    )
+            else:
+                wake_secs = (now - guard.wake_requested_at).total_seconds() if guard.wake_requested_at else 0
+                if wake_secs > EV_WAKE_TIMEOUT_S:
+                    _LOGGER.warning(
+                        "Peak Guard [SOLAR]: '%s' — wake-up timeout na %.0f s "
+                        "('%s' nog steeds '%s') — opnieuw proberen",
+                        device.name, wake_secs, status_entity, status_val,
+                    )
+                    guard.wake_requested_at = now
+                    try:
+                        await self.hass.services.async_call(
+                            "button", "press",
+                            {"entity_id": device.ev_wake_button},
+                            blocking=False,
+                        )
+                    except Exception as wake_err:
+                        _LOGGER.warning(
+                            "Peak Guard [SOLAR]: '%s' — wake-up herpoging mislukt: %s",
+                            device.name, wake_err,
+                        )
+                else:
+                    _LOGGER.debug(
+                        "Peak Guard [SOLAR]: '%s' — wachten op EV wake-up "
+                        "(%.0f/%.0f s, '%s'='%s')",
+                        device.name, wake_secs, EV_WAKE_TIMEOUT_S,
+                        status_entity, status_val,
+                    )
+            return excess
+
+        if guard.state == EVState.SLEEPING:
+            _LOGGER.info(
+                "Peak Guard [SOLAR]: '%s' — EV nu verbonden na wake-up — doorgang hersteld",
                 device.name,
             )
             guard.state = EVState.IDLE
