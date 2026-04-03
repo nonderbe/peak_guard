@@ -17,7 +17,7 @@ _LOGGER = logging.getLogger(__name__)
 _PANEL_REGISTERED_KEY = f"{DOMAIN}_panel_registered"
 
 # Platforms die door deze integratie geladen worden
-PLATFORMS = ["sensor", "button"]
+PLATFORMS = ["sensor", "button", "switch", "number"]
 
 
 class PeakGuardCascadeView(HomeAssistantView):
