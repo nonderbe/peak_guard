@@ -68,8 +68,9 @@ EV_MIN_ON_DURATION_S: float = 360.0     # 6 minutes
 # After turning the charger OFF we refuse to turn it ON again for this long.
 EV_MIN_OFF_DURATION_S: float = 300.0    # 5 minutes
 
-# Maximale wachttijd voor EV wake-up voordat een nieuwe poging wordt gedaan.
-EV_WAKE_TIMEOUT_S: float = 90.0
+# Maximale wachttijd (seconden) om te wachten tot de EV wakker is na wake-up.
+# De controller pollt elke seconde en start laden zodra de status "on" is.
+EV_WAKE_TIMEOUT_S: float = 15.0
 
 # Global rate limiter: maximum EV-related service calls per rolling window.
 EV_RATE_LIMIT_MAX_CALLS: int = 12
@@ -1484,74 +1485,6 @@ class PeakGuardController:
             guard.state = EVState.IDLE
             guard.surplus_history.clear()
 
-        # ── GATE: wake-up check ─────────────────────────────────────────── #
-        # Als de EV in slaapstand staat (ev_status_sensor = disconnected/offline)
-        # én er een wake-up button geconfigureerd is, roepen we de button aan
-        # en wachten tot de EV verbonden is. Blokkering geldt alleen voor STARTEN,
-        # niet voor een al lopende laadsessie.
-        if not sw_on and device.ev_wake_button and not self._ev_is_connected(device):
-            status_entity = device.ev_status_sensor or "(geen sensor)"
-            if device.ev_status_sensor:
-                st = self.hass.states.get(device.ev_status_sensor)
-                status_val = st.state if st else "niet gevonden"
-            else:
-                status_val = "geen sensor geconfigureerd"
-            if guard.state != EVState.SLEEPING:
-                guard.state = EVState.SLEEPING
-                guard.wake_requested_at = now
-                _LOGGER.info(
-                    "Peak Guard [SOLAR]: '%s' — EV niet verbonden "
-                    "('%s' = '%s') — wake-up button '%s' aanroepen",
-                    device.name, status_entity, status_val, device.ev_wake_button,
-                )
-                try:
-                    await self.hass.services.async_call(
-                        "button", "press",
-                        {"entity_id": device.ev_wake_button},
-                        blocking=False,
-                    )
-                except Exception as wake_err:
-                    _LOGGER.warning(
-                        "Peak Guard [SOLAR]: '%s' — wake-up aanroep mislukt: %s",
-                        device.name, wake_err,
-                    )
-            else:
-                wake_secs = (now - guard.wake_requested_at).total_seconds() if guard.wake_requested_at else 0
-                if wake_secs > EV_WAKE_TIMEOUT_S:
-                    _LOGGER.warning(
-                        "Peak Guard [SOLAR]: '%s' — wake-up timeout na %.0f s "
-                        "('%s' nog steeds '%s') — opnieuw proberen",
-                        device.name, wake_secs, status_entity, status_val,
-                    )
-                    guard.wake_requested_at = now
-                    try:
-                        await self.hass.services.async_call(
-                            "button", "press",
-                            {"entity_id": device.ev_wake_button},
-                            blocking=False,
-                        )
-                    except Exception as wake_err:
-                        _LOGGER.warning(
-                            "Peak Guard [SOLAR]: '%s' — wake-up herpoging mislukt: %s",
-                            device.name, wake_err,
-                        )
-                else:
-                    _LOGGER.debug(
-                        "Peak Guard [SOLAR]: '%s' — wachten op EV wake-up "
-                        "(%.0f/%.0f s, '%s'='%s')",
-                        device.name, wake_secs, EV_WAKE_TIMEOUT_S,
-                        status_entity, status_val,
-                    )
-            return excess
-
-        if guard.state == EVState.SLEEPING:
-            _LOGGER.info(
-                "Peak Guard [SOLAR]: '%s' — EV nu verbonden na wake-up — doorgang hersteld",
-                device.name,
-            )
-            guard.state = EVState.IDLE
-            guard.surplus_history.clear()
-
         # ── GATE: start-drempel check ───────────────────────────────────── #
         # Twee scenario's:
         #   A) EV staat UIT  → alleen starten als excess ≥ start_threshold_w
@@ -1682,6 +1615,56 @@ class PeakGuardController:
                 )
                 # Already on according to our guard; fall through to current adjustment
             else:
+                # ── GATE: wake-up check ───────────────────────────────── #
+                # Alleen hier: we hebben besloten te starten (surplus OK,
+                # debounce stabiel, alle gates gepasseerd). Nu pas checken
+                # of de EV wakker is. Als niet → wekken en wachten.
+                if device.ev_wake_button and not self._ev_is_connected(device):
+                    status_entity = device.ev_status_sensor or "(geen sensor)"
+                    status_val = "onbekend"
+                    if device.ev_status_sensor:
+                        _st = self.hass.states.get(device.ev_status_sensor)
+                        status_val = _st.state if _st else "niet gevonden"
+                    _LOGGER.info(
+                        "Peak Guard [SOLAR]: '%s' — Tesla in slaapstand "
+                        "('%s' = '%s') → wake button '%s' aanroepen",
+                        device.name, status_entity, status_val, device.ev_wake_button,
+                    )
+                    try:
+                        await self.hass.services.async_call(
+                            "button", "press",
+                            {"entity_id": device.ev_wake_button},
+                            blocking=False,
+                        )
+                    except Exception as wake_err:
+                        _LOGGER.warning(
+                            "Peak Guard [SOLAR]: '%s' — wake-up aanroep mislukt: %s",
+                            device.name, wake_err,
+                        )
+                    # Wacht maximaal EV_WAKE_TIMEOUT_S seconden tot auto wakker is
+                    wake_ok = False
+                    for _ in range(int(EV_WAKE_TIMEOUT_S)):
+                        await asyncio.sleep(1.0)
+                        if self._ev_is_connected(device):
+                            wake_ok = True
+                            break
+                    if wake_ok:
+                        if device.ev_status_sensor:
+                            _st2 = self.hass.states.get(device.ev_status_sensor)
+                            status_val = _st2.state if _st2 else "verbonden"
+                        _LOGGER.info(
+                            "Peak Guard [SOLAR]: '%s' — Tesla nu wakker "
+                            "('%s' = '%s') → laden starten met %d A",
+                            device.name, status_entity, status_val, new_a,
+                        )
+                    else:
+                        _LOGGER.warning(
+                            "Peak Guard [SOLAR]: '%s' — Tesla niet wakker na %.0f s "
+                            "('%s' = '%s') — laden uitgesteld tot volgende cyclus",
+                            device.name, EV_WAKE_TIMEOUT_S, status_entity, status_val,
+                        )
+                        return excess  # volgende loop-iteratie opnieuw proberen
+
                 # ── GATE: global rate limiter ─────────────────────────── #
                 if not self._ev_rate_check(device.name, "turn_on voor injectiepreventie"):
                     return excess
