@@ -647,7 +647,7 @@ class PeakGuardController:
         )
         if injection > buffer:
             enabled_devices = [d for d in self.inject_cascade if d.enabled]
-            _LOGGER.info(
+            _LOGGER.warning(
                 "Peak Guard [SOLAR cascade]: gestart — overschot = %.0f W "
                 "(buffer=%.0f W, %d apparaat/apparaten: %s)",
                 injection, buffer, len(enabled_devices),
@@ -1044,7 +1044,7 @@ class PeakGuardController:
             [d for d in cascade if d.enabled], key=lambda x: x.priority
         )
         label = "PIEK" if cascade_type == "peak" else "SOLAR"
-        _LOGGER.info(
+        _LOGGER.warning(
             "Peak Guard [%s cascade]: start — overschot=%.0f W, %d apparaat/apparaten (prioriteitsvolgorde: %s)",
             label, excess,
             len(sorted_devices),
@@ -1053,7 +1053,7 @@ class PeakGuardController:
         remaining = excess
         for device in sorted_devices:
             if remaining <= 0:
-                _LOGGER.info(
+                _LOGGER.warning(
                     "Peak Guard [%s cascade]: overschot opgelost (0 W resterend) — "
                     "verdere apparaten niet verwerkt",
                     label,
@@ -1063,17 +1063,17 @@ class PeakGuardController:
             remaining = await self._apply_action(device, remaining, snapshots, cascade_type)
             handled = before - remaining
             if handled > 0:
-                _LOGGER.info(
+                _LOGGER.warning(
                     "Peak Guard [%s cascade]:   ✓ '%s' — %.0f W verwerkt, resterend: %.0f W",
                     label, device.name, handled, remaining,
                 )
             elif handled < 0:
-                _LOGGER.info(
+                _LOGGER.warning(
                     "Peak Guard [%s cascade]:   ✓ '%s' — gestart (%.0f W > surplus), resterend: %.0f W",
                     label, device.name, abs(handled), remaining,
                 )
             else:
-                _LOGGER.info(
+                _LOGGER.warning(
                     "Peak Guard [%s cascade]:   · '%s' — geen actie (zie logs hierboven voor reden)",
                     label, device.name,
                 )
@@ -1084,7 +1084,7 @@ class PeakGuardController:
                 label, remaining,
             )
         else:
-            _LOGGER.info(
+            _LOGGER.warning(
                 "Peak Guard [%s cascade]: klaar — overschot volledig verwerkt ✓",
                 label,
             )
