@@ -680,38 +680,44 @@ class PeakGuardController:
         headroom = peak - buffer - consumption
         if headroom <= 0:
             _LOGGER.debug(
-                "Peak Guard [PEAK] herstel geblokkeerd: verbruik=%.0f W, "
+                "Peak Guard [PIEK] herstel geblokkeerd: verbruik=%.0f W, "
                 "piekgrens=%.0f W, buffer=%.0f W → headroom=%.0f W (≤ 0)",
                 consumption, peak, buffer, headroom,
             )
             return
+
         snapshots_to_restore = self._get_restore_candidates(
             self.peak_cascade, self._peak_snapshots, reverse=True
         )
         if not snapshots_to_restore:
             return
-        device, snapshot = snapshots_to_restore[0]
 
-        # Extra veiligheidscheck: herstel alleen als headroom groter is dan
-        # het nominale vermogen van het apparaat — anders riskeren we meteen
-        # een nieuwe piekovertreding zodra het apparaat weer aan gaat.
-        nominal_w = float(device.power_watts) if device.power_watts else 0.0
-        if nominal_w > 0 and headroom < nominal_w:
-            _LOGGER.info(
-                "Peak Guard [PIEK]:   · '%s' herstel GEBLOKKEERD — "
-                "headroom %.0f W < nominaal %.0f W (te weinig marge voor herinschakeling)",
-                device.name, headroom, nominal_w,
-            )
-            return
+        # Herstel ALLE kandidaten in omgekeerde prioriteitsvolgorde (laagste
+        # prioriteit eerst = het apparaat dat als laatste werd uitgeschakeld).
+        # Per apparaat reduceren we de beschikbare headroom met zijn vermogen
+        # zodat volgende apparaten alleen worden ingeschakeld als er nog marge is.
+        remaining_headroom = headroom
+        for device, snapshot in snapshots_to_restore:
+            nominal_w = float(device.power_watts) if device.power_watts else 0.0
+            if nominal_w > 0 and remaining_headroom < nominal_w:
+                _LOGGER.info(
+                    "Peak Guard [PIEK]:   · '%s' herstel GEBLOKKEERD — "
+                    "headroom %.0f W < nominaal %.0f W (te weinig marge)",
+                    device.name, remaining_headroom, nominal_w,
+                )
+                # Stop: als dit apparaat al te groot is, zijn volgende (hogere
+                # prioriteit = meer vermogen) dat zeker ook.
+                break
 
-        restored = await self._restore_device(device, snapshot)
-        if restored:
-            del self._peak_snapshots[device.entity_id]
-            _LOGGER.info(
-                "Peak Guard [PEAK]: '%s' terug AAN — headroom = %.0f W "
-                "(piek=%.0f W, buffer=%.0f W, verbruik=%.0f W — geen piek-risico meer)",
-                device.name, headroom, peak, buffer, consumption,
-            )
+            restored = await self._restore_device(device, snapshot)
+            if restored:
+                del self._peak_snapshots[device.entity_id]
+                remaining_headroom -= nominal_w   # reserveer vermogen voor volgende check
+                _LOGGER.info(
+                    "Peak Guard [PIEK]: '%s' terug AAN — headroom was %.0f W "
+                    "(piek=%.0f W, buffer=%.0f W, verbruik=%.0f W)",
+                    device.name, headroom, peak, buffer, consumption,
+                )
 
     async def _check_inject_restore(self, consumption: float):
         if not self._inject_snapshots:
