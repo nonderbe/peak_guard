@@ -275,6 +275,10 @@ class PeakGuardController:
         # dynamisch nieuwe entities kunnen aanmaken.
         self._entity_listeners: list = []
 
+        # Laatste reden waarom een apparaat geen actie ondernam (per cascade-run).
+        # Wordt gezet door _apply_action en gebruikt door _run_cascade voor logging.
+        self._last_skip_reason: str = ""
+
     # ------------------------------------------------------------------ #
     #  EV guard helpers                                                    #
     # ------------------------------------------------------------------ #
@@ -513,7 +517,7 @@ class PeakGuardController:
         # sensor-beschikbaarheid zelf af na de initiële opstart-vertraging.
         consumption_id = self.config.get(CONF_CONSUMPTION_SENSOR)
         peak_id = self.config.get(CONF_PEAK_SENSOR)
-        _LOGGER.info(
+        _LOGGER.warning(
             "Peak Guard: monitoring gestart — "
             "verbruikssensor='%s', piek-sensor='%s', "
             "piek-cascade: %d apparaat/apparaten, inject-cascade: %d apparaat/apparaten",
@@ -562,9 +566,12 @@ class PeakGuardController:
                 consumption = self._sensor_value(self.config.get(CONF_CONSUMPTION_SENSOR))
                 if consumption is not None:
                     _sensor_unavailable_count = 0   # reset bij succesvolle lezing
-                    _LOGGER.debug(
-                        "Peak Guard loop: verbruikssensor=%.0f W (positief=import, negatief=export)",
+                    _LOGGER.warning(
+                        "Peak Guard loop: verbruik=%.0f W — %s",
                         consumption,
+                        "EXPORT (solar cascade actief)" if consumption < 0
+                        else "import (piek-cascade actief)" if consumption > 0
+                        else "nul",
                     )
                     await self._check_power_drop(consumption)
                     if consumption > 0:
@@ -573,7 +580,7 @@ class PeakGuardController:
                         await self._check_inject_restore(consumption)
                     elif consumption < 0:
                         # Negatief verbruik = export naar net (zonne-overschot)
-                        _LOGGER.info(
+                        _LOGGER.warning(
                             "Peak Guard: zonne-overschot gedetecteerd — sensor=%.0f W "
                             "(export %.0f W) — solar cascade wordt gecontroleerd",
                             consumption, abs(consumption),
@@ -1060,22 +1067,23 @@ class PeakGuardController:
                 )
                 break
             before = remaining
+            self._last_skip_reason = ""
             remaining = await self._apply_action(device, remaining, snapshots, cascade_type)
             handled = before - remaining
             if handled > 0:
-                _LOGGER.warning(
+                _LOGGER.info(
                     "Peak Guard [%s cascade]:   ✓ '%s' — %.0f W verwerkt, resterend: %.0f W",
                     label, device.name, handled, remaining,
                 )
             elif handled < 0:
-                _LOGGER.warning(
+                _LOGGER.info(
                     "Peak Guard [%s cascade]:   ✓ '%s' — gestart (%.0f W > surplus), resterend: %.0f W",
                     label, device.name, abs(handled), remaining,
                 )
             else:
                 _LOGGER.warning(
-                    "Peak Guard [%s cascade]:   · '%s' — geen actie (zie logs hierboven voor reden)",
-                    label, device.name,
+                    "Peak Guard [%s cascade]:   · '%s' — geen actie: %s",
+                    label, device.name, self._last_skip_reason or "zie detail-logs",
                 )
         if remaining > 0:
             _LOGGER.warning(
@@ -1450,7 +1458,7 @@ class PeakGuardController:
         # Werkelijke laadstroom: altijd ≥ hardware-minimum, ≤ max
         new_a = max(int(hw_min_a), min(int(max_a), math.ceil(available_a_raw)))
 
-        _LOGGER.info(
+        _LOGGER.debug(
             "Peak Guard [SOLAR]: '%s' evalueren — "
             "overschot=%.0f W, spanning=%dV (%d fase(n)), "
             "beschikbaar=%.2f A, doel=%d A (hw-min=%.0f A=%.0f W, max=%d A), "
@@ -1471,7 +1479,8 @@ class PeakGuardController:
         if not sw_on and not self._ev_cable_connected(device):
             if guard.state != EVState.CABLE_DISCONNECTED:
                 guard.state = EVState.CABLE_DISCONNECTED
-                _LOGGER.info(
+                self._last_skip_reason = f"laadkabel niet aangesloten ({cable_entity})"
+                _LOGGER.warning(
                     "Peak Guard [SOLAR]: '%s' — laadkabel NIET aangesloten "
                     "('%s' = '%s') — laden geblokkeerd",
                     device.name, cable_entity,
@@ -1556,7 +1565,8 @@ class PeakGuardController:
                     return excess
             else:
                 # EV staat uit en surplus < start-drempel → geen actie
-                _LOGGER.debug(
+                self._last_skip_reason = f"surplus {excess:.0f} W < start-drempel {start_threshold_w:.0f} W"
+                _LOGGER.info(
                     "Peak Guard [SOLAR]: '%s' staat uit — surplus %.0f W < "
                     "start-drempel %.0f W → geen actie",
                     device.name, excess, start_threshold_w,
@@ -1573,7 +1583,8 @@ class PeakGuardController:
                 history_secs = (now - oldest).total_seconds()
             if guard.state != EVState.WAITING_FOR_STABLE:
                 guard.state = EVState.WAITING_FOR_STABLE
-                _LOGGER.info(
+                self._last_skip_reason = f"debounce: surplus {excess:.0f} W nog niet {EV_DEBOUNCE_STABLE_S:.0f}s stabiel"
+                _LOGGER.warning(
                     "Peak Guard [SOLAR]: '%s' NIET geactiveerd — wacht op stabiel overschot "
                     "(huidig=%.0f W, debounce=%.0f s vereist, tot nu toe=%.0f s, "
                     "tolerantie=±%.0f W)",
@@ -1581,6 +1592,7 @@ class PeakGuardController:
                     EV_DEBOUNCE_TOLERANCE_W,
                 )
             else:
+                self._last_skip_reason = f"debounce: wachten op stabiliteit ({history_secs:.0f}/{EV_DEBOUNCE_STABLE_S:.0f}s)"
                 _LOGGER.info(
                     "Peak Guard [SOLAR]: '%s' nog wachtend op stabiel overschot "
                     "(huidig=%.0f W, %.0f/%.0f s verstreken)",
@@ -1605,6 +1617,7 @@ class PeakGuardController:
             if guard.turned_off_at is not None:
                 off_secs = (now - guard.turned_off_at).total_seconds()
                 if off_secs < EV_MIN_OFF_DURATION_S:
+                    self._last_skip_reason = f"min OFF-duur: {off_secs:.0f}s < {EV_MIN_OFF_DURATION_S:.0f}s"
                     _LOGGER.info(
                         "Peak Guard [SOLAR]: '%s' aanzetten OVERGESLAGEN — "
                         "te kort geleden uitgeschakeld (%.0f s geleden, minimum %.0f s)",
