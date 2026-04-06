@@ -453,6 +453,7 @@ class PeakGuardPanel extends HTMLElement {
           ${device.action_type === "ev_charger"
             ? `<div id="ev-live-${type}-${index}" class="ev-live-status"></div>`
             : ""}
+          ${this._renderDeviceControls(device, index, type)}
         </div>
         <div class="device-actions">
           <button class="btn-icon" data-action="edit"
@@ -462,6 +463,57 @@ class PeakGuardPanel extends HTMLElement {
         </div>
       </div>
     `;
+  }
+
+  // Rendert inline bedieningselementen voor een apparaat in de kaart.
+  _renderDeviceControls(device, index, type) {
+    if (!this._hass) return "";
+
+    const isEV = device.action_type === "ev_charger";
+    const entityId = (isEV && device.ev_switch_entity)
+      ? device.ev_switch_entity : device.entity_id;
+    const state = this._hass.states[entityId];
+    if (!state || state.state === "unavailable" || state.state === "unknown") return "";
+
+    const isOn = state.state === "on";
+    const toggleLabel = isOn
+      ? (isEV ? "⏹ Stop laden" : "Uitschakelen")
+      : (isEV ? "▶ Start laden" : "Inschakelen");
+    const toggleCls = isOn ? "on" : "off";
+
+    let ampereControl = "";
+    if (isEV && device.ev_current_entity) {
+      const curState = this._hass.states[device.ev_current_entity];
+      const curA = curState && curState.state !== "unavailable"
+        ? parseFloat(curState.state) : null;
+      const minA = device.ev_min_current ?? device.min_value ?? 6;
+      const maxA = device.max_value ?? 32;
+      const valA = (!isNaN(curA) ? curA : minA);
+      ampereControl = `
+        <div class="ampere-control" data-ev-current="${this._esc(device.ev_current_entity)}">
+          <label>⚡</label>
+          <input type="range" class="ampere-slider"
+            min="${minA}" max="${maxA}" step="1" value="${valA}"
+            data-action="set-ampere"
+            data-entity="${this._esc(device.ev_current_entity)}"
+            data-index="${index}" data-type="${type}"
+            title="Laadstroom instellen (${minA}–${maxA} A)" />
+          <span class="ampere-value" id="ampere-val-${type}-${index}">${valA} A</span>
+        </div>`;
+    }
+
+    return `
+      <div class="device-controls">
+        <button class="btn-toggle ${toggleCls}"
+          data-action="toggle"
+          data-entity="${this._esc(entityId)}"
+          data-state="${state.state}"
+          data-index="${index}" data-type="${type}"
+          title="${isOn ? "Klik om uit te schakelen" : "Klik om in te schakelen"}">
+          ${toggleLabel}
+        </button>
+        ${ampereControl}
+      </div>`;
   }
 
   // Geeft de live statustext en CSS-klasse terug voor een apparaat
@@ -1302,6 +1354,43 @@ class PeakGuardPanel extends HTMLElement {
       });
     });
 
+    // Toggle aan/uit
+    this.shadowRoot.querySelectorAll("[data-action='toggle']").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const { entity, state } = btn.dataset;
+        if (!entity) return;
+        const isOn = state === "on";
+        btn.disabled = true;
+        try {
+          await this._hass.callService("switch", isOn ? "turn_off" : "turn_on", { entity_id: entity });
+          // Kleine vertraging zodat HA de state kan bijwerken, dan re-render
+          setTimeout(() => this._render(), 800);
+        } catch (e) {
+          console.error("Peak Guard toggle fout:", e);
+        } finally {
+          btn.disabled = false;
+        }
+      });
+    });
+
+    // Ampère slider: live label update + set_value on release
+    this.shadowRoot.querySelectorAll("[data-action='set-ampere']").forEach((slider) => {
+      const { type, index: idxStr } = slider.dataset;
+      const valEl = this.shadowRoot.querySelector(`#ampere-val-${type}-${idxStr}`);
+      slider.addEventListener("input", () => {
+        if (valEl) valEl.textContent = `${slider.value} A`;
+      });
+      slider.addEventListener("change", async () => {
+        const { entity } = slider.dataset;
+        if (!entity) return;
+        try {
+          await this._hass.callService("number", "set_value", { entity_id: entity, value: parseFloat(slider.value) });
+        } catch (e) {
+          console.error("Peak Guard set-ampere fout:", e);
+        }
+      });
+    });
+
     this.shadowRoot
       .querySelectorAll("[data-action='edit'], [data-action='delete'], [data-action='up'], [data-action='down']")
       .forEach((btn) => {
@@ -1474,7 +1563,35 @@ class PeakGuardPanel extends HTMLElement {
         .chip.chip-soc-lim    { background: #5c6bc0; }   /* paars-blauw: huidige limiet */
         .chip.chip-soc-bat    { background: #43a047; }   /* groen: huidig batterijniveau */
         .chip.chip-soc-target { background: #f57c00; }   /* oranje: doel bij zon */
-        .device-actions { display: flex; gap: 4px; }
+        .device-actions { display: flex; gap: 4px; align-items: center; }
+
+        /* Inline device controls */
+        .device-controls {
+          display: flex; align-items: center; gap: 8px;
+          margin-top: 8px; flex-wrap: wrap;
+        }
+        .btn-toggle {
+          padding: 5px 14px; border: none; border-radius: 20px;
+          font-size: .82em; font-weight: 600; cursor: pointer;
+          transition: background .15s, opacity .15s;
+          white-space: nowrap;
+        }
+        .btn-toggle.on  { background: #e8f5e9; color: #2e7d32; border: 1px solid #a5d6a7; }
+        .btn-toggle.off { background: #fff8f0; color: #e65100; border: 1px solid #ffcc80; }
+        .btn-toggle:hover { opacity: .8; }
+        .btn-toggle:disabled { opacity: .4; cursor: default; }
+        .ampere-control {
+          display: flex; align-items: center; gap: 6px;
+        }
+        .ampere-control label { font-size: .8em; color: var(--secondary-text-color,#757575); white-space: nowrap; }
+        .ampere-slider {
+          width: 100px; accent-color: var(--primary-color,#03a9f4);
+          cursor: pointer;
+        }
+        .ampere-value {
+          font-size: .82em; font-weight: 600; min-width: 38px;
+          color: var(--primary-text-color,#212121);
+        }
 
         .btn {
           padding: 8px 16px; border: none; border-radius: 8px;
