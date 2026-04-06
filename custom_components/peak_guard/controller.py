@@ -1028,27 +1028,32 @@ class PeakGuardController:
         original_soc: Optional[float] = None,
     ) -> None:
         if device.ev_max_soc is None:
+            _LOGGER.warning(
+                "Peak Guard EV: '%s' SOC-limiet NIET aangepast — "
+                "ev_max_soc niet geconfigureerd",
+                device.name,
+            )
             return
 
         soc_entity = device.ev_soc_entity
         if not soc_entity:
-            _LOGGER.info(
-                "Peak Guard EV: '%s' SOC-override %s (geen soc_entity geconfigureerd, "
-                "geen service-call gedaan)",
-                device.name, "ACTIEF" if override else "VERWIJDERD",
+            _LOGGER.warning(
+                "Peak Guard EV: '%s' SOC-limiet NIET aangepast — "
+                "geen soc_entity geconfigureerd in de wizard (stap 3: SoC-limiet entiteit)",
+                device.name,
             )
             return
 
         if override:
             target_soc = float(device.ev_max_soc)
-            _LOGGER.info(
-                "Peak Guard EV: '%s' SOC-limiet ingesteld op %.0f%% via '%s'",
+            _LOGGER.warning(
+                "Peak Guard EV: '%s' SOC-limiet instellen op %.0f%% via '%s'",
                 device.name, target_soc, soc_entity,
             )
         else:
             target_soc = float(original_soc) if original_soc is not None else 100.0
-            _LOGGER.info(
-                "Peak Guard EV: '%s' SOC-limiet hersteld naar %.0f%% via '%s'",
+            _LOGGER.warning(
+                "Peak Guard EV: '%s' SOC-limiet herstellen naar %.0f%% via '%s'",
                 device.name, target_soc, soc_entity,
             )
 
