@@ -21,6 +21,10 @@ class PeakGuardPanel extends HTMLElement {
 
     // EV spanning: 1-fase = 230 V, 3-fasen = 400 V
     this._evVoltage = (phases) => phases === 3 ? 400 : 230;
+
+    // Countdown timer state
+    this._countdownInterval = null;  // setInterval handle
+    this._nextCheckAt = null;        // Date wanneer de volgende check verwacht wordt
   }
 
   // ------------------------------------------------------------------ //
@@ -32,10 +36,13 @@ class PeakGuardPanel extends HTMLElement {
       // Nooit data herladen als modal open is
       if (this._hass && !this._modalVisible && !this._fetchInProgress) this._fetchData();
     }, 15000);
+    // Countdown tick elke seconde
+    this._countdownInterval = setInterval(() => this._tickCountdown(), 1000);
   }
 
   disconnectedCallback() {
     clearInterval(this._refreshInterval);
+    clearInterval(this._countdownInterval);
   }
 
   set hass(hass) {
@@ -73,6 +80,8 @@ class PeakGuardPanel extends HTMLElement {
       if (resp.ok) {
         this._data = await resp.json();
         this._log('_fetchData() data ontvangen. modalVisible=' + this._modalVisible);
+        // Bereken wanneer de volgende controller-check verwacht wordt
+        this._recalcNextCheck();
         if (!this._modalVisible) {
           this._log('_fetchData() => _render() aanroepen');
           this._render();
@@ -86,6 +95,43 @@ class PeakGuardPanel extends HTMLElement {
       this._renderError(`Verbindingsfout: ${e.message}`);
     } finally {
       this._fetchInProgress = false;
+    }
+  }
+
+  // Berekent wanneer de volgende check verwacht wordt op basis van last_loop_at en interval_s
+  _recalcNextCheck() {
+    const st = this._data?.status;
+    if (!st?.last_loop_at || !st?.interval_s) { this._nextCheckAt = null; return; }
+    const lastMs = new Date(st.last_loop_at).getTime();
+    if (isNaN(lastMs)) { this._nextCheckAt = null; return; }
+    this._nextCheckAt = new Date(lastMs + st.interval_s * 1000);
+  }
+
+  // Wordt elke seconde aangeroepen — werkt de countdown in de DOM bij
+  _tickCountdown() {
+    const el = this.shadowRoot?.querySelector("#countdown-val");
+    const bar = this.shadowRoot?.querySelector("#countdown-bar");
+    if (!el || !this._nextCheckAt || !this._data?.status?.interval_s) return;
+    const secLeft = Math.max(0, Math.round((this._nextCheckAt - Date.now()) / 1000));
+    const intervalS = this._data.status.interval_s;
+    el.textContent = secLeft > 0 ? `${secLeft}s` : "bezig…";
+    if (bar) bar.style.width = `${Math.round((1 - secLeft / intervalS) * 100)}%`;
+  }
+
+  // Roept de force_check API aan en reset de countdown
+  async _forceCheck() {
+    const btn = this.shadowRoot?.querySelector("#btn-force-check");
+    if (btn) { btn.disabled = true; btn.textContent = "⏳"; }
+    try {
+      await this._hass.fetchWithAuth("/api/peak_guard/force_check", { method: "POST" });
+      // Reset countdown: volgende check over ~1s
+      this._nextCheckAt = new Date(Date.now() + 2000);
+      // Herlaal data na 2s zodat de nieuwe status zichtbaar is
+      setTimeout(() => this._fetchData(), 2000);
+    } catch(e) {
+      console.error("Peak Guard force check fout:", e);
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = "▶ Nu controleren"; }
     }
   }
 
@@ -180,6 +226,22 @@ class PeakGuardPanel extends HTMLElement {
         if (evEl) {
           evEl.textContent = this._evLiveDetail(device);
         }
+        // EV debounce-indicator
+        if (device.action_type === "ev_charger") {
+          const wrapEl  = this.shadowRoot.querySelector(`#ev-debounce-${cascadeType}-${index}`);
+          const fillEl  = this.shadowRoot.querySelector(`#ev-debounce-fill-${cascadeType}-${index}`);
+          if (wrapEl && fillEl) {
+            // Zoek de guard-state voor dit apparaat via device.id
+            const guard = this._data?.status?.ev_guards?.[device.id];
+            const isWaiting = guard?.state === "waiting_for_stable_surplus";
+            wrapEl.style.display = isWaiting ? "" : "none";
+            if (isWaiting && guard.history_len > 0) {
+              // Schat voortgang op basis van history_len samples vs. benodigde 2 samples
+              const pct = Math.min(100, Math.round((guard.history_len / 2) * 100));
+              fillEl.style.width = `${pct}%`;
+            }
+          }
+        }
         // EV SoC chips live bijwerken
         if (device.action_type === "ev_charger" && this._hass) {
           // Chip 1: huidig max laadniveau via ev_soc_entity
@@ -233,7 +295,15 @@ class PeakGuardPanel extends HTMLElement {
               <span class="dot"></span>
               ${this._data.status?.monitoring ? "Actief" : "Inactief"}
             </span>
-            <button class="btn-icon" id="btn-refresh" title="Verversen">🔄</button>
+            <div class="countdown-wrap" title="Tijd tot de volgende cascade-check">
+              <div class="countdown-label">Volgende check: <span id="countdown-val">—</span></div>
+              <div class="countdown-track"><div id="countdown-bar" class="countdown-bar" style="width:0%"></div></div>
+            </div>
+            <button class="btn btn-secondary btn-force" id="btn-force-check"
+              title="Voer direct een nieuwe cascade-check uit (reset countdown)">
+              ▶ Nu controleren
+            </button>
+            <button class="btn-icon" id="btn-refresh" title="GUI verversen">🔄</button>
           </div>
         </header>
 
@@ -451,7 +521,11 @@ class PeakGuardPanel extends HTMLElement {
             ${!device.enabled ? `<span class="chip disabled" title="Dit apparaat is uitgeschakeld en wordt door Peak Guard genegeerd.">Uitgeschakeld</span>` : ""}
           </div>
           ${device.action_type === "ev_charger"
-            ? `<div id="ev-live-${type}-${index}" class="ev-live-status"></div>`
+            ? `<div id="ev-live-${type}-${index}" class="ev-live-status"></div>
+               <div id="ev-debounce-${type}-${index}" class="ev-debounce-bar-wrap" style="display:none;">
+                 <div class="ev-debounce-label">⏳ Wachten op stabiel overschot…</div>
+                 <div class="ev-debounce-track"><div id="ev-debounce-fill-${type}-${index}" class="ev-debounce-fill" style="width:0%"></div></div>
+               </div>`
             : ""}
           ${this._renderDeviceControls(device, index, type)}
         </div>
@@ -1331,6 +1405,9 @@ class PeakGuardPanel extends HTMLElement {
     this.shadowRoot.querySelector("#btn-refresh")?.addEventListener("click", () => {
       this._fetchData();
     });
+    this.shadowRoot.querySelector("#btn-force-check")?.addEventListener("click", () => {
+      this._forceCheck();
+    });
 
     // Chart selector in savings tab
     this.shadowRoot.querySelectorAll(".chart-toggle-btn").forEach((btn) => {
@@ -1469,6 +1546,46 @@ class PeakGuardPanel extends HTMLElement {
         .dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
         .badge.active .dot { animation: pulse 1.5s ease-in-out infinite; }
         @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+
+        /* Countdown */
+        .countdown-wrap {
+          display: flex; flex-direction: column; align-items: flex-end;
+          gap: 3px; min-width: 120px;
+        }
+        .countdown-label {
+          font-size: .75em; color: var(--secondary-text-color, #757575);
+          white-space: nowrap;
+        }
+        .countdown-track {
+          width: 100%; height: 4px; border-radius: 2px;
+          background: var(--divider-color, #e0e0e0); overflow: hidden;
+        }
+        .countdown-bar {
+          height: 100%; border-radius: 2px;
+          background: var(--primary-color, #03a9f4);
+          transition: width 0.9s linear;
+        }
+        .btn-force {
+          font-size: .8em; padding: 5px 12px;
+        }
+
+        /* EV debounce indicator */
+        .ev-debounce-bar-wrap {
+          margin-top: 6px;
+        }
+        .ev-debounce-label {
+          font-size: .75em; color: #f57c00; font-weight: 600;
+          margin-bottom: 3px;
+        }
+        .ev-debounce-track {
+          width: 100%; height: 5px; border-radius: 3px;
+          background: #ffe0b2; overflow: hidden;
+        }
+        .ev-debounce-fill {
+          height: 100%; border-radius: 3px;
+          background: linear-gradient(90deg, #f57c00, #ffb74d);
+          transition: width 0.5s ease;
+        }
 
         .status-row {
           display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
