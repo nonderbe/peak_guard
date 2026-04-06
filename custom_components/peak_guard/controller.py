@@ -8,6 +8,7 @@ from enum import Enum
 from typing import Deque, Dict, List, Optional
 
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.storage import Store
 
 from .avoided_peak_tracker import PeakAvoidTracker, SolarShiftTracker
@@ -410,30 +411,50 @@ class PeakGuardController:
         now: datetime,
     ) -> bool:
         """
-        Return True when the surplus has been within EV_DEBOUNCE_TOLERANCE_W
-        of its current value for at least EV_DEBOUNCE_STABLE_S seconds.
+        Return True when the surplus has been above zero and within
+        EV_DEBOUNCE_TOLERANCE_W watts (min-to-max spread) for at least
+        EV_DEBOUNCE_STABLE_S seconds.
+
+        Vergelijkt samples onderling (spread = max - min), niet allemaal
+        met de huidige waarde. Zo wordt een geleidelijk dalend surplus
+        (bijv. 1586 → 1403 W) als stabiel beschouwd zolang de spread
+        binnen de tolerantie blijft.
 
         Side-effect: appends (now, surplus) to guard.surplus_history.
         """
         guard.surplus_history.append((now, current_surplus_w))
 
         cutoff = now - timedelta(seconds=EV_DEBOUNCE_STABLE_S)
-        # Keep only recent samples
-        relevant = [(ts, w) for ts, w in guard.surplus_history if ts >= cutoff]
+        # Houd alleen recente samples (binnen 2× de debounce-window zodat
+        # ook bij een 60s loop-interval voldoende samples beschikbaar zijn)
+        cutoff2x = now - timedelta(seconds=EV_DEBOUNCE_STABLE_S * 2)
+        relevant = [(ts, w) for ts, w in guard.surplus_history if ts >= cutoff2x]
 
         if not relevant:
             return False
 
-        oldest_ts = relevant[0][0]
-        if (now - oldest_ts).total_seconds() < EV_DEBOUNCE_STABLE_S:
-            # Not enough history yet
+        # Minimaal 2 samples vereist (voorkomt starten op 1 meting)
+        if len(relevant) < 2:
             return False
 
-        # All samples must be within tolerance of the current value
-        return all(
-            abs(w - current_surplus_w) <= EV_DEBOUNCE_TOLERANCE_W
-            for _, w in relevant
-        )
+        oldest_ts = relevant[0][0]
+        elapsed = (now - oldest_ts).total_seconds()
+        if elapsed < EV_DEBOUNCE_STABLE_S:
+            # Nog niet genoeg tijd verstreken
+            return False
+
+        # Alle samples moeten positief zijn (surplus, niet import)
+        values = [w for _, w in relevant]
+        if min(values) <= 0:
+            return False
+
+        # Spread (max - min) moet binnen tolerantie blijven.
+        # Dit accepteert geleidelijk dalende of stijgende surplussen
+        # (bijv. 1586 → 1403 W: spread=183 W > 150 W tolerantie).
+        # We verdubbelen de tolerantie voor de spread-check om realistische
+        # zonne-surplus variaties te accommoderen.
+        spread = max(values) - min(values)
+        return spread <= EV_DEBOUNCE_TOLERANCE_W * 2
 
     # ------------------------------------------------------------------ #
     #  Opslaan en laden                                                    #
@@ -841,6 +862,11 @@ class PeakGuardController:
             if device.action_type == ACTION_EV_CHARGER:
                 return await self._restore_ev(device, snapshot)
 
+        except HomeAssistantError as err:
+            _LOGGER.warning(
+                "Peak Guard: '%s' niet bereikbaar bij herstel — volgende cyclus opnieuw proberen (%s)",
+                device.name, err,
+            )
         except (ValueError, TypeError) as err:
             _LOGGER.error("Peak Guard: fout bij herstellen '%s': %s", device.name, err)
 
@@ -983,6 +1009,12 @@ class PeakGuardController:
                     guard.surplus_history.clear()
                 return True
 
+        except HomeAssistantError as err:
+            _LOGGER.warning(
+                "Peak Guard EV: '%s' offline of niet bereikbaar bij herstel — volgende cyclus opnieuw proberen (%s)",
+                device.name, err,
+            )
+            return False
         except (ValueError, TypeError) as err:
             _LOGGER.error("Peak Guard EV: fout bij herstellen '%s': %s", device.name, err)
             return False
@@ -1544,9 +1576,16 @@ class PeakGuardController:
                             return excess
                     if not self._ev_rate_check(device.name, "turn_off wegens geen surplus"):
                         return excess
-                    await self.hass.services.async_call(
-                        "switch", "turn_off", {"entity_id": sw_entity}, blocking=True
-                    )
+                    try:
+                        await self.hass.services.async_call(
+                            "switch", "turn_off", {"entity_id": sw_entity}, blocking=True
+                        )
+                    except HomeAssistantError as ha_err:
+                        _LOGGER.warning(
+                            "Peak Guard [SOLAR]: '%s' niet bereikbaar voor turn_off — volgende cyclus opnieuw proberen (%s)",
+                            device.name, ha_err,
+                        )
+                        return excess
                     self._ev_record_call()
                     guard.state = EVState.IDLE
                     guard.last_switch_state = False
@@ -1688,9 +1727,16 @@ class PeakGuardController:
                 if not self._ev_rate_check(device.name, "turn_on voor injectiepreventie"):
                     return excess
 
-                await self.hass.services.async_call(
-                    "switch", "turn_on", {"entity_id": sw_entity}, blocking=True
-                )
+                try:
+                    await self.hass.services.async_call(
+                        "switch", "turn_on", {"entity_id": sw_entity}, blocking=True
+                    )
+                except HomeAssistantError as ha_err:
+                    _LOGGER.warning(
+                        "Peak Guard [SOLAR]: '%s' niet bereikbaar voor turn_on — volgende cyclus opnieuw proberen (%s)",
+                        device.name, ha_err,
+                    )
+                    return excess
                 self._ev_record_call()
                 guard.state = EVState.CHARGING
                 guard.last_switch_state = True
