@@ -605,16 +605,16 @@ class PeakGuardPanel extends HTMLElement {
         <td class="info-mod">${mod}</td>
       </tr>`;
 
-    let rows = row("Schakelaar", origState, modState);
+    let rows = row("Schakelaar", modState, origState);
     if (isEV && (origCurrent || modCurrent)) {
-      rows += row("Laadstroom", origCurrent ?? "—", modCurrent ?? "—");
+      rows += row("Laadstroom", modCurrent ?? "—", origCurrent ?? "—");
     }
     if (isEV && origSoc != null) {
       const socEntityId = device.ev_soc_entity;
       const socState    = socEntityId ? this._hass?.states[socEntityId] : null;
       const curSocVal   = socState && socState.state !== "unavailable"
         ? `${parseFloat(socState.state)}%` : "—";
-      rows += row("SoC-limiet", origSoc, curSocVal);
+      rows += row("SoC-limiet", curSocVal, origSoc);
     }
 
     const activeLabel = snap
@@ -629,6 +629,9 @@ class PeakGuardPanel extends HTMLElement {
         display: "flex", alignItems: "center",
         justifyContent: "center", padding: "16px",
       });
+    }
+    // Altijd terughangen: na een re-render kan de node uit de DOM zijn gevallen
+    if (!this._modalEl.isConnected) {
       this.shadowRoot.appendChild(this._modalEl);
     }
     this._modalVisible = true;
@@ -645,8 +648,8 @@ class PeakGuardPanel extends HTMLElement {
           <thead>
             <tr>
               <th></th>
-              <th>Origineel</th>
               <th>Huidig</th>
+              <th>Origineel</th>
             </tr>
           </thead>
           <tbody>${rows}</tbody>
@@ -1720,8 +1723,8 @@ class PeakGuardPanel extends HTMLElement {
           font-weight: 600; color: var(--secondary-text-color,#555);
           white-space: nowrap;
         }
-        .info-orig  { color: var(--secondary-text-color,#888); }
-        .info-mod   { font-weight: 600; color: var(--primary-text-color,#212121); }
+        .info-orig  { font-weight: 600; color: var(--primary-text-color,#212121); }
+        .info-mod   { color: var(--secondary-text-color,#888); }
         .info-active-badge {
           font-size: .75em; font-weight: 700; padding: 3px 10px;
           border-radius: 12px; background: #fff3e0; color: #e65100;
