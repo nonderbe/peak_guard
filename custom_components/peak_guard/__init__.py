@@ -57,6 +57,21 @@ class PeakGuardCascadeView(HomeAssistantView):
         return self.json({"status": "ok", "opgeslagen": len(devices)})
 
 
+class PeakGuardForceCheckView(HomeAssistantView):
+    """REST endpoint om direct een nieuwe check te triggeren."""
+    url = "/api/peak_guard/force_check"
+    name = "peak_guard:force_check"
+    requires_auth = True
+
+    async def post(self, request):
+        hass = request.app["hass"]
+        controller = hass.data.get(DOMAIN, {}).get("controller")
+        if not controller:
+            return self.json_message("Peak Guard niet geïnitialiseerd", status_code=503)
+        controller._force_check = True
+        return self.json({"status": "ok", "message": "force check getriggerd"})
+
+
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     return True
 
@@ -73,6 +88,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # REST API
     hass.http.register_view(PeakGuardCascadeView())
+    hass.http.register_view(PeakGuardForceCheckView())
 
     # Frontend panel (eenmalig)
     if not hass.data.get(_PANEL_REGISTERED_KEY):
