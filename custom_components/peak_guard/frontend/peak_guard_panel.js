@@ -530,6 +530,8 @@ class PeakGuardPanel extends HTMLElement {
           ${this._renderDeviceControls(device, index, type)}
         </div>
         <div class="device-actions">
+          <button class="btn-icon" data-action="info"
+            data-index="${index}" data-type="${type}" title="Status-info">ℹ️</button>
           <button class="btn-icon" data-action="edit"
             data-index="${index}" data-type="${type}" title="Bewerken">✏️</button>
           <button class="btn-icon" data-action="delete"
@@ -537,6 +539,133 @@ class PeakGuardPanel extends HTMLElement {
         </div>
       </div>
     `;
+  }
+
+  // Toont een info-popup voor een apparaat met originele/aangepaste status en uitleg.
+  _showInfoModal(device, cascadeType) {
+    const isEV  = device.action_type === "ev_charger";
+    const isPeak = cascadeType === "peak";
+
+    // Zoek snapshot voor dit apparaat (entity_id als sleutel)
+    const snaps     = this._data?.snapshots || {};
+    const peakSnap  = snaps.peak?.[device.entity_id];
+    const injectSnap= snaps.inject?.[device.entity_id];
+    const snap      = isPeak ? peakSnap : injectSnap;
+
+    // Huidige staat van de primaire entity
+    const entityId  = (isEV && device.ev_switch_entity) ? device.ev_switch_entity : device.entity_id;
+    const liveState = this._hass?.states[entityId];
+    const liveVal   = liveState?.state ?? "—";
+
+    // Labels
+    const stateLabel = (s) => {
+      if (s === "on")  return "Aan ✅";
+      if (s === "off") return "Uit ⭕";
+      return s ?? "—";
+    };
+
+    // Originele waarde (uit snapshot) of "ongewijzigd"
+    const origState   = snap ? stateLabel(snap.original_state) : "ongewijzigd";
+    const origCurrent = snap?.original_current != null ? `${snap.original_current} A` : null;
+    const origSoc     = snap?.original_soc     != null ? `${snap.original_soc}%`      : null;
+
+    // Aangepaste waarde = huidige live staat
+    const modState   = stateLabel(liveVal);
+    const curEntityId= isEV ? device.ev_current_entity : null;
+    const curState   = curEntityId ? this._hass?.states[curEntityId] : null;
+    const modCurrent = curState && curState.state !== "unavailable"
+      ? `${parseFloat(curState.state)} A` : null;
+
+    // Uitleg wanneer wordt teruggezet
+    let restoreDesc = "";
+    if (!snap) {
+      restoreDesc = "Peak Guard heeft dit apparaat nog niet aangepast. "
+        + "Er is geen actieve ingreep.";
+    } else if (isPeak) {
+      restoreDesc = `Dit apparaat werd uitgeschakeld omdat het verbruik de maandpiek dreigde te overschrijden. `
+        + `Het wordt automatisch terug ingeschakeld zodra het verbruik voldoende onder de piekgrens daalt `
+        + `(headroom > ${device.power_watts ?? 0} W) en er geen piekrisico meer is.`;
+    } else {
+      if (isEV) {
+        restoreDesc = `De EV-lader werd gestart op zonne-overschot. `
+          + `Het laden stopt automatisch wanneer het zonne-overschot wegvalt `
+          + `(netto verbruik ≥ 0 W) of wanneer het surplus lager wordt dan het EV-verbruik.`;
+      } else {
+        restoreDesc = `Dit apparaat werd ingeschakeld op zonne-overschot. `
+          + `Het wordt automatisch uitgeschakeld zodra het netto verbruik niet meer negatief is `
+          + `(geen export naar het net meer).`;
+      }
+    }
+
+    // Bouw tabel-rijen
+    const row = (label, orig, mod) => `
+      <tr>
+        <td class="info-label">${label}</td>
+        <td class="info-orig">${orig}</td>
+        <td class="info-mod">${mod}</td>
+      </tr>`;
+
+    let rows = row("Schakelaar", origState, modState);
+    if (isEV && (origCurrent || modCurrent)) {
+      rows += row("Laadstroom", origCurrent ?? "—", modCurrent ?? "—");
+    }
+    if (isEV && origSoc != null) {
+      const socEntityId = device.ev_soc_entity;
+      const socState    = socEntityId ? this._hass?.states[socEntityId] : null;
+      const curSocVal   = socState && socState.state !== "unavailable"
+        ? `${parseFloat(socState.state)}%` : "—";
+      rows += row("SoC-limiet", origSoc, curSocVal);
+    }
+
+    const activeLabel = snap
+      ? `<span class="info-active-badge">Ingreep actief</span>`
+      : `<span class="info-inactive-badge">Geen ingreep</span>`;
+
+    if (!this._modalEl) {
+      this._modalEl = document.createElement("div");
+      Object.assign(this._modalEl.style, {
+        position: "fixed", inset: "0", zIndex: "999",
+        background: "rgba(0,0,0,.45)",
+        display: "flex", alignItems: "center",
+        justifyContent: "center", padding: "16px",
+      });
+      this.shadowRoot.appendChild(this._modalEl);
+    }
+    this._modalVisible = true;
+    this._modalEl.style.display = "flex";
+
+    this._modalEl.innerHTML = `
+      <div class="modal" id="modal-box" style="max-width:480px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+          <h3 style="margin:0;">${this._esc(device.name)}</h3>
+          ${activeLabel}
+        </div>
+        <div class="modal-subtitle">${isPeak ? "Piek-cascade" : "Solar-cascade"} · ${device.action_type}</div>
+        <table class="info-table">
+          <thead>
+            <tr>
+              <th></th>
+              <th>Origineel</th>
+              <th>Huidig</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+        <div class="info-restore-box">
+          <div class="info-restore-title">↩ Wanneer wordt hersteld?</div>
+          <div class="info-restore-text">${restoreDesc}</div>
+        </div>
+        <div class="modal-actions" style="justify-content:flex-end;">
+          <button class="btn btn-secondary" id="info-close">Sluiten</button>
+        </div>
+      </div>`;
+
+    this._modalEl.querySelector("#info-close")?.addEventListener("click", () => {
+      this._closeModal();
+    });
+    this._modalEl.addEventListener("click", (e) => {
+      if (e.target === this._modalEl) this._closeModal();
+    });
   }
 
   // Rendert inline bedieningselementen voor een apparaat in de kaart.
@@ -1469,14 +1598,16 @@ class PeakGuardPanel extends HTMLElement {
     });
 
     this.shadowRoot
-      .querySelectorAll("[data-action='edit'], [data-action='delete'], [data-action='up'], [data-action='down']")
+      .querySelectorAll("[data-action='info'], [data-action='edit'], [data-action='delete'], [data-action='up'], [data-action='down']")
       .forEach((btn) => {
         btn.addEventListener("click", () => {
           const { action, index: idxStr, type } = btn.dataset;
           const idx = parseInt(idxStr);
           const devices = [...(this._data?.[type] || [])];
 
-          if (action === "edit") {
+          if (action === "info") {
+            this._showInfoModal(devices[idx], type);
+          } else if (action === "edit") {
             this._openModal({ ...devices[idx] }, type);
           } else if (action === "delete") {
             if (confirm(`'${devices[idx].name}' verwijderen?`)) {
@@ -1568,6 +1699,49 @@ class PeakGuardPanel extends HTMLElement {
         .btn-force {
           font-size: .8em; padding: 5px 12px;
         }
+
+        /* Info-modal */
+        .info-table {
+          width: 100%; border-collapse: collapse;
+          margin: 14px 0; font-size: .88em;
+        }
+        .info-table th {
+          text-align: left; font-size: .75em; font-weight: 700;
+          text-transform: uppercase; letter-spacing: .05em;
+          color: var(--secondary-text-color,#757575);
+          padding: 0 10px 6px 0; border-bottom: 2px solid var(--divider-color,#e0e0e0);
+        }
+        .info-table td {
+          padding: 8px 10px 8px 0;
+          border-bottom: 1px solid var(--divider-color,#f0f0f0);
+          vertical-align: middle;
+        }
+        .info-label {
+          font-weight: 600; color: var(--secondary-text-color,#555);
+          white-space: nowrap;
+        }
+        .info-orig  { color: var(--secondary-text-color,#888); }
+        .info-mod   { font-weight: 600; color: var(--primary-text-color,#212121); }
+        .info-active-badge {
+          font-size: .75em; font-weight: 700; padding: 3px 10px;
+          border-radius: 12px; background: #fff3e0; color: #e65100;
+          border: 1px solid #ffcc80;
+        }
+        .info-inactive-badge {
+          font-size: .75em; font-weight: 700; padding: 3px 10px;
+          border-radius: 12px; background: #e8f5e9; color: #2e7d32;
+          border: 1px solid #a5d6a7;
+        }
+        .info-restore-box {
+          background: var(--secondary-background-color,#f5f5f5);
+          border-radius: 10px; padding: 12px 14px; margin-top: 4px;
+        }
+        .info-restore-title {
+          font-size: .8em; font-weight: 700; text-transform: uppercase;
+          letter-spacing: .05em; color: var(--secondary-text-color,#757575);
+          margin-bottom: 5px;
+        }
+        .info-restore-text { font-size: .87em; line-height: 1.5; }
 
         /* EV debounce indicator */
         .ev-debounce-bar-wrap {
