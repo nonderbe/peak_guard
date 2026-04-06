@@ -280,6 +280,13 @@ class PeakGuardController:
         # Wordt gezet door _apply_action en gebruikt door _run_cascade voor logging.
         self._last_skip_reason: str = ""
 
+        # Tijdstip van de laatste loop-iteratie (UTC ISO-string, voor de GUI).
+        self._last_loop_at: Optional[str] = None
+
+        # Force-check flag: als True wordt de volgende loop-iteratie onmiddellijk
+        # uitgevoerd zonder te wachten op het interval.
+        self._force_check: bool = False
+
     # ------------------------------------------------------------------ #
     #  EV guard helpers                                                    #
     # ------------------------------------------------------------------ #
@@ -493,7 +500,16 @@ class PeakGuardController:
                 "update_interval":    self.config.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL),
             },
             "status": {
-                "monitoring": self._monitoring,
+                "monitoring":    self._monitoring,
+                "last_loop_at":  self._last_loop_at,
+                "interval_s":    max(float(self.config.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL)), 60.0),
+                "ev_guards": {
+                    device_id: {
+                        "state": guard.state.value,
+                        "history_len": len(guard.surplus_history),
+                    }
+                    for device_id, guard in self._ev_guards.items()
+                },
                 "ev_rate_limiter": {
                     "calls_in_window": self._ev_rate_limiter.calls_in_window,
                     "remaining":       self._ev_rate_limiter.remaining,
@@ -584,6 +600,7 @@ class PeakGuardController:
 
         while self._monitoring:
             try:
+                self._last_loop_at = datetime.now(timezone.utc).isoformat()
                 consumption = self._sensor_value(self.config.get(CONF_CONSUMPTION_SENSOR))
                 if consumption is not None:
                     _sensor_unavailable_count = 0   # reset bij succesvolle lezing
@@ -633,7 +650,15 @@ class PeakGuardController:
                     self._prev_consumption = None
             except Exception:
                 _LOGGER.exception("Peak Guard: fout in monitoring loop")
-            await asyncio.sleep(interval)
+            # Normaal wachten op interval, maar breek vroeg af als force_check gezet is
+            self._force_check = False
+            elapsed = 0.0
+            while elapsed < interval and self._monitoring:
+                await asyncio.sleep(1.0)
+                elapsed += 1.0
+                if self._force_check:
+                    self._force_check = False
+                    break
 
     # ------------------------------------------------------------------ #
     #  Cascade logica — ingreep                                            #
