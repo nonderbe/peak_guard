@@ -943,7 +943,8 @@ class PeakGuardController:
                     )
 
                 if cur_entity and snapshot.original_current is not None:
-                    orig_a = snapshot.original_current
+                    max_a = float(device.max_value if device.max_value is not None else DEFAULT_EV_MAX_AMPERE)
+                    orig_a = min(snapshot.original_current, max_a)
                     cur_state = self.hass.states.get(cur_entity)
                     if cur_state is not None:
                         try:
@@ -958,8 +959,8 @@ class PeakGuardController:
                             )
                             _LOGGER.info(
                                 "Peak Guard EV peak: '%s' laadstroom hersteld naar %.1f A "
-                                "(reden: herstel na piekbeperking)",
-                                device.name, orig_a,
+                                "(reden: herstel na piekbeperking, gecapped aan max %.1f A)",
+                                device.name, orig_a, max_a,
                             )
 
                 self.peak_tracker.start_measurement_on_turnon(
