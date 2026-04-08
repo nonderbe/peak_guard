@@ -114,10 +114,11 @@ class PeakAvoidTracker:
         # Events log (max 50, FIFO)
         self.events: deque[PeakEvent] = deque(maxlen=MAX_EVENTS)
 
-        # Maand-cumulatieven
+        # Maand-cumulatieven (holistisch herberekend, niet per event opgeteld)
         self.avoided_kw_this_month:   float = 0.0
         self.savings_euro_this_month:  float = 0.0
-        # Jaar-cumulatief (overleeft maandwissel)
+        # Jaar-cumulatief: basis van afgesloten maanden + lopende maand
+        self._savings_euro_year_base:  float = 0.0
         self.savings_euro_this_year:   float = 0.0
 
         # Hypothetische maandpiek
@@ -134,16 +135,24 @@ class PeakAvoidTracker:
                     actual_monthly_peak: float) -> None:
         self._actual_quarters     = actual_quarters
         self._actual_monthly_peak = actual_monthly_peak
+        # Herbereken maandbesparing: een hogere werkelijke piek verkleint de besparing
+        self._recalc_month_savings()
         _LOGGER.debug(
-            "PeakAvoidTracker.set_context: %d kwartieren, maandpiek=%.3f kW",
-            len(actual_quarters), actual_monthly_peak,
+            "PeakAvoidTracker.set_context: %d kwartieren, maandpiek=%.3f kW, "
+            "besparing=€%.4f",
+            len(actual_quarters), actual_monthly_peak, self.savings_euro_this_month,
         )
 
     def set_tarief(self, tarief: float) -> None:
         self._tarief = tarief
+        self._recalc_month_savings()
         _LOGGER.debug("PeakAvoidTracker.set_tarief: %.4f €/kW/jaar", tarief)
 
     def reset_month(self) -> None:
+        # Sla de definitieve maandbesparing op in de jaarbasis vóór het resetten
+        self._savings_euro_year_base = round(
+            self._savings_euro_year_base + self.savings_euro_this_month, 4
+        )
         # Waarschuw als er nog actieve metingen lopen bij de maandwissel
         if self._pending:
             _LOGGER.warning(
@@ -167,7 +176,8 @@ class PeakAvoidTracker:
         _LOGGER.info("PeakAvoidTracker: maanddata gereset")
 
     def reset_year(self) -> None:
-        self.savings_euro_this_year = 0.0
+        self._savings_euro_year_base = 0.0
+        self.savings_euro_this_year  = 0.0
         _LOGGER.info("PeakAvoidTracker: jaardata gereset")
 
     # ── Hook 1: cascade schakelt UIT ─────────────────────────────── #
@@ -222,25 +232,30 @@ class PeakAvoidTracker:
 
         added_kwh = (duration_min / 60.0) * meas.nominal_kw
 
+        # Snapshot maandbesparing vóór dit event (voor marginale bijdrage)
+        savings_before = self.savings_euro_this_month
+        avoided_before = self.avoided_kw_this_month
+
         # Verdeel energie over kwartierblokken vanaf avoid_ts
         for q, kwh in self._distribute(meas.avoid_ts, duration_min, added_kwh).items():
             self.extra_dict[q] = self.extra_dict.get(q, 0.0) + kwh / _QUARTER_H
 
         self._recalc_hypo()
+        # Herbereken maandtotalen holistisch: niet accumuleren maar opnieuw berekenen
+        self._recalc_month_savings()
 
-        hypo     = self.hypothetical_monthly_peak_kw or 0.0
-        avoided  = round(max(0.0, hypo - self._actual_monthly_peak), 4)
-        savings  = round(max(0.0, hypo - self._actual_monthly_peak) * self._tarief / 12.0, 4)
+        hypo    = self.hypothetical_monthly_peak_kw or 0.0
+        # Marginale bijdrage van dit event aan de maandbesparing
+        event_avoided = round(max(0.0, self.avoided_kw_this_month - avoided_before), 4)
+        event_savings = round(max(0.0, self.savings_euro_this_month - savings_before), 4)
 
         _LOGGER.debug(
             "PeakAvoidTracker.complete_peak_calculation '%s': "
-            "hypo=%.3f kW, actual=%.3f kW, avoided=%.4f kW, tarief=%.4f, savings=€%.4f",
-            meas.device_name, hypo, self._actual_monthly_peak, avoided, self._tarief, savings,
+            "hypo=%.3f kW, actual=%.3f kW, maand_vermeden=%.4f kW, "
+            "event_vermeden=%.4f kW, maand_besparing=€%.4f",
+            meas.device_name, hypo, self._actual_monthly_peak,
+            self.avoided_kw_this_month, event_avoided, self.savings_euro_this_month,
         )
-
-        self.avoided_kw_this_month   = round(self.avoided_kw_this_month + avoided, 4)
-        self.savings_euro_this_month  = round(self.savings_euro_this_month + savings, 4)
-        self.savings_euro_this_year   = round(self.savings_euro_this_year + savings, 4)
 
         event = PeakEvent(
             device_id=device_id, device_name=meas.device_name,
@@ -249,12 +264,16 @@ class PeakAvoidTracker:
             natural_stop_ts=now,
             measured_duration_min=round(duration_min, 2),
             added_energy_kwh=round(added_kwh, 4),
-            avoided_peak_kw=avoided,
-            savings_euro=savings,
+            avoided_peak_kw=event_avoided,
+            savings_euro=event_savings,
         )
         self.events.append(event)
-        _LOGGER.info("PeakAvoidTracker: '%s' duur=%.1fmin vermeden=%.3fkW €%.4f",
-                     meas.device_name, duration_min, avoided, savings)
+        _LOGGER.info(
+            "PeakAvoidTracker: '%s' duur=%.1fmin event_vermeden=%.3fkW €%.4f "
+            "| maand totaal: vermeden=%.3fkW €%.4f",
+            meas.device_name, duration_min, event_avoided, event_savings,
+            self.avoided_kw_this_month, self.savings_euro_this_month,
+        )
         return event
 
     # ── query-methoden ────────────────────────────────────────────── #
@@ -288,6 +307,26 @@ class PeakAvoidTracker:
         vals = [self._actual_quarters.get(q, 0.0) + self.extra_dict.get(q, 0.0)
                 for q in all_q]
         self.hypothetical_monthly_peak_kw = round(max(vals), 4)
+
+    def _recalc_month_savings(self) -> None:
+        """
+        Herbereken maand- en jaarbesparing holistisch op basis van de huidige
+        hypothetische maandpiek versus de werkelijke maandpiek.
+
+        De maandbesparing is een enkelvoudige waarde:
+            (hypo_maandpiek − werkelijke_maandpiek) × tarief / 12
+
+        Dit voorkomt dat individuele events dubbel worden opgeteld, en zorgt
+        dat een latere echte piek de besparing automatisch vermindert.
+        """
+        hypo = self.hypothetical_monthly_peak_kw or 0.0
+        self.avoided_kw_this_month  = round(max(0.0, hypo - self._actual_monthly_peak), 4)
+        self.savings_euro_this_month = round(
+            self.avoided_kw_this_month * self._tarief / 12.0, 4
+        )
+        self.savings_euro_this_year  = round(
+            self._savings_euro_year_base + self.savings_euro_this_month, 4
+        )
 
 
 # ──────────────────────────────────────────────────────────────────── #
