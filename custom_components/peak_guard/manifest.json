@@ -1,18 +1,18 @@
 {
   "domain": "peak_guard",
   "name": "Peak Guard",
-  "documentation": "https://github.com/nonderbe/peak_guard",
-  "issue_tracker": "https://github.com/nonderbe/peak_guard/issues",
-  "version": "1.2.0",
+  "codeowners": [
+    "@nonderbe"
+  ],
   "config_flow": true,
-  "requirements": [],
   "dependencies": [
     "frontend",
     "http",
     "panel_custom"
   ],
-  "codeowners": [
-    "@nonderbe"
-  ],
-  "iot_class": "local_polling"
+  "documentation": "https://github.com/nonderbe/peak_guard",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/nonderbe/peak_guard/issues",
+  "requirements": [],
+  "version": "1.2.0"
 }
