@@ -74,6 +74,7 @@ class PeakEvent:
     added_energy_kwh:      float
     avoided_peak_kw:       float
     savings_euro:          float
+    hypothetical_peak_kw:  float = 0.0
 
 
 @dataclass
@@ -266,6 +267,7 @@ class PeakAvoidTracker:
             added_energy_kwh=round(added_kwh, 4),
             avoided_peak_kw=event_avoided,
             savings_euro=event_savings,
+            hypothetical_peak_kw=round(hypo, 4),
         )
         self.events.append(event)
         _LOGGER.info(

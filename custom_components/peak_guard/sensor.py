@@ -148,6 +148,7 @@ async def async_setup_entry(
                         added_energy_kwh=float(ev_dict["added_energy_kwh"]),
                         avoided_peak_kw=float(ev_dict["avoided_peak_kw"]),
                         savings_euro=float(ev_dict["savings_euro"]),
+                        hypothetical_peak_kw=float(ev_dict.get("hypothetical_peak_kw", 0.0)),
                     )
                     peak_tracker.events.append(ev)
                 except (KeyError, ValueError):
@@ -423,6 +424,7 @@ class SharedCapacityState:
                         "added_energy_kwh":     e.added_energy_kwh,
                         "avoided_peak_kw":      e.avoided_peak_kw,
                         "savings_euro":         e.savings_euro,
+                        "hypothetical_peak_kw": e.hypothetical_peak_kw,
                     }
                     for e in self._peak_tracker.events
                 ]
@@ -822,6 +824,7 @@ class PeakAvoidedEventsSensor(SensorEntity):
                     "apparaat":                e.device_name,
                     "gemeten_duur_min":        e.measured_duration_min,
                     "vermeden_piek_kw":        e.avoided_peak_kw,
+                    "hypothetische_piek_kw":   e.hypothetical_peak_kw,
                     "besparing_eur":           e.savings_euro,
                 }
                 for e in reversed(list(self._tracker.events))
