@@ -1861,6 +1861,23 @@ class PeakGuardController:
         #  EV staat al aan → alleen stroom aanpassen als echt nodig        #
         # ──────────────────────────────────────────────────────────────── #
 
+        # Herbereken new_a rekening houdend met de lopende EV-consumptie.
+        # excess = netto export BOVENOP de huidige EV-consumptie (de P1-meter
+        # meet al het verbruik inclusief de EV). Totaal beschikbaar voor de EV:
+        #   huidige EV-stroom × spanning  +  netto overschot
+        # Zonder deze correctie zou een overschot van 777 W bij een EV die al op
+        # 10 A laadt (2300 W) leiden tot new_a = ceil(777/230) = 4 A → hw_min 5 A,
+        # wat de lader onterecht verlaagt van 10 A naar 5 A.
+        if current_a is not None:
+            total_for_ev_w = current_a * voltage + excess
+            available_a_raw = total_for_ev_w / voltage
+            new_a = max(int(hw_min_a), min(int(max_a), math.ceil(available_a_raw)))
+            _LOGGER.debug(
+                "Peak Guard [SOLAR]: '%s' (EV aan) herberekend — "
+                "huidig=%.1f A, overschot=%.0f W, totaal=%.0f W → doel=%d A",
+                device.name, current_a, excess, total_for_ev_w, new_a,
+            )
+
         actual_consumption_w = new_a * voltage
 
         if cur_entity is None or current_a is None:
