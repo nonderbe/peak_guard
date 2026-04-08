@@ -2108,6 +2108,7 @@ class PeakGuardPanel extends HTMLElement {
         }
         .ev-val  { font-family: monospace; font-weight: 600; }
         .ev-eur  { font-weight: 700; color: #2e7d32; }
+        .ev-hypo { font-family: monospace; color: var(--secondary-text-color, #757575); }
         .ev-time { font-family: monospace; font-size: .88em; color: var(--secondary-text-color, #757575); }
         .ev-empty {
           text-align: center; padding: 24px;
@@ -2208,22 +2209,24 @@ class PeakGuardPanel extends HTMLElement {
     // ---- Gecombineerde events gesorteerd op tijd (max 100) ---------- //
     const allEvents = [
       ...peakEvents.map(e => ({
-        ts:       e.timestamp_start_uitstel,
-        modus:    "Piek",
-        icon:     "⚡",
-        apparaat: e.apparaat,
-        duur:     e.gemeten_duur_min,
-        waarde:   `${e.vermeden_piek_kw} kW`,
-        eur:      e.besparing_eur,
+        ts:        e.timestamp_start_uitstel,
+        modus:     "Piek",
+        icon:      "⚡",
+        apparaat:  e.apparaat,
+        duur:      e.gemeten_duur_min,
+        waarde:    `${e.vermeden_piek_kw} kW`,
+        hypo_kw:   e.hypothetische_piek_kw ?? null,
+        eur:       e.besparing_eur,
       })),
       ...solarEvents.map(e => ({
-        ts:       e.timestamp_start_inschakeling,
-        modus:    "Solar",
-        icon:     "☀️",
-        apparaat: e.apparaat,
-        duur:     e.gemeten_duur_min,
-        waarde:   `${e.verschoven_kwh} kWh`,
-        eur:      e.besparing_eur,
+        ts:        e.timestamp_start_inschakeling,
+        modus:     "Solar",
+        icon:      "☀️",
+        apparaat:  e.apparaat,
+        duur:      e.gemeten_duur_min,
+        waarde:    `${e.verschoven_kwh} kWh`,
+        hypo_kw:   null,
+        eur:       e.besparing_eur,
       })),
     ].sort((a, b) => b.ts.localeCompare(a.ts)).slice(0, 100);
 
@@ -2256,7 +2259,7 @@ class PeakGuardPanel extends HTMLElement {
     // Groepeer events per dag
     let eventsRows = "";
     if (allEvents.length === 0) {
-      eventsRows = `<tr><td colspan="5" class="ev-empty">Nog geen events bijgehouden</td></tr>`;
+      eventsRows = `<tr><td colspan="6" class="ev-empty">Nog geen events bijgehouden</td></tr>`;
     } else {
       let lastDay = null;
       for (const e of allEvents) {
@@ -2265,15 +2268,19 @@ class PeakGuardPanel extends HTMLElement {
           lastDay = day;
           eventsRows += `
             <tr class="ev-day-header">
-              <td colspan="5">${fmtDayLabel(day)}</td>
+              <td colspan="6">${fmtDayLabel(day)}</td>
             </tr>`;
         }
+        const hypoCell = e.hypo_kw != null
+          ? `${Number(e.hypo_kw).toFixed(3)} kW`
+          : `—`;
         eventsRows += `
           <tr>
             <td class="ev-time">${fmtTs(e.ts)}</td>
             <td><span class="mode-badge mode-${e.modus.toLowerCase()}">${e.icon} ${e.modus}</span></td>
             <td>${this._esc(e.apparaat)}</td>
             <td>${e.duur} min · ${e.waarde}</td>
+            <td class="ev-hypo">${hypoCell}</td>
             <td class="ev-eur">€ ${e.eur}</td>
           </tr>`;
       }
@@ -2357,6 +2364,7 @@ class PeakGuardPanel extends HTMLElement {
                 <th>Modus</th>
                 <th>Apparaat</th>
                 <th>Duur · Resultaat</th>
+                <th>Hypo. piek</th>
                 <th>Besparing</th>
               </tr>
             </thead>
