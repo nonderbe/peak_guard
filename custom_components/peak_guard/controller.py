@@ -62,6 +62,10 @@ EV_MIN_UPDATE_INTERVAL_S: float = 90.0
 EV_DEBOUNCE_STABLE_S: float = 45.0
 EV_DEBOUNCE_TOLERANCE_W: float = 150.0   # ±150 W counts as "stable"
 
+# When surplus exceeds this threshold the debounce is skipped entirely — a very
+# large surplus signals solid solar production, not a brief cloud break.
+EV_DEBOUNCE_BYPASS_SURPLUS_W: float = 1500.0
+
 # After turning the charger ON we refuse to turn it back OFF for this long.
 # Prevents rapid ON/OFF cycling that hammers the Tesla API.
 EV_MIN_ON_DURATION_S: float = 360.0     # 6 minutes
@@ -118,6 +122,10 @@ class EVDeviceGuard:
     # ---- debounce ring buffer ----------------------------------------- #
     # Stores (timestamp, surplus_W) tuples for stability check
     surplus_history: Deque = field(default_factory=lambda: deque(maxlen=60))
+
+    # True when Peak Guard itself issued the last turn_off (not the user).
+    # Used to decide whether the min-OFF-duration gate applies.
+    turned_off_by_pg: bool = False
 
     # ---- global rate limiter (shared across all devices) -------------- #
     # NOTE: the actual limiter lives on the controller; this is a back-ref
@@ -1016,6 +1024,7 @@ class PeakGuardController:
                     guard = self._ev_guard(device.id)
                     guard.state = EVState.IDLE
                     guard.turned_off_at = datetime.now(timezone.utc)
+                    guard.turned_off_by_pg = True
                     guard.surplus_history.clear()
                 else:
                     # Schakelaar staat al uit — snapshot opruimen zonder extra actie.
@@ -1407,6 +1416,7 @@ class PeakGuardController:
                 guard.state = EVState.IDLE
                 guard.last_switch_state = False
                 guard.turned_off_at = now
+                guard.turned_off_by_pg = True
                 guard.last_sent_amps = min_a
                 guard.surplus_history.clear()
 
@@ -1620,6 +1630,7 @@ class PeakGuardController:
                     guard.state = EVState.IDLE
                     guard.last_switch_state = False
                     guard.turned_off_at = now
+                    guard.turned_off_by_pg = True
                     guard.surplus_history.clear()
                     event = self.solar_tracker.complete_solar_calculation(
                         device_id=device.id, now=now,
@@ -1644,8 +1655,39 @@ class PeakGuardController:
 
         # surplus ≥ start_threshold_w — EV mag (of blijft) laden
 
+        # ── Detecteer handmatige start ──────────────────────────────────── #
+        # Als de schakelaar aan staat maar de guard dat niet verwacht, heeft de
+        # gebruiker de EV handmatig gestart.  Neem de toestand over zodat PG
+        # de EV niet direct weer uitzet of blokkeert via turned_off_at.
+        if sw_on and guard.last_switch_state is not True:
+            _LOGGER.info(
+                "Peak Guard [SOLAR]: '%s' — handmatige start gedetecteerd — "
+                "toestand overgenomen (turned_off_at gereset, turned_off_by_pg=False)",
+                device.name,
+            )
+            guard.state = EVState.CHARGING
+            guard.last_switch_state = True
+            guard.turned_on_at = now
+            guard.turned_off_at = None
+            guard.turned_off_by_pg = False
+            guard.surplus_history.clear()
+
         # ── GATE: debounce — surplus must be stable before we act ──────── #
-        if not self._ev_surplus_is_stable(guard, excess, now):
+        # Bypass volledig als het overschot zeer groot is (solide zonne-opwekking).
+        large_surplus = excess >= EV_DEBOUNCE_BYPASS_SURPLUS_W
+        if large_surplus:
+            guard.surplus_history.append((now, excess))  # bijhouden voor historiek
+            if guard.state == EVState.WAITING_FOR_STABLE:
+                _LOGGER.info(
+                    "Peak Guard [SOLAR]: '%s' — debounce overgeslagen "
+                    "(overschot %.0f W ≥ bypass-drempel %.0f W)",
+                    device.name, excess, EV_DEBOUNCE_BYPASS_SURPLUS_W,
+                )
+            surplus_stable = True
+        else:
+            surplus_stable = self._ev_surplus_is_stable(guard, excess, now)
+
+        if not surplus_stable:
             history_secs = 0.0
             if guard.surplus_history:
                 oldest = guard.surplus_history[0][0]
@@ -1669,7 +1711,7 @@ class PeakGuardController:
                 )
             return excess
 
-        # Surplus is stable — update state machine
+        # Surplus is stable (of groot genoeg) — state machine bijwerken
         if guard.state == EVState.WAITING_FOR_STABLE:
             _LOGGER.info(
                 "Peak Guard [SOLAR]: '%s' overschot stabiel — actie toegestaan "
@@ -1683,13 +1725,16 @@ class PeakGuardController:
             # ──────────────────────────────────────────────────────────── #
 
             # ── GATE: minimum OFF duration ──────────────────────────────── #
-            if guard.turned_off_at is not None:
+            # Alleen van toepassing als PG zelf heeft uitgeschakeld.
+            # Bij een handmatige stop (turned_off_by_pg=False) wordt de wachttijd
+            # niet opgelegd zodat PG gewoon kan herstarten bij voldoende overschot.
+            if guard.turned_off_at is not None and guard.turned_off_by_pg:
                 off_secs = (now - guard.turned_off_at).total_seconds()
                 if off_secs < EV_MIN_OFF_DURATION_S:
                     self._last_skip_reason = f"min OFF-duur: {off_secs:.0f}s < {EV_MIN_OFF_DURATION_S:.0f}s"
                     _LOGGER.info(
                         "Peak Guard [SOLAR]: '%s' aanzetten OVERGESLAGEN — "
-                        "te kort geleden uitgeschakeld (%.0f s geleden, minimum %.0f s)",
+                        "te kort geleden automatisch uitgeschakeld (%.0f s geleden, minimum %.0f s)",
                         device.name, off_secs, EV_MIN_OFF_DURATION_S,
                     )
                     return excess
