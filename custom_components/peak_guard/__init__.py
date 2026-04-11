@@ -72,10 +72,6 @@ class PeakGuardForceCheckView(HomeAssistantView):
         return self.json({"status": "ok", "message": "force check getriggerd"})
 
 
-async def async_setup(hass: HomeAssistant, config: dict) -> bool:
-    return True
-
-
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Stel Peak Guard in vanuit een config entry."""
     controller = PeakGuardController(hass, dict(entry.data))
