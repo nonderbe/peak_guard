@@ -1742,13 +1742,18 @@ class PeakGuardController:
 
             # ── GATE: redundancy check ──────────────────────────────────── #
             if guard.last_switch_state is True:
-                _LOGGER.debug(
-                    "Peak Guard [SOLAR]: '%s' turn_on OVERGESLAGEN — "
-                    "schakelaar al aan (redundant call vermeden)",
+                # We sent turn_on previously but the HA entity still reports off.
+                # The Tesla API acknowledged our command but didn't execute it yet
+                # (or the command was silently dropped). Reset guard state so the
+                # turn_on is retried this cycle instead of being skipped forever.
+                _LOGGER.info(
+                    "Peak Guard [SOLAR]: '%s' — schakelaar nog steeds UIT na eerder turn_on commando "
+                    "(Tesla API bevestigt ontvangst maar niet uitvoering) — opnieuw proberen",
                     device.name,
                 )
-                # Already on according to our guard; fall through to current adjustment
-            else:
+                guard.last_switch_state = None
+                guard.state = EVState.IDLE
+            if guard.last_switch_state is not True:
                 # ── GATE: wake-up check ───────────────────────────────── #
                 # Alleen hier: we hebben besloten te starten (surplus OK,
                 # debounce stabiel, alle gates gepasseerd). Nu pas checken
