@@ -612,7 +612,7 @@ class PeakGuardController:
                 consumption = self._sensor_value(self.config.get(CONF_CONSUMPTION_SENSOR))
                 if consumption is not None:
                     _sensor_unavailable_count = 0   # reset bij succesvolle lezing
-                    _LOGGER.warning(
+                    _LOGGER.debug(
                         "Peak Guard loop: verbruik=%.0f W — %s",
                         consumption,
                         "EXPORT (solar cascade actief)" if consumption < 0
@@ -626,7 +626,7 @@ class PeakGuardController:
                         await self._check_inject_restore(consumption)
                     elif consumption < 0:
                         # Negatief verbruik = export naar net (zonne-overschot)
-                        _LOGGER.warning(
+                        _LOGGER.debug(
                             "Peak Guard: zonne-overschot gedetecteerd — sensor=%.0f W "
                             "(export %.0f W) — solar cascade wordt gecontroleerd",
                             consumption, abs(consumption),
