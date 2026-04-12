@@ -480,11 +480,24 @@ class PeakGuardController:
         if data:
             self.peak_cascade   = [CascadeDevice(**d) for d in data.get("peak", [])]
             self.inject_cascade = [CascadeDevice(**d) for d in data.get("inject", [])]
+            for k, v in data.get("peak_snapshots", {}).items():
+                self._peak_snapshots[k] = DeviceSnapshot(**v)
+            for k, v in data.get("inject_snapshots", {}).items():
+                self._inject_snapshots[k] = DeviceSnapshot(**v)
+            if self._peak_snapshots:
+                _LOGGER.warning(
+                    "Peak Guard: %d apparaat/apparaten nog uitgeschakeld uit vorige sessie — "
+                    "worden hersteld zodra piekmarges het toelaten: %s",
+                    len(self._peak_snapshots),
+                    list(self._peak_snapshots.keys()),
+                )
 
     async def async_save(self):
         await self._store.async_save({
             "peak":   [d.to_dict() for d in self.peak_cascade],
             "inject": [d.to_dict() for d in self.inject_cascade],
+            "peak_snapshots":   {k: asdict(v) for k, v in self._peak_snapshots.items()},
+            "inject_snapshots": {k: asdict(v) for k, v in self._inject_snapshots.items()},
         })
 
     # ------------------------------------------------------------------ #
@@ -758,6 +771,7 @@ class PeakGuardController:
         # Per apparaat reduceren we de beschikbare headroom met zijn vermogen
         # zodat volgende apparaten alleen worden ingeschakeld als er nog marge is.
         remaining_headroom = headroom
+        any_restored = False
         for device, snapshot in snapshots_to_restore:
             nominal_w = float(device.power_watts) if device.power_watts else 0.0
             if nominal_w > 0 and remaining_headroom < nominal_w:
@@ -774,11 +788,14 @@ class PeakGuardController:
             if restored:
                 del self._peak_snapshots[device.entity_id]
                 remaining_headroom -= nominal_w   # reserveer vermogen voor volgende check
+                any_restored = True
                 _LOGGER.info(
                     "Peak Guard [PIEK]: '%s' terug AAN — headroom was %.0f W "
                     "(piek=%.0f W, buffer=%.0f W, verbruik=%.0f W)",
                     device.name, headroom, peak, buffer, consumption,
                 )
+        if any_restored:
+            await self.async_save()
 
     async def _check_inject_restore(self, consumption: float):
         if not self._inject_snapshots:
@@ -803,6 +820,7 @@ class PeakGuardController:
         if restored:
             del self._inject_snapshots[device.entity_id]
             _LOGGER.info("Peak Guard: '%s' hersteld", device.name)
+            await self.async_save()
 
     def _get_restore_candidates(
         self,
@@ -1168,6 +1186,7 @@ class PeakGuardController:
                 "Peak Guard [%s cascade]: klaar — overschot volledig verwerkt ✓",
                 label,
             )
+        await self.async_save()
 
     async def _apply_action(
         self,
