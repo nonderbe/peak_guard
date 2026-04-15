@@ -12,6 +12,7 @@ CONF_ENERGY_SENSOR = "energy_sensor"
 CONF_REGIO = "regio"
 CONF_POWER_DETECTION_TOLERANCE_PERCENT = "power_detection_tolerance_percent"
 CONF_SOLAR_NETTO_EUR_PER_KWH = "netto_besparing_per_kwh_verschoven"
+CONF_DEBUG_DECISION_LOGGING = "debug_decision_logging"
 
 # ------------------------------------------------------------------ #
 #  Fluvius netgebieden + tarieven 2026 (euro/kW/jaar, excl. BTW)      #
