@@ -251,3 +251,218 @@ class EVGuard:
 
         spread = max(values) - min(values)
         return spread <= EV_DEBOUNCE_TOLERANCE_W * 2
+
+    # ------------------------------------------------------------------ #
+    #  SOC-limiet override                                                 #
+    # ------------------------------------------------------------------ #
+
+    async def _set_soc_override(
+        self,
+        device: CascadeDevice,
+        override: bool,
+        original_soc: Optional[float] = None,
+    ) -> None:
+        """Stel de SOC-limiet in (override=True) of herstel hem (override=False)."""
+        if device.ev_max_soc is None:
+            _LOGGER.warning(
+                "Peak Guard EV: '%s' SOC-limiet NIET aangepast — "
+                "ev_max_soc niet geconfigureerd",
+                device.name,
+            )
+            return
+
+        soc_entity = device.ev_soc_entity
+        if not soc_entity:
+            _LOGGER.warning(
+                "Peak Guard EV: '%s' SOC-limiet NIET aangepast — "
+                "geen soc_entity geconfigureerd in de wizard (stap 3: SoC-limiet entiteit)",
+                device.name,
+            )
+            return
+
+        if override:
+            target_soc = float(device.ev_max_soc)
+            _LOGGER.warning(
+                "Peak Guard EV: '%s' SOC-limiet instellen op %.0f%% via '%s'",
+                device.name, target_soc, soc_entity,
+            )
+        else:
+            target_soc = float(original_soc) if original_soc is not None else 100.0
+            _LOGGER.warning(
+                "Peak Guard EV: '%s' SOC-limiet herstellen naar %.0f%% via '%s'",
+                device.name, target_soc, soc_entity,
+            )
+
+        try:
+            await self.hass.services.async_call(
+                "number", "set_value",
+                {"entity_id": soc_entity, "value": target_soc},
+                blocking=True,
+            )
+        except Exception as err:
+            _LOGGER.error(
+                "Peak Guard EV: fout bij instellen SOC-limiet voor '%s' via '%s': %s",
+                device.name, soc_entity, err,
+            )
+
+    # ------------------------------------------------------------------ #
+    #  Herstel na Peak Guard ingreep                                       #
+    # ------------------------------------------------------------------ #
+
+    async def restore(
+        self,
+        device: CascadeDevice,
+        snapshot: DeviceSnapshot,
+        peak_tracker: "PeakAvoidTracker",
+        solar_tracker: "SolarShiftTracker",
+    ) -> bool:
+        """
+        Herstel EV Charger na een Peak Guard ingreep.
+
+        PIEKBEPERKING (original_state == "on"):
+          Zet schakelaar terug aan, herstel laadstroom, start duurmeting.
+
+        INJECTIEPREVENTIE (original_state == "off"):
+          Verwijder SOC-override, herstel laadstroom, zet schakelaar uit,
+          voltooi solar duurmeting.
+        """
+        try:
+            sw_entity  = device.ev_switch_entity or device.entity_id
+            cur_entity = device.ev_current_entity
+
+            sw_state = self.hass.states.get(sw_entity)
+            if sw_state is None:
+                _LOGGER.warning(
+                    "Peak Guard EV: schakelaar '%s' niet gevonden bij herstel", sw_entity
+                )
+                return False
+
+            # ---- PIEKBEPERKING: schakelaar was aan, nu uitgeschakeld ---- #
+            if snapshot.original_state == "on":
+                if sw_state.state != "on":
+                    await self.hass.services.async_call(
+                        "switch", "turn_on", {"entity_id": sw_entity}, blocking=True
+                    )
+                    _LOGGER.info(
+                        "Peak Guard EV peak: '%s' terug ingeschakeld "
+                        "(reden: herstel na piekbeperking)",
+                        device.name,
+                    )
+
+                if cur_entity and snapshot.original_current is not None:
+                    max_a = float(
+                        device.max_value if device.max_value is not None
+                        else DEFAULT_EV_MAX_AMPERE
+                    )
+                    orig_a = min(snapshot.original_current, max_a)
+                    cur_state = self.hass.states.get(cur_entity)
+                    if cur_state is not None:
+                        try:
+                            cur_val = float(cur_state.state)
+                        except (ValueError, TypeError):
+                            cur_val = None
+                        if cur_val is None or round(cur_val, 0) != round(orig_a, 0):
+                            await self.hass.services.async_call(
+                                "number", "set_value",
+                                {"entity_id": cur_entity, "value": round(orig_a, 1)},
+                                blocking=True,
+                            )
+                            _LOGGER.info(
+                                "Peak Guard EV peak: '%s' laadstroom hersteld naar %.1f A "
+                                "(reden: herstel na piekbeperking, gecapped aan max %.1f A)",
+                                device.name, orig_a, max_a,
+                            )
+
+                peak_tracker.start_measurement_on_turnon(
+                    device_id=device.id,
+                    device_name=device.name,
+                    ts=datetime.now(timezone.utc),
+                )
+                guard = self.get_guard(device.id)
+                guard.state = EVState.CHARGING
+                guard.last_switch_state = True
+                guard.turned_on_at = datetime.now(timezone.utc)
+                guard.surplus_history.clear()
+                return True
+
+            # ---- INJECTIEPREVENTIE: schakelaar was uit, nu aangezet ---- #
+            if snapshot.original_state == "off":
+                if sw_state.state != "off":
+                    await self._set_soc_override(
+                        device, override=False, original_soc=snapshot.original_soc
+                    )
+
+                    if cur_entity:
+                        restore_a = (
+                            snapshot.original_current
+                            if snapshot.original_current is not None
+                            else (device.min_value or DEFAULT_EV_MIN_AMPERE)
+                        )
+                        await self.hass.services.async_call(
+                            "number", "set_value",
+                            {"entity_id": cur_entity, "value": round(restore_a, 1)},
+                            blocking=True,
+                        )
+                        _LOGGER.info(
+                            "Peak Guard EV solar: '%s' laadstroom hersteld naar %.1f A "
+                            "(reden: herstel na injectiepreventie)",
+                            device.name, restore_a,
+                        )
+
+                    await self.hass.services.async_call(
+                        "switch", "turn_off", {"entity_id": sw_entity}, blocking=True
+                    )
+                    _LOGGER.info(
+                        "Peak Guard EV solar: '%s' schakelaar uitgeschakeld "
+                        "(reden: herstel na injectiepreventie)",
+                        device.name,
+                    )
+
+                    ev_event = solar_tracker.complete_solar_calculation(
+                        device_id=device.id,
+                        now=datetime.now(timezone.utc),
+                    )
+                    if ev_event:
+                        _LOGGER.info(
+                            "Peak Guard EV solar: event afgerond voor '%s' — "
+                            "duur=%.1f min, verschoven=%.4f kWh, besparing=€%.4f",
+                            device.name, ev_event.measured_duration_min,
+                            ev_event.shifted_kwh, ev_event.savings_euro,
+                        )
+
+                    guard = self.get_guard(device.id)
+                    guard.state = EVState.IDLE
+                    guard.turned_off_at = datetime.now(timezone.utc)
+                    guard.turned_off_by_pg = True
+                    guard.surplus_history.clear()
+                else:
+                    # Schakelaar staat al uit — snapshot opruimen zonder service-call.
+                    _LOGGER.debug(
+                        "Peak Guard EV solar: '%s' schakelaar al uit bij herstel — "
+                        "snapshot opgeruimd zonder service-call",
+                        device.name,
+                    )
+                    solar_tracker.complete_solar_calculation(
+                        device_id=device.id,
+                        now=datetime.now(timezone.utc),
+                    )
+                    guard = self.get_guard(device.id)
+                    guard.state = EVState.IDLE
+                    guard.surplus_history.clear()
+                return True
+
+        except HomeAssistantError as err:
+            _LOGGER.warning(
+                "Peak Guard EV: '%s' offline of niet bereikbaar bij herstel — "
+                "volgende cyclus opnieuw proberen (%s)",
+                device.name, err,
+            )
+            return False
+        except (ValueError, TypeError) as err:
+            _LOGGER.error(
+                "Peak Guard EV: fout bij herstellen '%s': %s",
+                device.name, err,
+            )
+            return False
+
+        return False
