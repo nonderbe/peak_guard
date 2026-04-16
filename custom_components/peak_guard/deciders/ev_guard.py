@@ -128,3 +128,126 @@ class EVGuard:
         if value is not None:
             entry["value"] = value
         self._iteration_actions.append(entry)
+
+    # ------------------------------------------------------------------ #
+    #  Kabeldetectie                                                       #
+    # ------------------------------------------------------------------ #
+
+    def cable_connected(self, device: CascadeDevice) -> bool:
+        """
+        Geeft True als de laadkabel aangesloten is, of als er geen kabelentity
+        geconfigureerd is.
+
+        Truthy-states: on, true, connected, charging, complete, fully_charged,
+        pending, 1 — of een numerieke waarde > 0.
+        Bij unavailable/unknown: True (niet blokkeren bij tijdelijke storing).
+        """
+        cable_entity = device.ev_cable_entity or DEFAULT_EV_CABLE_ENTITY
+        if not cable_entity:
+            return True
+
+        state = self.hass.states.get(cable_entity)
+        if state is None:
+            _LOGGER.debug(
+                "Peak Guard EV: kabelentity '%s' niet gevonden voor '%s' — "
+                "kabelcheck overgeslagen (aanname: aangesloten)",
+                cable_entity, device.name,
+            )
+            return True
+
+        s = state.state.lower().strip()
+        if s in ("unavailable", "unknown", ""):
+            return True
+
+        CABLE_ON = {"on", "true", "connected", "charging", "complete",
+                    "fully_charged", "pending", "1"}
+        if s in CABLE_ON:
+            return True
+
+        try:
+            return float(s) > 0
+        except (ValueError, TypeError):
+            pass
+
+        return False
+
+    # ------------------------------------------------------------------ #
+    #  Verbindingsstatus (wake-up check)                                   #
+    # ------------------------------------------------------------------ #
+
+    def is_connected(self, device: CascadeDevice) -> bool:
+        """
+        Geeft True als de EV verbonden/online is, of als er geen status-sensor is.
+
+        Gebruikt om te bepalen of de auto wakker is vóór het starten van laden.
+        States die als "verbonden" gelden: on, true, connected, online, home,
+        charging, complete, fully_charged, pending, 1.
+        Bij ontbrekende of unavailable sensor: True (geen blokkering).
+        """
+        status_entity = device.ev_status_sensor
+        if not status_entity:
+            return True
+
+        state = self.hass.states.get(status_entity)
+        if state is None:
+            _LOGGER.debug(
+                "Peak Guard EV: status-sensor '%s' niet gevonden voor '%s' — "
+                "wake-up check overgeslagen (aanname: verbonden)",
+                status_entity, device.name,
+            )
+            return True
+
+        s = state.state.lower().strip()
+        if s in ("unavailable", "unknown", ""):
+            return True
+
+        CONNECTED = {"on", "true", "connected", "online", "home",
+                     "charging", "complete", "fully_charged", "pending", "1"}
+        if s in CONNECTED:
+            return True
+
+        try:
+            return float(s) > 0
+        except (ValueError, TypeError):
+            pass
+
+        return False
+
+    # ------------------------------------------------------------------ #
+    #  Debounce helper                                                     #
+    # ------------------------------------------------------------------ #
+
+    def surplus_is_stable(
+        self,
+        guard: EVDeviceGuard,
+        current_surplus_w: float,
+        now: datetime,
+    ) -> bool:
+        """
+        Geeft True als het surplus stabiel is geweest (spread ≤ 2× tolerantie)
+        gedurende minstens EV_DEBOUNCE_STABLE_S seconden.
+
+        Vergelijkt samples onderling (spread = max − min), niet allemaal met
+        de huidige waarde. Zo wordt een geleidelijk dalend surplus als stabiel
+        beschouwd zolang de spread binnen de tolerantie blijft.
+
+        Side-effect: voegt (now, current_surplus_w) toe aan guard.surplus_history.
+        """
+        guard.surplus_history.append((now, current_surplus_w))
+
+        cutoff2x = now - timedelta(seconds=EV_DEBOUNCE_STABLE_S * 2)
+        relevant = [(ts, w) for ts, w in guard.surplus_history if ts >= cutoff2x]
+
+        if len(relevant) < 2:
+            return False
+
+        oldest_ts = relevant[0][0]
+        if (now - oldest_ts).total_seconds() < EV_DEBOUNCE_STABLE_S:
+            return False
+
+        values = [w for _, w in relevant]
+        if min(values) <= 0:
+            return False
+
+        spread = max(values) - min(values)
+        return spread <= EV_DEBOUNCE_TOLERANCE_W * 2
