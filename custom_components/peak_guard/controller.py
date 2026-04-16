@@ -856,9 +856,9 @@ class PeakGuardController:
                     "headroom %.0f W < nominaal %.0f W (te weinig marge)",
                     device.name, remaining_headroom, nominal_w,
                 )
-                # Stop: als dit apparaat al te groot is, zijn volgende (hogere
-                # prioriteit = meer vermogen) dat zeker ook.
-                break
+                # Sla dit apparaat over maar ga door met de rest: een kleiner
+                # apparaat (lagere prioriteit) kan mogelijk wél nog passen.
+                continue
 
             restored = await self._restore_device(device, snapshot)
             if restored:
@@ -936,17 +936,23 @@ class PeakGuardController:
                         ts=datetime.now(timezone.utc),
                     )
                 elif snapshot.original_state == "on" and state.state == "on":
+                    # Apparaat staat al terug aan (bijv. manueel ingeschakeld vóór
+                    # Peak Guard het kon herstellen). Transiteer expliciet via
+                    # pending → active → direct afgerond (0 duur → geen event),
+                    # zodat _pending correct opgeruimd wordt en er geen stale state
+                    # overblijft tot aan de maandwissel.
                     now_ts = datetime.now(timezone.utc)
-                    event = self.peak_tracker.complete_peak_calculation(
+                    self.peak_tracker.start_measurement_on_turnon(
+                        device_id=device.id, device_name=device.name, ts=now_ts
+                    )
+                    self.peak_tracker.complete_peak_calculation(
                         device_id=device.id, now=now_ts
                     )
-                    if event:
-                        _LOGGER.info(
-                            "Peak Guard: piek-event afgerond voor '%s' — "
-                            "duur=%.1f min, vermeden=%.3f kW, besparing=€%.4f",
-                            device.name, event.measured_duration_min,
-                            event.avoided_peak_kw, event.savings_euro,
-                        )
+                    _LOGGER.debug(
+                        "Peak Guard: '%s' stond al aan bij herstel — "
+                        "meting opgeruimd (0 duur, geen event)",
+                        device.name,
+                    )
                 return True
 
             if device.action_type == ACTION_SWITCH_ON:
@@ -1027,7 +1033,10 @@ class PeakGuardController:
 
             # ---- PIEKBEPERKING: schakelaar was aan, nu uitgeschakeld ---- #
             if snapshot.original_state == "on":
-                if sw_state.state != "on":
+                now_ts = datetime.now(timezone.utc)
+                already_on = sw_state.state == "on"
+
+                if not already_on:
                     await self.hass.services.async_call(
                         "switch", "turn_on", {"entity_id": sw_entity}, blocking=True
                     )
@@ -1057,16 +1066,31 @@ class PeakGuardController:
                                 device.name, orig_a, max_a,
                             )
 
-                self.peak_tracker.start_measurement_on_turnon(
-                    device_id=device.id,
-                    device_name=device.name,
-                    ts=datetime.now(timezone.utc),
-                )
-                # Clear guard state so fresh debounce starts
                 guard = self._ev_guard(device.id)
+                if already_on:
+                    # EV stond al aan (bijv. manueel ingeschakeld vóór Peak Guard).
+                    # Meting opruimen: pending → active → direct afgerond (0 duur, geen event).
+                    self.peak_tracker.start_measurement_on_turnon(
+                        device_id=device.id, device_name=device.name, ts=now_ts
+                    )
+                    self.peak_tracker.complete_peak_calculation(
+                        device_id=device.id, now=now_ts
+                    )
+                    _LOGGER.debug(
+                        "Peak Guard EV peak: '%s' stond al aan bij herstel — "
+                        "meting opgeruimd (0 duur, geen event)",
+                        device.name,
+                    )
+                else:
+                    # Normaal herstelpad: meting start nu, wordt afgerond bij
+                    # power-drop detectie (via get_active_nominal_kw).
+                    self.peak_tracker.start_measurement_on_turnon(
+                        device_id=device.id, device_name=device.name, ts=now_ts
+                    )
+                    guard.turned_on_at = now_ts
+
                 guard.state = EVState.CHARGING
-                guard.last_switch_state = True   # schakelaar is nu (weer) aan
-                guard.turned_on_at = datetime.now(timezone.utc)
+                guard.last_switch_state = True
                 guard.surplus_history.clear()
                 return True
 
@@ -2358,7 +2382,12 @@ class PeakGuardController:
 
             nominal_w = float(device.power_watts)
             if nominal_w <= 0:
-                continue
+                # EV-laders hebben power_watts=0 omdat hun vermogen dynamisch is.
+                # Het werkelijke vermogen bij uitschakelen is opgeslagen in de tracker.
+                nominal_kw = self.peak_tracker.get_active_nominal_kw(device_id)
+                if nominal_kw is None or nominal_kw <= 0:
+                    continue
+                nominal_w = nominal_kw * 1000.0
 
             tol_pct = float(self.config.get(
                 CONF_POWER_DETECTION_TOLERANCE_PERCENT,

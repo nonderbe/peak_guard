@@ -203,7 +203,7 @@ class PeakAvoidTracker:
             return
         if ts is None:
             ts = datetime.now(timezone.utc)
-        p = self._pending[device_id]
+        p = self._pending.pop(device_id)   # verwijder uit pending bij overgang → active
         self._active[device_id] = ActivePeakMeasurement(
             device_id=device_id, device_name=device_name,
             nominal_kw=p.nominal_kw, avoid_ts=p.avoid_ts, turnon_ts=ts,
@@ -285,6 +285,11 @@ class PeakAvoidTracker:
 
     def get_active_ids(self) -> list[str]:
         return list(self._active.keys())
+
+    def get_active_nominal_kw(self, device_id: str) -> Optional[float]:
+        """Geeft het opgeslagen nominaal vermogen (kW) voor een actieve meting, of None."""
+        meas = self._active.get(device_id)
+        return meas.nominal_kw if meas else None
 
     # ── interne helpers ───────────────────────────────────────────── #
 
