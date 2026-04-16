@@ -14,6 +14,7 @@ from .const import (
     CONF_UPDATE_INTERVAL,
     CONF_POWER_DETECTION_TOLERANCE_PERCENT,
     CONF_SOLAR_NETTO_EUR_PER_KWH,
+    CONF_DEBUG_DECISION_LOGGING,
     DEFAULT_BUFFER_WATTS,
     DEFAULT_UPDATE_INTERVAL,
     DEFAULT_REGIO,
@@ -94,5 +95,38 @@ class PeakGuardConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         unit_of_measurement="€/kWh", mode="box",
                     )
                 ),
+                # ---- Debug logging -----------------------------------
+                vol.Optional(
+                    CONF_DEBUG_DECISION_LOGGING, default=False
+                ): selector.BooleanSelector(),
+            }),
+        )
+
+    @staticmethod
+    @config_entries.callback
+    def async_get_options_flow(config_entry):
+        """Geef de options flow terug (voor 'Configureren' in de HA-UI)."""
+        return PeakGuardOptionsFlow(config_entry)
+
+
+class PeakGuardOptionsFlow(config_entries.OptionsFlow):
+    """Options flow — laat toe om instellingen na de initiële setup te wijzigen."""
+
+    def __init__(self, config_entry):
+        self._config_entry = config_entry
+
+    async def async_step_init(self, user_input=None):
+        if user_input is not None:
+            return self.async_create_entry(title="", data=user_input)
+
+        current = self._config_entry.options.get(
+            CONF_DEBUG_DECISION_LOGGING, False
+        )
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema({
+                vol.Optional(
+                    CONF_DEBUG_DECISION_LOGGING, default=current
+                ): selector.BooleanSelector(),
             }),
         )

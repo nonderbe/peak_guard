@@ -74,7 +74,9 @@ class PeakGuardForceCheckView(HomeAssistantView):
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Stel Peak Guard in vanuit een config entry."""
-    controller = PeakGuardController(hass, dict(entry.data))
+    # Merge entry.data (initial config) with entry.options (changeable via "Configureren").
+    # entry.options wins on conflict so users can override defaults without re-adding.
+    controller = PeakGuardController(hass, {**entry.data, **entry.options})
     await controller.async_load()
 
     # Sla alles op onder DOMAIN als dict zodat meerdere objecten
