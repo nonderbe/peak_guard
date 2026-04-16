@@ -12,6 +12,7 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.storage import Store
 
 from .avoided_peak_tracker import PeakAvoidTracker, SolarShiftTracker
+from .deciders import EVGuard, InjectionDecider, PeakDecider
 
 from .const import (
     DOMAIN,
@@ -302,6 +303,31 @@ class PeakGuardController:
         # Datum van de laatste dag waarvoor een header is geschreven.
         self._last_logged_day: Optional[str] = None
 
+        # ── Deciders ─────────────────────────────────────────────────── #
+        self._ev_guard_decider = EVGuard(hass, config, self._iteration_actions)
+        self._peak_decider = PeakDecider(
+            hass=hass,
+            config=config,
+            peak_tracker=self.peak_tracker,
+            solar_tracker=self.solar_tracker,
+            ev_guard=self._ev_guard_decider,
+            iteration_actions=self._iteration_actions,
+            save_fn=self.async_save,
+            cascade=self.peak_cascade,
+            snapshots=self._peak_snapshots,
+        )
+        self._injection_decider = InjectionDecider(
+            hass=hass,
+            config=config,
+            peak_tracker=self.peak_tracker,
+            solar_tracker=self.solar_tracker,
+            ev_guard=self._ev_guard_decider,
+            iteration_actions=self._iteration_actions,
+            save_fn=self.async_save,
+            cascade=self.inject_cascade,
+            snapshots=self._inject_snapshots,
+        )
+
     # ------------------------------------------------------------------ #
     #  EV guard helpers                                                    #
     # ------------------------------------------------------------------ #
@@ -509,6 +535,9 @@ class PeakGuardController:
         if data:
             self.peak_cascade   = [CascadeDevice(**d) for d in data.get("peak", [])]
             self.inject_cascade = [CascadeDevice(**d) for d in data.get("inject", [])]
+            # Houd decider-cascades gesynchroniseerd na herladen vanuit opslag.
+            self._peak_decider._cascade      = self.peak_cascade
+            self._injection_decider._cascade = self.inject_cascade
             for k, v in data.get("peak_snapshots", {}).items():
                 self._peak_snapshots[k] = DeviceSnapshot(**v)
             for k, v in data.get("inject_snapshots", {}).items():
@@ -558,11 +587,11 @@ class PeakGuardController:
                         "state": guard.state.value,
                         "history_len": len(guard.surplus_history),
                     }
-                    for device_id, guard in self._ev_guards.items()
+                    for device_id, guard in self._ev_guard_decider.guards.items()
                 },
                 "ev_rate_limiter": {
-                    "calls_in_window": self._ev_rate_limiter.calls_in_window,
-                    "remaining":       self._ev_rate_limiter.remaining,
+                    "calls_in_window": self._ev_guard_decider.rate_limiter.calls_in_window,
+                    "remaining":       self._ev_guard_decider.rate_limiter.remaining,
                     "window_s":        EV_RATE_LIMIT_WINDOW_S,
                     "max_calls":       EV_RATE_LIMIT_MAX_CALLS,
                 },
@@ -573,8 +602,10 @@ class PeakGuardController:
         parsed = [CascadeDevice(**d) for d in devices]
         if cascade_type == "peak":
             self.peak_cascade = parsed
+            self._peak_decider._cascade = self.peak_cascade
         elif cascade_type == "inject":
             self.inject_cascade = parsed
+            self._injection_decider._cascade = self.inject_cascade
         # Notificeer entity-platforms zodat nieuwe apparaten een entity krijgen
         for cb in self._entity_listeners:
             try:
@@ -652,7 +683,7 @@ class PeakGuardController:
             try:
                 self._last_loop_at = datetime.now(timezone.utc).isoformat()
                 # Reset iteration tracking voor beslissingslog.
-                self._iteration_actions = []
+                self._iteration_actions.clear()
                 consumption = self._sensor_value(self.config.get(CONF_CONSUMPTION_SENSOR))
                 if consumption is not None:
                     _sensor_unavailable_count = 0   # reset bij succesvolle lezing
@@ -674,9 +705,9 @@ class PeakGuardController:
                     )
                     await self._check_power_drop(consumption)
                     if consumption > 0:
-                        await self._check_peak(consumption)
-                        await self._check_peak_restore(consumption)
-                        await self._check_inject_restore(consumption)
+                        await self._peak_decider.check(consumption)
+                        await self._peak_decider.check_restore(consumption)
+                        await self._injection_decider.check_restore(consumption)
                     elif consumption < 0:
                         # Negatief verbruik = export naar net (zonne-overschot)
                         _LOGGER.debug(
@@ -684,12 +715,12 @@ class PeakGuardController:
                             "(export %.0f W) — solar cascade wordt gecontroleerd",
                             consumption, abs(consumption),
                         )
-                        await self._check_injection(consumption)
-                        await self._check_peak_restore(consumption)
-                        await self._check_inject_restore(consumption)
+                        await self._injection_decider.check(consumption)
+                        await self._peak_decider.check_restore(consumption)
+                        await self._injection_decider.check_restore(consumption)
                     else:
-                        await self._check_peak_restore(0.0)
-                        await self._check_inject_restore(0.0)
+                        await self._peak_decider.check_restore(0.0)
+                        await self._injection_decider.check_restore(0.0)
 
                     # ── Beslissingslog schrijven ──────────────────────── #
                     if _debug_logging:
