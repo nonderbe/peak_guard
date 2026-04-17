@@ -177,12 +177,15 @@ class EVGuard:
 
     def is_connected(self, device: CascadeDevice) -> bool:
         """
-        Geeft True als de EV verbonden/online is, of als er geen status-sensor is.
+        Geeft True als de EV verbonden/wakker is.
 
-        Gebruikt om te bepalen of de auto wakker is vóór het starten van laden.
-        States die als "verbonden" gelden: on, true, connected, online, home,
-        charging, complete, fully_charged, pending, 1.
-        Bij ontbrekende of unavailable sensor: True (geen blokkering).
+        States die als "verbonden/wakker" gelden: on, true, connected, online, home,
+        charging, fully_charged, pending, 1.
+        "complete" is bewust weggelaten: Tesla-auto's slapen vaak in die staat.
+        "unavailable"/"unknown": als een wake-button geconfigureerd is, beschouwen we
+        dit als slapend (False) zodat de wake-up getriggerd wordt. Zonder wake-button
+        blokkeren we niet (True).
+        Bij ontbrekende sensor: True (geen blokkering).
         """
         status_entity = device.ev_status_sensor
         if not status_entity:
@@ -199,10 +202,12 @@ class EVGuard:
 
         s = state.state.lower().strip()
         if s in ("unavailable", "unknown", ""):
-            return True
+            # Tesla-sensoren worden unavailable als de auto slaapt. Als er een
+            # wake-button is, triggeren we de wake-up; anders blokkeren we niet.
+            return not bool(device.ev_wake_button)
 
         CONNECTED = {"on", "true", "connected", "online", "home",
-                     "charging", "complete", "fully_charged", "pending", "1"}
+                     "charging", "fully_charged", "pending", "1"}
         if s in CONNECTED:
             return True
 
@@ -212,6 +217,36 @@ class EVGuard:
             pass
 
         return False
+
+    # ------------------------------------------------------------------ #
+    #  Locatie helper                                                      #
+    # ------------------------------------------------------------------ #
+
+    def is_home(self, device: CascadeDevice) -> bool:
+        """
+        Geeft True als de EV thuis is, of als er geen locatie-tracker is.
+
+        Ondersteunt device_tracker (home/not_home) en binary_sensor (on/off).
+        Bij ontbrekende, unavailable of onbekende sensor: True (geen blokkering).
+        """
+        tracker_entity = device.ev_location_tracker
+        if not tracker_entity:
+            return True
+
+        state = self.hass.states.get(tracker_entity)
+        if state is None:
+            _LOGGER.debug(
+                "Peak Guard EV: locatie-tracker '%s' niet gevonden voor '%s' — "
+                "locatiecheck overgeslagen (aanname: thuis)",
+                tracker_entity, device.name,
+            )
+            return True
+
+        s = state.state.lower().strip()
+        if s in ("unavailable", "unknown", ""):
+            return True
+
+        return s in ("home", "on", "true", "1")
 
     # ------------------------------------------------------------------ #
     #  Debounce helper                                                     #
@@ -807,6 +842,26 @@ class EVGuard:
                 return excess
 
         # surplus ≥ start_threshold_w — EV mag (of blijft) laden
+
+        # GATE: locatie — EV moet thuis zijn om te laden
+        if not self.is_home(device):
+            if guard.state != EVState.IDLE:
+                loc_st = self.hass.states.get(device.ev_location_tracker) if device.ev_location_tracker else None
+                _LOGGER.info(
+                    "Peak Guard [SOLAR]: '%s' niet thuis (tracker='%s', staat='%s') — "
+                    "toestand gereset naar IDLE",
+                    device.name, device.ev_location_tracker or "(geen)",
+                    loc_st.state if loc_st else "onbekend",
+                )
+                guard.state = EVState.IDLE
+                guard.surplus_history.clear()
+            else:
+                _LOGGER.debug(
+                    "Peak Guard [SOLAR]: '%s' niet thuis — laden overgeslagen",
+                    device.name,
+                )
+            self.last_skip_reason = "EV niet thuis"
+            return excess
 
         # Detecteer handmatige start
         if sw_on and guard.last_switch_state is not True:

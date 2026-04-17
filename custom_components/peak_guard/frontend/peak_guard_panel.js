@@ -527,6 +527,12 @@ class PeakGuardPanel extends HTMLElement {
                  <div class="ev-debounce-track"><div id="ev-debounce-fill-${type}-${index}" class="ev-debounce-fill" style="width:0%"></div></div>
                </div>`
             : ""}
+          ${device.action_type === "ev_charger" && type === "inject" && !device.ev_location_tracker
+            ? `<div class="ev-location-warning">
+                 <span>Geen locatie-tracker ingesteld. Peak Guard kan niet controleren of de wagen thuis is.</span>
+                 <button class="btn-inline-warning" data-action="configure-location" data-index="${index}" data-type="${type}">Configureren</button>
+               </div>`
+            : ""}
           ${this._renderDeviceControls(device, index, type)}
         </div>
         <div class="device-actions">
@@ -811,12 +817,12 @@ class PeakGuardPanel extends HTMLElement {
   //  Modal — persistente DOM-node, nooit door _render() gewist           //
   // ------------------------------------------------------------------ //
 
-  _openModal(device, cascadeType) {
+  _openModal(device, cascadeType, startStep = 1) {
     this._log("_openModal() aangeroepen. type=" + cascadeType);
     this._editDevice = device || null;
     this._editCascadeType = cascadeType;
     this._modalVisible = true;
-    this._wizardStep = 1; // altijd starten op stap 1
+    this._wizardStep = startStep;
 
     // Maak de backdrop-node éénmalig aan
     if (!this._modalEl) {
@@ -1115,6 +1121,27 @@ class PeakGuardPanel extends HTMLElement {
         <hr style="border:none;border-top:1px solid var(--divider-color,#e0e0e0);margin:16px 0;" />
         <div style="font-size:.8em;font-weight:700;text-transform:uppercase;letter-spacing:.06em;
                     color:var(--secondary-text-color,#757575);margin-bottom:12px;">
+          Locatie (optioneel)
+        </div>
+
+        <div class="form-group">
+          <label>Locatie-tracker <span style="font-weight:400;text-transform:none;">(optioneel)</span></label>
+          <div class="entity-picker">
+            <input id="f-ev-location-tracker" type="text"
+              value="${this._esc(d.ev_location_tracker || '')}"
+              placeholder="device_tracker.tesla" autocomplete="off" />
+            <div id="ev-location-tracker-dropdown" class="entity-dropdown" style="display:none;"></div>
+          </div>
+          <div class="field-hint">
+            Tracker die aangeeft of de auto thuis is (bijv. <em>device_tracker.tesla</em>).
+            Peak Guard slaat het laden over als de tracker "not_home" toont — de auto heeft
+            dan immers geen invloed op het thuisverbruik.
+          </div>
+        </div>
+
+        <hr style="border:none;border-top:1px solid var(--divider-color,#e0e0e0);margin:16px 0;" />
+        <div style="font-size:.8em;font-weight:700;text-transform:uppercase;letter-spacing:.06em;
+                    color:var(--secondary-text-color,#757575);margin-bottom:12px;">
           Wake-up (optioneel — voor auto's die in slaapstand gaan)
         </div>
 
@@ -1342,10 +1369,11 @@ class PeakGuardPanel extends HTMLElement {
         });
 
       } else if (step === 3) {
-        makeEntityPicker("#f-ev-soc-entity",       "#ev-soc-entity-dropdown",       (id) => id.startsWith("number."));
-        makeEntityPicker("#f-ev-battery-entity",   "#ev-battery-entity-dropdown",   (id) => id.startsWith("sensor."));
-        makeEntityPicker("#f-ev-status-sensor",    "#ev-status-sensor-dropdown",    (id) => id.startsWith("binary_sensor.") || id.startsWith("sensor."));
-        makeEntityPicker("#f-ev-wake-button",      "#ev-wake-button-dropdown",      (id) => id.startsWith("button."));
+        makeEntityPicker("#f-ev-soc-entity",        "#ev-soc-entity-dropdown",        (id) => id.startsWith("number."));
+        makeEntityPicker("#f-ev-battery-entity",    "#ev-battery-entity-dropdown",    (id) => id.startsWith("sensor."));
+        makeEntityPicker("#f-ev-location-tracker",  "#ev-location-tracker-dropdown",  (id) => id.startsWith("device_tracker.") || id.startsWith("binary_sensor."));
+        makeEntityPicker("#f-ev-status-sensor",     "#ev-status-sensor-dropdown",     (id) => id.startsWith("binary_sensor.") || id.startsWith("sensor."));
+        makeEntityPicker("#f-ev-wake-button",       "#ev-wake-button-dropdown",       (id) => id.startsWith("button."));
 
         root.querySelector("#wizard-prev")?.addEventListener("click", () => {
           this._editDevice = { ...(this._editDevice || {}) };
@@ -1413,8 +1441,9 @@ class PeakGuardPanel extends HTMLElement {
 
       const power_watts = Math.round(evMaxA * this._evVoltage(evPhases));
 
-      const evStatusSensor = val("#f-ev-status-sensor") || d.ev_status_sensor || null;
-      const evWakeButton   = val("#f-ev-wake-button")   || d.ev_wake_button   || null;
+      const evStatusSensor    = val("#f-ev-status-sensor")    || d.ev_status_sensor    || null;
+      const evWakeButton      = val("#f-ev-wake-button")      || d.ev_wake_button      || null;
+      const evLocationTracker = val("#f-ev-location-tracker") || d.ev_location_tracker || null;
 
       device = {
         id:               d.id || `dev_${Date.now()}`,
@@ -1434,8 +1463,9 @@ class PeakGuardPanel extends HTMLElement {
         ev_battery_entity: evBattEntity,
         ev_max_soc:        evSoc,
         ev_phases:         evPhases,
-        ev_status_sensor:  evStatusSensor,
-        ev_wake_button:    evWakeButton,
+        ev_status_sensor:    evStatusSensor,
+        ev_wake_button:      evWakeButton,
+        ev_location_tracker: evLocationTracker,
       };
 
     } else {
@@ -1467,8 +1497,9 @@ class PeakGuardPanel extends HTMLElement {
         ev_battery_entity: null,
         ev_max_soc:        null,
         ev_phases:         null,
-        ev_status_sensor:  null,
-        ev_wake_button:    null,
+        ev_status_sensor:    null,
+        ev_wake_button:      null,
+        ev_location_tracker: null,
       };
     }
 
@@ -1601,7 +1632,7 @@ class PeakGuardPanel extends HTMLElement {
     });
 
     this.shadowRoot
-      .querySelectorAll("[data-action='info'], [data-action='edit'], [data-action='delete'], [data-action='up'], [data-action='down']")
+      .querySelectorAll("[data-action='info'], [data-action='edit'], [data-action='delete'], [data-action='up'], [data-action='down'], [data-action='configure-location']")
       .forEach((btn) => {
         btn.addEventListener("click", () => {
           const { action, index: idxStr, type } = btn.dataset;
@@ -1612,6 +1643,8 @@ class PeakGuardPanel extends HTMLElement {
             this._showInfoModal(devices[idx], type);
           } else if (action === "edit") {
             this._openModal({ ...devices[idx] }, type);
+          } else if (action === "configure-location") {
+            this._openModal({ ...devices[idx] }, type, 3);
           } else if (action === "delete") {
             if (confirm(`'${devices[idx].name}' verwijderen?`)) {
               devices.splice(idx, 1);
@@ -1745,6 +1778,20 @@ class PeakGuardPanel extends HTMLElement {
           margin-bottom: 5px;
         }
         .info-restore-text { font-size: .87em; line-height: 1.5; }
+
+        /* EV locatie-waarschuwing */
+        .ev-location-warning {
+          display: flex; align-items: center; justify-content: space-between; gap: 10px;
+          margin-top: 8px; padding: 7px 10px;
+          background: #fff8e1; border: 1px solid #ffe082; border-radius: 6px;
+          font-size: .8em; color: #5d4037;
+        }
+        .btn-inline-warning {
+          flex-shrink: 0; padding: 3px 10px; border-radius: 4px; border: none;
+          background: #f9a825; color: #fff; font-size: .85em; font-weight: 600;
+          cursor: pointer; white-space: nowrap;
+        }
+        .btn-inline-warning:hover { background: #f57f17; }
 
         /* EV debounce indicator */
         .ev-debounce-bar-wrap {

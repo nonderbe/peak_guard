@@ -204,6 +204,9 @@ class CascadeDevice:
       ev_status_sensor  : sensor die verbindingsstatus toont (bijv. binary_sensor.tesla_status).
                           "connected"/"online"/"on" = verbonden, anders = slapend.
                           Optioneel; als niet ingesteld wordt wake-up check overgeslagen.
+      ev_location_tracker : device_tracker of sensor die aangeeft of de EV thuis is.
+                          "home" / "on" = thuis; alles anders = niet thuis → laden overgeslagen.
+                          Optioneel; als niet ingesteld wordt locatie niet gecontroleerd.
       min_value         : minimale laadstroom (A), default 6
       max_value         : maximale laadstroom (A), default 32
 
@@ -234,8 +237,9 @@ class CascadeDevice:
     ev_min_current:     Optional[float] = None   # hardware-minimum laadstroom (A)
     start_threshold_w:  Optional[float] = None   # solar start-drempel (W), default 230
     ev_cable_entity:    Optional[str]   = None   # sensor die kabelaansluiting detecteert
-    ev_wake_button:     Optional[str]   = None   # button.* om EV wakker te maken
-    ev_status_sensor:   Optional[str]   = None   # sensor verbindingsstatus EV
+    ev_wake_button:       Optional[str]   = None   # button.* om EV wakker te maken
+    ev_status_sensor:     Optional[str]   = None   # sensor verbindingsstatus EV
+    ev_location_tracker:  Optional[str]   = None   # device_tracker.* of sensor — thuis = home/on
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -456,10 +460,12 @@ class PeakGuardController:
 
         s = state.state.lower().strip()
         if s in ("unavailable", "unknown", ""):
-            return True  # tijdelijk onbeschikbaar → niet blokkeren
+            # Tesla-sensoren worden unavailable als de auto slaapt. Als er een
+            # wake-button is, triggeren we de wake-up; anders blokkeren we niet.
+            return not bool(device.ev_wake_button)
 
         CONNECTED = {"on", "true", "connected", "online", "home",
-                     "charging", "complete", "fully_charged", "pending", "1"}
+                     "charging", "fully_charged", "pending", "1"}
         if s in CONNECTED:
             return True
 
@@ -1781,6 +1787,28 @@ class PeakGuardController:
                 return excess
 
         # surplus ≥ start_threshold_w — EV mag (of blijft) laden
+
+        # ── GATE: locatie — EV moet thuis zijn om te laden ──────────────── #
+        if device.ev_location_tracker:
+            loc_state = self.hass.states.get(device.ev_location_tracker)
+            loc_val = loc_state.state.lower().strip() if loc_state else ""
+            ev_is_home = loc_val in ("home", "on", "true", "1") or loc_val in ("unavailable", "unknown", "")
+            if not ev_is_home:
+                if guard.state != EVState.IDLE:
+                    _LOGGER.info(
+                        "Peak Guard [SOLAR]: '%s' niet thuis (tracker='%s', staat='%s') — "
+                        "toestand gereset naar IDLE",
+                        device.name, device.ev_location_tracker,
+                        loc_state.state if loc_state else "onbekend",
+                    )
+                    guard.state = EVState.IDLE
+                    guard.surplus_history.clear()
+                else:
+                    _LOGGER.debug(
+                        "Peak Guard [SOLAR]: '%s' niet thuis — laden overgeslagen",
+                        device.name,
+                    )
+                return excess
 
         # ── Detecteer handmatige start ──────────────────────────────────── #
         # Als de schakelaar aan staat maar de guard dat niet verwacht, heeft de

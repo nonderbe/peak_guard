@@ -172,6 +172,9 @@ class CascadeDevice:
       ev_status_sensor  : sensor die verbindingsstatus toont (bijv. binary_sensor.tesla_status).
                           "connected"/"online"/"on" = verbonden, anders = slapend.
                           Optioneel; als niet ingesteld wordt wake-up check overgeslagen.
+      ev_location_tracker : device_tracker of sensor die aangeeft of de EV thuis is.
+                          "home" / "on" = thuis; alles anders = niet thuis → laden overgeslagen.
+                          Optioneel; als niet ingesteld wordt locatie niet gecontroleerd.
       min_value         : minimale laadstroom (A), default 6
       max_value         : maximale laadstroom (A), default 32
 
@@ -202,8 +205,9 @@ class CascadeDevice:
     ev_min_current:     Optional[float] = None   # hardware-minimum laadstroom (A)
     start_threshold_w:  Optional[float] = None   # solar start-drempel (W), default 230
     ev_cable_entity:    Optional[str]   = None   # sensor die kabelaansluiting detecteert
-    ev_wake_button:     Optional[str]   = None   # button.* om EV wakker te maken
-    ev_status_sensor:   Optional[str]   = None   # sensor verbindingsstatus EV
+    ev_wake_button:       Optional[str]   = None   # button.* om EV wakker te maken
+    ev_status_sensor:     Optional[str]   = None   # sensor verbindingsstatus EV
+    ev_location_tracker:  Optional[str]   = None   # device_tracker.* of sensor — thuis = home/on
 
     def to_dict(self) -> dict:
         return asdict(self)
