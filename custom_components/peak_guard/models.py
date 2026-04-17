@@ -97,6 +97,11 @@ class EVDeviceGuard:
     # Slaat (tijdstempel, surplus_W) tuples op voor stabiliteitscheck
     surplus_history: Deque = field(default_factory=lambda: deque(maxlen=60))
 
+    # ---- debounce doelwaarde ------------------------------------------ #
+    # Laadstroom (A) die PG wil instellen zodra het surplus stabiel is.
+    # Ingesteld bij elke evaluatie zodat de GUI de gewenste actie kan tonen.
+    pending_amps: Optional[int] = None
+
     # True als Peak Guard zelf de laatste turn_off heeft gegeven (niet de gebruiker).
     # Wordt gebruikt om te bepalen of de min-OFF-duur gate van toepassing is.
     turned_off_by_pg: bool = False

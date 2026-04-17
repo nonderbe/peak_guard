@@ -230,15 +230,20 @@ class PeakGuardPanel extends HTMLElement {
         if (device.action_type === "ev_charger") {
           const wrapEl  = this.shadowRoot.querySelector(`#ev-debounce-${cascadeType}-${index}`);
           const fillEl  = this.shadowRoot.querySelector(`#ev-debounce-fill-${cascadeType}-${index}`);
+          const labelEl = this.shadowRoot.querySelector(`#ev-debounce-label-${cascadeType}-${index}`);
           if (wrapEl && fillEl) {
-            // Zoek de guard-state voor dit apparaat via device.id
             const guard = this._data?.status?.ev_guards?.[device.id];
             const isWaiting = guard?.state === "waiting_for_stable_surplus";
             wrapEl.style.display = isWaiting ? "" : "none";
-            if (isWaiting && guard.history_len > 0) {
-              // Schat voortgang op basis van history_len samples vs. benodigde 2 samples
-              const pct = Math.min(100, Math.round((guard.history_len / 2) * 100));
-              fillEl.style.width = `${pct}%`;
+            if (isWaiting) {
+              if (guard.history_len > 0) {
+                const pct = Math.min(100, Math.round((guard.history_len / 2) * 100));
+                fillEl.style.width = `${pct}%`;
+              }
+              if (labelEl && guard.pending_amps != null) {
+                const from = guard.last_sent_amps != null ? `${guard.last_sent_amps} A` : "uit";
+                labelEl.textContent = `⏳ Wachten op stabiel overschot — beslissing: ${from} → ${guard.pending_amps} A`;
+              }
             }
           }
         }
@@ -523,7 +528,7 @@ class PeakGuardPanel extends HTMLElement {
           ${device.action_type === "ev_charger"
             ? `<div id="ev-live-${type}-${index}" class="ev-live-status"></div>
                <div id="ev-debounce-${type}-${index}" class="ev-debounce-bar-wrap" style="display:none;">
-                 <div class="ev-debounce-label">⏳ Wachten op stabiel overschot…</div>
+                 <div id="ev-debounce-label-${type}-${index}" class="ev-debounce-label">⏳ Wachten op stabiel overschot…</div>
                  <div class="ev-debounce-track"><div id="ev-debounce-fill-${type}-${index}" class="ev-debounce-fill" style="width:0%"></div></div>
                </div>`
             : ""}

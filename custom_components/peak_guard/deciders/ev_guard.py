@@ -725,6 +725,7 @@ class EVGuard:
 
         available_a_raw = excess / voltage
         new_a = max(int(hw_min_a), min(int(max_a), math.ceil(available_a_raw)))
+        guard.pending_amps = new_a
 
         _LOGGER.debug(
             "Peak Guard [SOLAR]: '%s' evalueren — "

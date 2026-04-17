@@ -590,8 +590,10 @@ class PeakGuardController:
                 "interval_s":    max(float(self.config.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL)), 60.0),
                 "ev_guards": {
                     device_id: {
-                        "state": guard.state.value,
-                        "history_len": len(guard.surplus_history),
+                        "state":          guard.state.value,
+                        "history_len":    len(guard.surplus_history),
+                        "pending_amps":   guard.pending_amps,
+                        "last_sent_amps": int(guard.last_sent_amps) if guard.last_sent_amps is not None else None,
                     }
                     for device_id, guard in self._ev_guard_decider.guards.items()
                 },
