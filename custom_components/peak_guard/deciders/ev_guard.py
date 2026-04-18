@@ -28,7 +28,6 @@ from ..const import (
     DEFAULT_EV_CABLE_ENTITY,
     DEFAULT_EV_MAX_AMPERE,
     DEFAULT_EV_MIN_AMPERE,
-    DEFAULT_EV_SOLAR_STOP_THRESHOLD_W,
 )
 from ..models import (
     CascadeDevice,
@@ -47,6 +46,7 @@ from ..models import (
     EV_RATE_LIMIT_WINDOW_S,
     EV_VOLTS_1PHASE,
     EV_VOLTS_3PHASE,
+    EV_WAKE_TIMEOUT_S,
 )
 
 if TYPE_CHECKING:
@@ -766,70 +766,18 @@ class EVGuard:
             guard.state = EVState.IDLE
             guard.surplus_history.clear()
 
-        # GATE: start-drempel / stop-hysteresis
+        # GATE: start-drempel
+        # EV aan: doorladen zolang er injectie is; stoppen enkel via check_restore (consumption ≥ 0).
+        # EV uit: alleen starten als excess ≥ start_threshold_w.
         if excess < start_threshold_w:
             if sw_on:
-                ev_current_w = (current_a if current_a is not None else hw_min_a) * voltage
-                surplus_after_stop = excess - ev_current_w
-                if surplus_after_stop > DEFAULT_EV_SOLAR_STOP_THRESHOLD_W:
-                    # Nog genoeg surplus na stop → doorladen, history bijhouden
-                    self.surplus_is_stable(guard, excess, now)
-                    _LOGGER.debug(
-                        "Peak Guard [SOLAR]: '%s' draait — surplus %.0f W < start-drempel %.0f W "
-                        "maar surplus na stop zou %.0f W zijn (> stop-drempel %.0f W) → doorladen",
-                        device.name, excess, start_threshold_w,
-                        surplus_after_stop, DEFAULT_EV_SOLAR_STOP_THRESHOLD_W,
-                    )
-                    # Val door naar stroom-aanpassing hieronder
-                else:
-                    # Surplus echt weg → stoppen
-                    _LOGGER.info(
-                        "Peak Guard [SOLAR]: '%s' GESTOPT — surplus %.0f W < start-drempel %.0f W "
-                        "én surplus na stop zou %.0f W zijn (≤ stop-drempel %.0f W)",
-                        device.name, excess, start_threshold_w,
-                        surplus_after_stop, DEFAULT_EV_SOLAR_STOP_THRESHOLD_W,
-                    )
-                    # GATE: minimum ON duration
-                    if guard.turned_on_at is not None:
-                        on_secs = (now - guard.turned_on_at).total_seconds()
-                        if on_secs < EV_MIN_ON_DURATION_S:
-                            _LOGGER.info(
-                                "Peak Guard [SOLAR]: '%s' uitschakelen OVERGESLAGEN — "
-                                "te kort geleden ingeschakeld (%.0f s geleden, minimum %.0f s)",
-                                device.name, on_secs, EV_MIN_ON_DURATION_S,
-                            )
-                            return excess
-                    if not self._rate_check(device.name, "turn_off wegens geen surplus"):
-                        return excess
-                    try:
-                        await self.hass.services.async_call(
-                            "switch", "turn_off", {"entity_id": sw_entity}, blocking=True
-                        )
-                    except HomeAssistantError as ha_err:
-                        _LOGGER.warning(
-                            "Peak Guard [SOLAR]: '%s' niet bereikbaar voor turn_off — "
-                            "volgende cyclus opnieuw proberen (%s)",
-                            device.name, ha_err,
-                        )
-                        return excess
-                    self._record_call()
-                    self._track_action(sw_entity, "switch.turn_off")
-                    guard.state = EVState.IDLE
-                    guard.last_switch_state = False
-                    guard.turned_off_at = now
-                    guard.turned_off_by_pg = True
-                    guard.surplus_history.clear()
-                    event = solar_tracker.complete_solar_calculation(
-                        device_id=device.id, now=now,
-                    )
-                    if event:
-                        _LOGGER.info(
-                            "Peak Guard: solar-event afgerond voor '%s' — "
-                            "duur=%.1f min, verschoven=%.4f kWh, besparing=€%.4f",
-                            device.name, event.measured_duration_min,
-                            event.shifted_kwh, event.savings_euro,
-                        )
-                    return excess
+                self.surplus_is_stable(guard, excess, now)
+                _LOGGER.debug(
+                    "Peak Guard [SOLAR]: '%s' draait — surplus %.0f W < start-drempel %.0f W "
+                    "→ doorladen (stop enkel als geen injectie meer)",
+                    device.name, excess, start_threshold_w,
+                )
+                # Val door naar stroom-aanpassing hieronder
             else:
                 # EV uit, surplus < drempel → geen actie
                 self.last_skip_reason = (
@@ -927,6 +875,7 @@ class EVGuard:
                 "(%.0f W stabiel gedurende ≥ %.0f s)",
                 device.name, excess, EV_DEBOUNCE_STABLE_S,
             )
+            guard.state = EVState.IDLE
 
         if not sw_on:
             # EV staat uit → aanzetten op hardware-minimum laadstroom
