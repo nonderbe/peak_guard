@@ -281,16 +281,20 @@ class EVGuard:
         """
         guard.surplus_history.append((now, current_surplus_w))
 
-        cutoff = now - timedelta(seconds=EV_DEBOUNCE_STABLE_S)
-        window = [(ts, w) for ts, w in guard.surplus_history if ts >= cutoff]
-
-        if len(window) < 3:
+        if len(guard.surplus_history) < 2:
             return False, 0.0
 
-        if (now - window[0][0]).total_seconds() < EV_DEBOUNCE_STABLE_S:
+        oldest_ts = guard.surplus_history[0][0]
+        span_s = (now - oldest_ts).total_seconds()
+
+        # Gebruik de totale tijdsspanne van de history, niet een vast venster.
+        # Een vast venster (bijv. 20s) is korter dan een loop-interval van 60s,
+        # waardoor er nooit meer dan 1 sample in het venster valt en de check
+        # nooit slaagt. Met de span-check werkt het bij elk loop-interval.
+        if span_s < EV_DEBOUNCE_STABLE_S:
             return False, 0.0
 
-        values = [w for _, w in window]
+        values = [w for _, w in guard.surplus_history]
         if min(values) <= 0:
             return False, 0.0
 
@@ -781,6 +785,7 @@ class EVGuard:
                         device, override=False, original_soc=snap.original_soc
                     )
             else:
+                self.last_skip_reason = f"laadkabel niet aangesloten ({cable_entity})"
                 _LOGGER.debug(
                     "Peak Guard [SOLAR]: '%s' — kabel nog steeds niet aangesloten, wachten",
                     device.name,
