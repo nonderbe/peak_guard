@@ -136,7 +136,11 @@ class PeakAvoidTracker:
                     actual_monthly_peak: float) -> None:
         self._actual_quarters     = actual_quarters
         self._actual_monthly_peak = actual_monthly_peak
-        # Herbereken maandbesparing: een hogere werkelijke piek verkleint de besparing
+        # Herbereken hypothetische piek met de nieuwste kwartierdata, daarna besparing.
+        # Zonder deze recalc-stap was de hypothetische piek verouderd: complete_peak_calculation
+        # vuurde terwijl het kwartier nog niet afgesloten was (_actual_quarters leeg),
+        # waardoor hypo = enkel extra_dict (zonder basisbelasting) → te laag → besparing = 0.
+        self._recalc_hypo()
         self._recalc_month_savings()
         _LOGGER.debug(
             "PeakAvoidTracker.set_context: %d kwartieren, maandpiek=%.3f kW, "
