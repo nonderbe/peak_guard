@@ -34,13 +34,14 @@ EV_HYSTERESIS_AMPS: float = 1.0
 # Minimale seconden tussen opeenvolgende stroom-aanpassingen voor één EV-apparaat.
 EV_MIN_UPDATE_INTERVAL_S: float = 90.0
 
-# Zonne-overschot moet stabiel zijn (binnen EV_DEBOUNCE_TOLERANCE_W watt spread)
-# gedurende minstens deze tijd voordat we actie ondernemen.
+# Tijdvenster (seconden) waarbinnen de surplus-geschiedenis wordt opgebouwd.
+# De EV start pas nadat dit venster volledig gevuld is met positieve waarden.
 EV_DEBOUNCE_STABLE_S: float = 20.0
-EV_DEBOUNCE_TOLERANCE_W: float = 150.0   # ±150 W telt als "stabiel"
 
-# Als het overschot deze drempel overschrijdt, wordt de debounce volledig overgeslagen.
-EV_DEBOUNCE_BYPASS_SURPLUS_W: float = 1500.0
+# Percentiel van de surplus-geschiedenis dat als "veilige ondergrens" (floor) wordt gebruikt.
+# 10 % betekent: de laadstroom wordt bepaald op de waarde die 90 % van de tijd gehaald wordt.
+# Lager = conservatiever (minder oscillatierisico), hoger = agressiever.
+EV_FLOOR_PERCENTILE: int = 10
 
 # Na het AAN-zetten van de lader weigeren we hem gedurende deze tijd UIT te zetten.
 EV_MIN_ON_DURATION_S: float = 360.0     # 6 minuten

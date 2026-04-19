@@ -35,9 +35,8 @@ from ..models import (
     EVDeviceGuard,
     EVRateLimiter,
     EVState,
-    EV_DEBOUNCE_BYPASS_SURPLUS_W,
     EV_DEBOUNCE_STABLE_S,
-    EV_DEBOUNCE_TOLERANCE_W,
+    EV_FLOOR_PERCENTILE,
     EV_HYSTERESIS_AMPS,
     EV_MIN_OFF_DURATION_S,
     EV_MIN_UPDATE_INTERVAL_S,
@@ -250,43 +249,54 @@ class EVGuard:
         return s in ("home", "on", "true", "1")
 
     # ------------------------------------------------------------------ #
-    #  Debounce helper                                                     #
+    #  Dynamische ondergrens-detectie                                      #
     # ------------------------------------------------------------------ #
 
-    def surplus_is_stable(
+    def _surplus_floor(
         self,
         guard: EVDeviceGuard,
         current_surplus_w: float,
         now: datetime,
-    ) -> bool:
+    ) -> tuple[bool, float]:
         """
-        Geeft True als het surplus stabiel is geweest (spread ≤ 2× tolerantie)
-        gedurende minstens EV_DEBOUNCE_STABLE_S seconden.
+        Bepaal de veilige ondergrens van het zonne-overschot uit de recente geschiedenis.
 
-        Vergelijkt samples onderling (spread = max − min), niet allemaal met
-        de huidige waarde. Zo wordt een geleidelijk dalend surplus als stabiel
-        beschouwd zolang de spread binnen de tolerantie blijft.
+        Werkt volledig drempelvrij: geen vaste watt-waarden. Enkel een tijdvenster
+        (EV_DEBOUNCE_STABLE_S) en een percentiel (EV_FLOOR_PERCENTILE).
 
-        Side-effect: voegt (now, current_surplus_w) toe aan guard.surplus_history.
+        Algoritme:
+          1. Voeg het huidige sample toe aan de ringbuffer.
+          2. Selecteer alle samples binnen het tijdvenster.
+          3. Het venster is "gevuld" als het oudste sample minstens
+             EV_DEBOUNCE_STABLE_S seconden oud is.
+          4. floor_w = EV_FLOOR_PERCENTILE-percentiel van de vensterwaarden.
+             Bij 10 % en 20 samples = de 2e laagste waarde — robuust tegen
+             één incidentele dip, maar conservatief genoeg om oscillatie
+             te vermijden bij breed fluctuerend overschot.
+
+        Returns:
+            (ready, floor_w)
+            ready   — True als het venster volledig gevuld is met positieve waarden.
+            floor_w — veilige startwaarde in watt (0.0 als not ready).
         """
         guard.surplus_history.append((now, current_surplus_w))
 
-        cutoff2x = now - timedelta(seconds=EV_DEBOUNCE_STABLE_S * 2)
-        relevant = [(ts, w) for ts, w in guard.surplus_history if ts >= cutoff2x]
+        cutoff = now - timedelta(seconds=EV_DEBOUNCE_STABLE_S)
+        window = [(ts, w) for ts, w in guard.surplus_history if ts >= cutoff]
 
-        if len(relevant) < 2:
-            return False
+        if len(window) < 3:
+            return False, 0.0
 
-        oldest_ts = relevant[0][0]
-        if (now - oldest_ts).total_seconds() < EV_DEBOUNCE_STABLE_S:
-            return False
+        if (now - window[0][0]).total_seconds() < EV_DEBOUNCE_STABLE_S:
+            return False, 0.0
 
-        values = [w for _, w in relevant]
+        values = [w for _, w in window]
         if min(values) <= 0:
-            return False
+            return False, 0.0
 
-        spread = max(values) - min(values)
-        return spread <= EV_DEBOUNCE_TOLERANCE_W * 2
+        sorted_vals = sorted(values)
+        idx = max(0, min(int(len(sorted_vals) * EV_FLOOR_PERCENTILE / 100), len(sorted_vals) - 1))
+        return True, sorted_vals[idx]
 
     # ------------------------------------------------------------------ #
     #  SOC-limiet override                                                 #
@@ -771,7 +781,8 @@ class EVGuard:
         # EV uit: alleen starten als excess ≥ start_threshold_w.
         if excess < start_threshold_w:
             if sw_on:
-                self.surplus_is_stable(guard, excess, now)
+                # EV draait — doorladen zolang er injectie is.
+                # Geen ondergrens-check nodig; stroomaanpassing hieronder.
                 _LOGGER.debug(
                     "Peak Guard [SOLAR]: '%s' draait — surplus %.0f W < start-drempel %.0f W "
                     "→ doorladen (stop enkel als geen injectie meer)",
@@ -826,56 +837,56 @@ class EVGuard:
             guard.turned_off_by_pg = False
             guard.surplus_history.clear()
 
-        # GATE: debounce (bypass bij heel groot surplus)
-        large_surplus = excess >= EV_DEBOUNCE_BYPASS_SURPLUS_W
-        if large_surplus:
-            guard.surplus_history.append((now, excess))
+        # ── Dynamische ondergrens-detectie ───────────────────────────
+        # Alleen nodig als de EV nog niet aan het laden is.
+        # Bouwt de surplus-geschiedenis op en berekent het EV_FLOOR_PERCENTILE-
+        # percentiel als "veilige startwaarde". Geen vaste watt-drempel.
+        if not sw_on:
+            surplus_ready, floor_w = self._surplus_floor(guard, excess, now)
+
+            if not surplus_ready:
+                history_secs = 0.0
+                if guard.surplus_history:
+                    history_secs = (now - guard.surplus_history[0][0]).total_seconds()
+                if guard.state != EVState.WAITING_FOR_STABLE:
+                    guard.state = EVState.WAITING_FOR_STABLE
+                    self.last_skip_reason = (
+                        f"opbouwen geschiedenis "
+                        f"({history_secs:.0f}/{EV_DEBOUNCE_STABLE_S:.0f}s)"
+                    )
+                    _LOGGER.warning(
+                        "Peak Guard [SOLAR]: '%s' NIET geactiveerd — "
+                        "surplus-geschiedenis aan het opbouwen "
+                        "(%.0f/%.0f s, huidig=%.0f W, percentiel=%d%%)",
+                        device.name, history_secs, EV_DEBOUNCE_STABLE_S,
+                        excess, EV_FLOOR_PERCENTILE,
+                    )
+                else:
+                    self.last_skip_reason = (
+                        f"opbouwen geschiedenis "
+                        f"({history_secs:.0f}/{EV_DEBOUNCE_STABLE_S:.0f}s)"
+                    )
+                    _LOGGER.info(
+                        "Peak Guard [SOLAR]: '%s' geschiedenis opbouwen "
+                        "(%.0f/%.0f s, huidig=%.0f W)",
+                        device.name, history_secs, EV_DEBOUNCE_STABLE_S, excess,
+                    )
+                return excess
+
             if guard.state == EVState.WAITING_FOR_STABLE:
                 _LOGGER.info(
-                    "Peak Guard [SOLAR]: '%s' — debounce overgeslagen "
-                    "(overschot %.0f W ≥ bypass-drempel %.0f W)",
-                    device.name, excess, EV_DEBOUNCE_BYPASS_SURPLUS_W,
+                    "Peak Guard [SOLAR]: '%s' ondergrens vastgesteld op %.0f W "
+                    "(%d-percentiel over %.0f s) — EV starten",
+                    device.name, floor_w, EV_FLOOR_PERCENTILE, EV_DEBOUNCE_STABLE_S,
                 )
-            surplus_stable = True
-        else:
-            surplus_stable = self.surplus_is_stable(guard, excess, now)
+                guard.state = EVState.IDLE
 
-        if not surplus_stable:
-            history_secs = 0.0
-            if guard.surplus_history:
-                history_secs = (now - guard.surplus_history[0][0]).total_seconds()
-            if guard.state != EVState.WAITING_FOR_STABLE:
-                guard.state = EVState.WAITING_FOR_STABLE
-                self.last_skip_reason = (
-                    f"debounce: surplus {excess:.0f} W nog niet "
-                    f"{EV_DEBOUNCE_STABLE_S:.0f}s stabiel"
-                )
-                _LOGGER.warning(
-                    "Peak Guard [SOLAR]: '%s' NIET geactiveerd — wacht op stabiel overschot "
-                    "(huidig=%.0f W, debounce=%.0f s vereist, tot nu toe=%.0f s, "
-                    "tolerantie=±%.0f W)",
-                    device.name, excess, EV_DEBOUNCE_STABLE_S, history_secs,
-                    EV_DEBOUNCE_TOLERANCE_W,
-                )
-            else:
-                self.last_skip_reason = (
-                    f"debounce: wachten op stabiliteit "
-                    f"({history_secs:.0f}/{EV_DEBOUNCE_STABLE_S:.0f}s)"
-                )
-                _LOGGER.info(
-                    "Peak Guard [SOLAR]: '%s' nog wachtend op stabiel overschot "
-                    "(huidig=%.0f W, %.0f/%.0f s verstreken)",
-                    device.name, excess, history_secs, EV_DEBOUNCE_STABLE_S,
-                )
-            return excess
-
-        if guard.state == EVState.WAITING_FOR_STABLE:
-            _LOGGER.info(
-                "Peak Guard [SOLAR]: '%s' overschot stabiel — actie toegestaan "
-                "(%.0f W stabiel gedurende ≥ %.0f s)",
-                device.name, excess, EV_DEBOUNCE_STABLE_S,
-            )
-            guard.state = EVState.IDLE
+            # Overschrijf new_a: gebruik de veilige ondergrens als startlaadstroom.
+            # floor() garandeert dat het setpoint nooit boven de ondergrens uitkomt,
+            # ook niet als het surplus precies op de grens schommelt.
+            floor_a = max(int(hw_min_a), min(int(max_a), math.floor(floor_w / voltage)))
+            guard.pending_amps = floor_a
+            new_a = floor_a
 
         if not sw_on:
             # EV staat uit → aanzetten op hardware-minimum laadstroom
