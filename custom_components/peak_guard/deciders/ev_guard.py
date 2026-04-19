@@ -759,10 +759,40 @@ class EVGuard:
             guard.state.value,
         )
 
-        # GATE: kabeldetectie — blokkeert alleen starten, niet stoppen
+        # GATE: kabeldetectie — blokkeert starten én zet EV uit als kabel mid-charge ontkoppeld
         cable_entity = device.ev_cable_entity or DEFAULT_EV_CABLE_ENTITY
-        if not sw_on and not self.cable_connected(device):
-            if guard.state != EVState.CABLE_DISCONNECTED:
+        if not self.cable_connected(device):
+            if sw_on:
+                # Kabel ontkoppeld terwijl EV aan het laden was: zet schakelaar uit en
+                # meld het overschot als onverwerkt. Zonder deze check berekent de code
+                # een fictief verbruik (new_a × voltage) en denkt de cascade ten onrechte
+                # dat het overschot volledig verwerkt is.
+                _LOGGER.warning(
+                    "Peak Guard [SOLAR]: '%s' — laadkabel ontkoppeld TIJDENS het laden "
+                    "('%s' = '%s') — schakelaar uitzetten",
+                    device.name, cable_entity,
+                    (self.hass.states.get(cable_entity) or type("", (), {"state": "??"})()).state,
+                )
+                if self._rate_check(device.name, "turn_off kabel ontkoppeld"):
+                    try:
+                        await self.hass.services.async_call(
+                            "switch", "turn_off", {"entity_id": sw_entity}, blocking=True
+                        )
+                        self._record_call()
+                        self._track_action(sw_entity, "switch.turn_off")
+                    except HomeAssistantError as err:
+                        _LOGGER.warning(
+                            "Peak Guard [SOLAR]: '%s' — turn_off na kabelontkoppeling mislukt: %s",
+                            device.name, err,
+                        )
+                snap = snapshots.get(snap_key)
+                if snap is not None and snap.original_soc is not None:
+                    await self._set_soc_override(device, override=False, original_soc=snap.original_soc)
+                guard.state = EVState.CABLE_DISCONNECTED
+                guard.last_switch_state = False
+                guard.surplus_history.clear()
+                self.last_skip_reason = f"laadkabel ontkoppeld tijdens laden ({cable_entity})"
+            elif guard.state != EVState.CABLE_DISCONNECTED:
                 guard.state = EVState.CABLE_DISCONNECTED
                 self.last_skip_reason = f"laadkabel niet aangesloten ({cable_entity})"
                 _LOGGER.warning(
