@@ -295,12 +295,12 @@ class EVGuard:
             return False, 0.0
 
         values = [w for _, w in guard.surplus_history]
-        if min(values) <= 0:
-            return False, 0.0
-
         sorted_vals = sorted(values)
         idx = max(0, min(int(len(sorted_vals) * EV_FLOOR_PERCENTILE / 100), len(sorted_vals) - 1))
-        return True, sorted_vals[idx]
+        floor_w = sorted_vals[idx]
+        if floor_w <= 0:
+            return False, 0.0
+        return True, floor_w
 
     # ------------------------------------------------------------------ #
     #  SOC-limiet override                                                 #
