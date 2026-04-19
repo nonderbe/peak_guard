@@ -2136,6 +2136,18 @@ class PeakGuardPanel extends HTMLElement {
           font-size: .9em; text-align: center; gap: 6px;
         }
         .chart-no-data-sub { font-size: .8em; opacity: .7; }
+        .chart-tooltip {
+          position: absolute;
+          background: rgba(33,33,33,0.88);
+          color: #fff;
+          padding: 5px 10px;
+          border-radius: 6px;
+          font-size: 12px;
+          pointer-events: none;
+          white-space: nowrap;
+          z-index: 10;
+          box-shadow: 0 2px 8px rgba(0,0,0,.3);
+        }
 
         /* Events table */
         .events-table-wrap {
@@ -2405,6 +2417,7 @@ class PeakGuardPanel extends HTMLElement {
               Grafieken vullen automatisch op naarmate de integratie draait.
             </span>
           </div>
+          <div id="chart-tooltip" class="chart-tooltip" style="display:none;"></div>
         </div>
 
         <!-- ======================================================= -->
@@ -2482,7 +2495,7 @@ class PeakGuardPanel extends HTMLElement {
 
     ctx.clearRect(0, 0, W, H);
 
-    const PAD = { top: 20, right: 16, bottom: 48, left: 52 };
+    const PAD = { top: 24, right: 58, bottom: 48, left: 52 };
     const chartW = W - PAD.left - PAD.right;
     const chartH = H - PAD.top - PAD.bottom;
 
@@ -2496,8 +2509,9 @@ class PeakGuardPanel extends HTMLElement {
     const groupW = chartW / N;
     const BAR_W  = Math.max(4, Math.min(22, groupW * 0.35));
     const GAP    = 4;
+    const chartBottom = PAD.top + chartH;
 
-    // ---- Raster ------------------------------------------------
+    // ---- Raster + beide y-assen --------------------------------
     ctx.strokeStyle = gridColor;
     ctx.lineWidth   = 1;
     const gridLines = 4;
@@ -2508,32 +2522,30 @@ class PeakGuardPanel extends HTMLElement {
       ctx.lineTo(W - PAD.right, y);
       ctx.stroke();
 
-      // Linker y-as labels (kW of kWh)
+      // Linker y-as (kW/kWh)
       const valLbl = ((1 - i / gridLines) * maxA).toFixed(1);
       ctx.fillStyle = textColor;
-      ctx.font = `11px sans-serif`;
+      ctx.font = "11px sans-serif";
       ctx.textAlign = "right";
       ctx.fillText(valLbl, PAD.left - 6, y + 4);
+
+      // Rechter y-as (EUR)
+      const eurVal = (1 - i / gridLines) * maxB;
+      const eurLbl = eurVal < 10 ? `€${eurVal.toFixed(2)}` : `€${eurVal.toFixed(1)}`;
+      ctx.fillStyle = accentB;
+      ctx.textAlign = "left";
+      ctx.fillText(eurLbl, W - PAD.right + 4, y + 4);
     }
 
-    // Rechter y-as label (EUR)
-    ctx.save();
-    ctx.translate(W - 8, PAD.top + chartH / 2);
-    ctx.rotate(-Math.PI / 2);
-    ctx.textAlign = "center";
-    ctx.fillStyle = accentB;
-    ctx.font = "11px sans-serif";
-    ctx.fillText("€ besparing", 0, 0);
-    ctx.restore();
-
-    // ---- Balken ------------------------------------------------
+    // ---- Balken + waarde-labels --------------------------------
+    const barData = [];
     labels.forEach((lbl, i) => {
       const cx = PAD.left + (i + 0.5) * groupW;
 
       // Balk A: hoofdwaarde (kW / kWh)
       const hA = (valuesA[i] / maxA) * chartH;
       const xA = cx - BAR_W - GAP / 2;
-      const yA = PAD.top + chartH - hA;
+      const yA = chartBottom - hA;
       ctx.fillStyle = accentA;
       ctx.beginPath();
       ctx.roundRect
@@ -2541,10 +2553,18 @@ class PeakGuardPanel extends HTMLElement {
         : ctx.rect(xA, yA, BAR_W, hA);
       ctx.fill();
 
+      // Waarde-label boven balk A
+      if (hA > 0) {
+        ctx.fillStyle = textColor;
+        ctx.font = "bold 10px sans-serif";
+        ctx.textAlign = "center";
+        ctx.fillText(valuesA[i].toFixed(1), xA + BAR_W / 2, Math.max(yA - 3, PAD.top + 9));
+      }
+
       // Balk B: EUR
       const hB = (valuesB[i] / maxB) * chartH;
       const xB = cx + GAP / 2;
-      const yB = PAD.top + chartH - hB;
+      const yB = chartBottom - hB;
       ctx.fillStyle = accentB;
       ctx.beginPath();
       ctx.roundRect
@@ -2552,11 +2572,22 @@ class PeakGuardPanel extends HTMLElement {
         : ctx.rect(xB, yB, BAR_W, hB);
       ctx.fill();
 
+      // Waarde-label boven balk B
+      if (hB > 0) {
+        ctx.fillStyle = accentB;
+        ctx.font = "bold 10px sans-serif";
+        ctx.textAlign = "center";
+        const eurStr = valuesB[i] < 10 ? `€${valuesB[i].toFixed(2)}` : `€${valuesB[i].toFixed(1)}`;
+        ctx.fillText(eurStr, xB + BAR_W / 2, Math.max(yB - 3, PAD.top + 9));
+      }
+
       // X-as label
       ctx.fillStyle = textColor;
       ctx.font = "11px sans-serif";
       ctx.textAlign = "center";
       ctx.fillText(lbl, cx, H - PAD.bottom + 16);
+
+      barData.push({ label: lbl, valueA: valuesA[i], valueB: valuesB[i], xA, xB, BAR_W, yA, yB, hA, hB, chartBottom });
     });
 
     // ---- Legenda -----------------------------------------------
@@ -2573,6 +2604,53 @@ class PeakGuardPanel extends HTMLElement {
     ctx.fillRect(PAD.left + 130, legY - 8, 10, 10);
     ctx.fillStyle = textColor;
     ctx.fillText("€ bespaard", PAD.left + 144, legY);
+
+    this._setupChartTooltip(canvas, barData, isPeak);
+  }
+
+  _setupChartTooltip(canvas, barData, isPeak) {
+    const tooltip = this.shadowRoot.querySelector("#chart-tooltip");
+    if (!tooltip) return;
+
+    if (this._chartMouseMove)  canvas.removeEventListener("mousemove",  this._chartMouseMove);
+    if (this._chartMouseLeave) canvas.removeEventListener("mouseleave", this._chartMouseLeave);
+
+    const unitAShort = isPeak ? "kW" : "kWh";
+
+    this._chartMouseMove = (e) => {
+      const rect = canvas.getBoundingClientRect();
+      const scaleX = canvas.width  / rect.width;
+      const scaleY = canvas.height / rect.height;
+      const mx = (e.clientX - rect.left) * scaleX;
+      const my = (e.clientY - rect.top)  * scaleY;
+
+      let hit = null;
+      for (const bar of barData) {
+        if (mx >= bar.xA && mx <= bar.xA + bar.BAR_W && my >= bar.yA && my <= bar.chartBottom) {
+          hit = bar; break;
+        }
+        if (mx >= bar.xB && mx <= bar.xB + bar.BAR_W && my >= bar.yB && my <= bar.chartBottom) {
+          hit = bar; break;
+        }
+      }
+
+      if (hit) {
+        const px = e.clientX - rect.left;
+        const py = e.clientY - rect.top;
+        tooltip.style.left    = `${Math.min(px + 12, rect.width - 160)}px`;
+        tooltip.style.top     = `${Math.max(py - 44, 4)}px`;
+        tooltip.style.display = "block";
+        const eurStr = hit.valueB < 10 ? hit.valueB.toFixed(2) : hit.valueB.toFixed(1);
+        tooltip.innerHTML = `<strong>${hit.label}</strong><br>${hit.valueA.toFixed(2)}\u202f${unitAShort}&ensp;·&ensp;€\u202f${eurStr}`;
+      } else {
+        tooltip.style.display = "none";
+      }
+    };
+
+    this._chartMouseLeave = () => { tooltip.style.display = "none"; };
+
+    canvas.addEventListener("mousemove",  this._chartMouseMove);
+    canvas.addEventListener("mouseleave", this._chartMouseLeave);
   }
 
   /**
