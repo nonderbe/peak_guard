@@ -481,7 +481,12 @@ class EVGuard:
                     guard.turned_off_by_pg = True
                     guard.surplus_history.clear()
                 else:
-                    # Schakelaar staat al uit — snapshot opruimen zonder service-call.
+                    # Schakelaar staat al uit (bijv. kabel eerder ontkoppeld).
+                    # Herstel de SOC-limiet voor het geval dat nog niet gebeurde
+                    # in de kabeldetectie-gate (bijv. geen ev_cable_entity geconfigureerd).
+                    await self._set_soc_override(
+                        device, override=False, original_soc=snapshot.original_soc
+                    )
                     _LOGGER.debug(
                         "Peak Guard EV solar: '%s' schakelaar al uit bij herstel — "
                         "snapshot opgeruimd zonder service-call",
@@ -762,6 +767,19 @@ class EVGuard:
                     device.name, cable_entity,
                     (self.hass.states.get(cable_entity) or type("", (), {"state": "??"})()).state,
                 )
+                # Als PG de laadlimiet had verhoogd (SOC-override actief), herstel die nu.
+                # De normale restore()-flow triggert pas als de injectie stopt, wat niet
+                # gebeurt als de kabel wordt ontkoppeld terwijl de zon nog schijnt.
+                snap = snapshots.get(snap_key)
+                if snap is not None and snap.original_state == "off" and snap.original_soc is not None:
+                    _LOGGER.info(
+                        "Peak Guard [SOLAR]: '%s' — kabel ontkoppeld, SOC-override herstellen "
+                        "naar %.0f%%",
+                        device.name, snap.original_soc,
+                    )
+                    await self._set_soc_override(
+                        device, override=False, original_soc=snap.original_soc
+                    )
             else:
                 _LOGGER.debug(
                     "Peak Guard [SOLAR]: '%s' — kabel nog steeds niet aangesloten, wachten",
