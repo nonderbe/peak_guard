@@ -40,7 +40,6 @@ from ..models import (
     EV_DEBOUNCE_TOLERANCE_W,
     EV_HYSTERESIS_AMPS,
     EV_MIN_OFF_DURATION_S,
-    EV_MIN_ON_DURATION_S,
     EV_MIN_UPDATE_INTERVAL_S,
     EV_RATE_LIMIT_MAX_CALLS,
     EV_RATE_LIMIT_WINDOW_S,
@@ -206,8 +205,10 @@ class EVGuard:
             # wake-button is, triggeren we de wake-up; anders blokkeren we niet.
             return not bool(device.ev_wake_button)
 
+        # "complete" = lading gestopt omdat limiet bereikt; auto is wakker en verbonden.
+        # Slapen → "unavailable"/"unknown" (Tesla integration gaat offline bij slaap).
         CONNECTED = {"on", "true", "connected", "online", "home",
-                     "charging", "fully_charged", "pending", "1"}
+                     "charging", "complete", "fully_charged", "pending", "1"}
         if s in CONNECTED:
             return True
 
@@ -299,9 +300,8 @@ class EVGuard:
     ) -> None:
         """Stel de SOC-limiet in (override=True) of herstel hem (override=False)."""
         if device.ev_max_soc is None:
-            _LOGGER.warning(
-                "Peak Guard EV: '%s' SOC-limiet NIET aangepast — "
-                "ev_max_soc niet geconfigureerd",
+            _LOGGER.debug(
+                "Peak Guard EV: '%s' SOC-limiet overgeslagen — ev_max_soc niet geconfigureerd",
                 device.name,
             )
             return

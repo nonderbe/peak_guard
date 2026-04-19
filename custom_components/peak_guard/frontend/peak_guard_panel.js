@@ -748,6 +748,11 @@ class PeakGuardPanel extends HTMLElement {
     }
 
     if (device.action_type === "ev_charger") {
+      // Guard-state heeft voorrang: PG kan al laden terwijl de HA-schakelaar nog "off" rapporteert
+      // (bijv. Tesla integration lag na SOC-override + turn_on).
+      const guardCharging = this._data?.status?.ev_guards?.[device.id]?.state === "charging";
+      if (guardCharging) return { text: "laden", cls: "status-on" };
+
       if (state.state === "off") {
         const cableEntity = device.ev_cable_entity || "sensor.tesla_opladen";
         const cableState  = this._hass?.states[cableEntity];
@@ -782,7 +787,8 @@ class PeakGuardPanel extends HTMLElement {
 
     const swEntity = device.ev_switch_entity || device.entity_id;
     const swState  = this._hass.states[swEntity];
-    if (!swState || swState.state === "off") return "";
+    const guardCharging = this._data?.status?.ev_guards?.[device.id]?.state === "charging";
+    if (!swState || (swState.state === "off" && !guardCharging)) return "";
 
     const parts = [];
 
