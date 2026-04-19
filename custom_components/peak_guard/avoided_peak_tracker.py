@@ -124,6 +124,9 @@ class PeakAvoidTracker:
 
         # Hypothetische maandpiek
         self.hypothetical_monthly_peak_kw: Optional[float] = None
+        # Lijst van alle berekende hypothetische pieken deze maand (één per event).
+        # Wordt gepersisteerd zodat de hoogste waarde na een herstart beschikbaar blijft.
+        self.hypothetical_peaks_this_month: List[float] = []
 
         # Context (bijgewerkt door SharedCapacityState)
         self._actual_quarters:     Dict[datetime, float] = {}
@@ -178,6 +181,7 @@ class PeakAvoidTracker:
         self.avoided_kw_this_month  = 0.0
         self.savings_euro_this_month = 0.0
         self.hypothetical_monthly_peak_kw = None
+        self.hypothetical_peaks_this_month.clear()
         _LOGGER.info("PeakAvoidTracker: maanddata gereset")
 
     def reset_year(self) -> None:
@@ -246,6 +250,8 @@ class PeakAvoidTracker:
             self.extra_dict[q] = self.extra_dict.get(q, 0.0) + kwh / _QUARTER_H
 
         self._recalc_hypo()
+        if self.hypothetical_monthly_peak_kw is not None:
+            self.hypothetical_peaks_this_month.append(self.hypothetical_monthly_peak_kw)
         # Herbereken maandtotalen holistisch: niet accumuleren maar opnieuw berekenen
         self._recalc_month_savings()
 
@@ -312,12 +318,17 @@ class PeakAvoidTracker:
 
     def _recalc_hypo(self) -> None:
         all_q = set(self._actual_quarters) | set(self.extra_dict)
-        if not all_q:
-            self.hypothetical_monthly_peak_kw = None
-            return
-        vals = [self._actual_quarters.get(q, 0.0) + self.extra_dict.get(q, 0.0)
-                for q in all_q]
-        self.hypothetical_monthly_peak_kw = round(max(vals), 4)
+        if all_q:
+            vals = [self._actual_quarters.get(q, 0.0) + self.extra_dict.get(q, 0.0)
+                    for q in all_q]
+            live = round(max(vals), 4)
+        else:
+            live = 0.0
+        # Neem de hoogste eerder berekende hypo van deze maand mee als vloer.
+        # Na een herstart is extra_dict leeg, maar de lijst overleeft via persistentie.
+        floor = max(self.hypothetical_peaks_this_month) if self.hypothetical_peaks_this_month else 0.0
+        combined = max(live, floor)
+        self.hypothetical_monthly_peak_kw = combined if combined > 0 else None
 
     def _recalc_month_savings(self) -> None:
         """

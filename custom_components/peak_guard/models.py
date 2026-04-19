@@ -36,7 +36,7 @@ EV_MIN_UPDATE_INTERVAL_S: float = 90.0
 
 # Zonne-overschot moet stabiel zijn (binnen EV_DEBOUNCE_TOLERANCE_W watt spread)
 # gedurende minstens deze tijd voordat we actie ondernemen.
-EV_DEBOUNCE_STABLE_S: float = 45.0
+EV_DEBOUNCE_STABLE_S: float = 20.0
 EV_DEBOUNCE_TOLERANCE_W: float = 150.0   # ±150 W telt als "stabiel"
 
 # Als het overschot deze drempel overschrijdt, wordt de debounce volledig overgeslagen.

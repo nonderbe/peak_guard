@@ -132,6 +132,15 @@ async def async_setup_entry(
                 and peak_state.get("month") == current_month):
             peak_tracker.avoided_kw_this_month   = float(peak_state.get("avoided_kw_this_month", 0.0))
             peak_tracker.savings_euro_this_month  = float(peak_state.get("savings_euro_this_month", 0.0))
+            # Herstel lijst van hypothetische pieken — zorgt dat _recalc_hypo() na herstart
+            # de hoogste bekende hypo als vloer gebruikt (in plaats van 0).
+            peak_tracker.hypothetical_peaks_this_month = [
+                float(v) for v in peak_state.get("hypothetical_peaks_this_month", [])
+            ]
+            # Herstel jaarbasis zodat _recalc_month_savings() de jaarbesparing correct herberekent.
+            peak_tracker._savings_euro_year_base = round(
+                max(0.0, peak_tracker.savings_euro_this_year - peak_tracker.savings_euro_this_month), 4
+            )
             # Herstel events
             from .avoided_peak_tracker import PeakEvent
             from dataclasses import fields
@@ -154,8 +163,9 @@ async def async_setup_entry(
                 except (KeyError, ValueError):
                     pass
             _LOGGER.info(
-                "Peak Guard: %d piek-events hersteld vanuit opslag",
+                "Peak Guard: %d piek-events hersteld vanuit opslag (%d hypo-pieken)",
                 len(peak_tracker.events),
+                len(peak_tracker.hypothetical_peaks_this_month),
             )
 
     # Laad persistente events en maandstatistieken — solar
@@ -433,6 +443,7 @@ class SharedCapacityState:
                     "month":                 now.month,
                     "avoided_kw_this_month": self._peak_tracker.avoided_kw_this_month,
                     "savings_euro_this_month": msv,
+                    "hypothetical_peaks_this_month": list(self._peak_tracker.hypothetical_peaks_this_month),
                     "events":                events_data,
                 })
                 self._last_peak_events_count            = n
