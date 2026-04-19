@@ -957,6 +957,10 @@ class EVGuard:
                 if not self._rate_check(device.name, "turn_on voor injectiepreventie"):
                     return excess
 
+                # SOC-override vóór turn_on: Tesla weigert turn_on als huidige SOC
+                # boven de geconfigureerde laadlimiet ligt ("Command was unsuccessful: complete").
+                await self._set_soc_override(device, override=True)
+
                 try:
                     await self.hass.services.async_call(
                         "switch", "turn_on", {"entity_id": sw_entity}, blocking=True
@@ -986,8 +990,6 @@ class EVGuard:
                         self._track_action(cur_entity, "number.set_value", float(new_a))
                         guard.last_sent_amps = float(new_a)
                         guard.last_current_update = now
-
-                await self._set_soc_override(device, override=True)
 
                 actual_consumption_w = new_a * voltage
                 _LOGGER.info(
