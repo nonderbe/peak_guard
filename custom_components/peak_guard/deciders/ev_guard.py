@@ -336,7 +336,23 @@ class EVGuard:
                 device.name, target_soc, soc_entity,
             )
         else:
-            target_soc = float(original_soc) if original_soc is not None else 100.0
+            if original_soc is None:
+                current_st = self.hass.states.get(soc_entity)
+                current_val: Optional[float] = None
+                if current_st is not None:
+                    try:
+                        current_val = float(current_st.state)
+                    except (ValueError, TypeError):
+                        pass
+                _LOGGER.warning(
+                    "Peak Guard EV: '%s' SOC-limiet NIET hersteld — originele waarde was "
+                    "onbekend bij activering (Tesla sliep of rapporteerde 'none'). "
+                    "Huidige laadlimiet: %s%%. Controleer manueel de laadlimiet in de Tesla-app.",
+                    device.name,
+                    f"{current_val:.0f}" if current_val is not None else "onbekend",
+                )
+                return
+            target_soc = float(original_soc)
             _LOGGER.warning(
                 "Peak Guard EV: '%s' SOC-limiet herstellen naar %.0f%% via '%s'",
                 device.name, target_soc, soc_entity,
@@ -1026,21 +1042,36 @@ class EVGuard:
                 if not self._rate_check(device.name, "turn_on voor injectiepreventie"):
                     return excess
 
-                # SOC-override vóór turn_on: Tesla weigert turn_on als huidige SOC
-                # boven de geconfigureerde laadlimiet ligt ("Command was unsuccessful: complete").
-                # Lees de SOC opnieuw: de Tesla was eerder mogelijk slapend (state="unavailable"),
-                # waardoor original_soc=None in de snapshot zit. Nu de Tesla wakker is, kunnen
-                # we de echte oorspronkelijke waarde alsnog opslaan zodat het herstel correct werkt.
-                if device.ev_soc_entity:
+                # SOC-override vóór turn_on: Tesla weigert turn_on als huidige SOC boven de
+                # geconfigureerde laadlimiet ligt ("Command was unsuccessful: complete").
+                # Als de Tesla sliep bij snapshot-aanmaak (original_soc=None), forceer nu een
+                # verse bevraging zodat we de originele waarde kunnen opslaan voor correct herstel.
+                _snap_now = snapshots.get(snap_key)
+                if device.ev_soc_entity and _snap_now is not None and _snap_now.original_soc is None:
+                    try:
+                        await self.hass.services.async_call(
+                            "homeassistant", "update_entity",
+                            {"entity_id": device.ev_soc_entity},
+                            blocking=True,
+                        )
+                    except Exception:
+                        pass
                     _soc_st = self.hass.states.get(device.ev_soc_entity)
                     if _soc_st is not None:
                         try:
-                            _soc_now = float(_soc_st.state)
-                            _snap_now = snapshots.get(snap_key)
-                            if _snap_now is not None and _snap_now.original_soc is None:
-                                _snap_now.original_soc = _soc_now
+                            _snap_now.original_soc = float(_soc_st.state)
+                            _LOGGER.info(
+                                "Peak Guard EV: '%s' originele laadlimiet uitgelezen = %.0f%%"
+                                " (na herbevraging)",
+                                device.name, _snap_now.original_soc,
+                            )
                         except (ValueError, TypeError):
-                            pass
+                            _LOGGER.warning(
+                                "Peak Guard EV: '%s' laadlimiet onleesbaar ('%s') na herbevraging"
+                                " — SOC-override wordt toegepast maar kan bij herstel niet worden"
+                                " hersteld. Controleer manueel de laadlimiet in de Tesla-app.",
+                                device.name, _soc_st.state,
+                            )
                 await self._set_soc_override(device, override=True)
 
                 try:

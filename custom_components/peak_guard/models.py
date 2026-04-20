@@ -32,7 +32,7 @@ EV_VOLTS_3PHASE: float = 400.0
 EV_HYSTERESIS_AMPS: float = 1.0
 
 # Minimale seconden tussen opeenvolgende stroom-aanpassingen voor één EV-apparaat.
-EV_MIN_UPDATE_INTERVAL_S: float = 90.0
+EV_MIN_UPDATE_INTERVAL_S: float = 20.0
 
 # Tijdvenster (seconden) waarbinnen de surplus-geschiedenis wordt opgebouwd.
 # De EV start pas nadat dit venster volledig gevuld is met positieve waarden.
