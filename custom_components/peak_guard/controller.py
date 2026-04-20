@@ -4,7 +4,8 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.storage import Store
 
 from .avoided_peak_tracker import PeakAvoidTracker, SolarShiftTracker
@@ -81,9 +82,14 @@ class PeakGuardController:
         # Tijdstip van de laatste loop-iteratie (UTC ISO-string, voor de GUI).
         self._last_loop_at: Optional[str] = None
 
-        # Force-check flag: als True wordt de volgende loop-iteratie onmiddellijk
-        # uitgevoerd zonder te wachten op het interval.
-        self._force_check: bool = False
+        # Wakeup-event: als gezet wordt de volgende loop-iteratie onmiddellijk
+        # uitgevoerd zonder te wachten op het interval. Vervangt de vroegere
+        # boolean _force_check — Event is race-condition-vrij: een .set() die
+        # binnenkomt terwijl de loop actief is gaat niet verloren.
+        self._wakeup: asyncio.Event = asyncio.Event()
+
+        # Unsubscribe-callbacks voor state-change listeners op EV-entiteiten.
+        self._state_unsubs: list = []
 
         # ── Decision logging ──────────────────────────────────────────── #
         # Acties uitgevoerd in de huidige iteratie (reset elk begin loop).
@@ -198,6 +204,9 @@ class PeakGuardController:
         elif cascade_type == "inject":
             self.inject_cascade = parsed
             self._injection_decider._cascade = self.inject_cascade
+        # Herregistreer EV listeners zodat nieuwe/gewijzigde apparaten meegenomen worden
+        if self._monitoring:
+            self._setup_ev_listeners()
         # Notificeer entity-platforms zodat nieuwe apparaten een entity krijgen
         for cb in self._entity_listeners:
             try:
@@ -214,11 +223,76 @@ class PeakGuardController:
         self._entity_listeners.append(callback)
 
     # ------------------------------------------------------------------ #
+    #  EV state-change listeners                                           #
+    # ------------------------------------------------------------------ #
+
+    def trigger_wakeup(self) -> None:
+        """Wek de monitoring loop onmiddellijk op, zonder te wachten op het interval."""
+        self._wakeup.set()
+
+    def _ev_watched_entities(self) -> set:
+        """Verzamel alle EV-entiteit-IDs waarop we state-changes willen volgen."""
+        entities = set()
+        for device in self.inject_cascade:
+            if device.action_type != ACTION_EV_CHARGER:
+                continue
+            # Laadkabelstatus — meest kritisch: kabel koppelen/ontkoppelen
+            if device.ev_cable_entity:
+                entities.add(device.ev_cable_entity)
+            # Laadrschakelaar — detecteer handmatig aan/uit door gebruiker
+            sw = device.ev_switch_entity or device.entity_id
+            if sw:
+                entities.add(sw)
+        return entities
+
+    def _setup_ev_listeners(self) -> None:
+        """Registreer state-change listeners op alle EV-entiteiten in de inject-cascade.
+
+        Wanneer een relevante entiteit van staat wisselt (bijv. kabel ontkoppeld),
+        wordt de monitoring loop direct gewekt in plaats van te wachten op het
+        volgende interval.
+        """
+        self._teardown_ev_listeners()
+        entities = self._ev_watched_entities()
+        if not entities:
+            return
+
+        @callback
+        def _on_ev_state_changed(event) -> None:
+            old = event.data.get("old_state")
+            new = event.data.get("new_state")
+            if old is None or new is None or old.state == new.state:
+                return
+            entity_id = event.data.get("entity_id")
+            _LOGGER.debug(
+                "Peak Guard: EV-entity '%s' gewijzigd (%s → %s) — directe check",
+                entity_id, old.state, new.state,
+            )
+            self.trigger_wakeup()
+
+        unsub = async_track_state_change_event(self.hass, list(entities), _on_ev_state_changed)
+        self._state_unsubs.append(unsub)
+        _LOGGER.debug(
+            "Peak Guard: state-change listeners geregistreerd op %d EV-entiteit(en): %s",
+            len(entities), sorted(entities),
+        )
+
+    def _teardown_ev_listeners(self) -> None:
+        """Verwijder alle eerder geregistreerde EV state-change listeners."""
+        for unsub in self._state_unsubs:
+            try:
+                unsub()
+            except Exception:
+                pass
+        self._state_unsubs.clear()
+
+    # ------------------------------------------------------------------ #
     #  Monitoring loop                                                     #
     # ------------------------------------------------------------------ #
 
     async def start_monitoring(self):
         self._monitoring = True
+        self._setup_ev_listeners()
         self._task = self.hass.loop.create_task(self._monitor_loop())
         # Startup diagnostic: alleen configuratie loggen.
         # Sensorwaarden worden NIET gecontroleerd bij opstarten omdat HA-entities
@@ -239,6 +313,8 @@ class PeakGuardController:
 
     async def stop_monitoring(self):
         self._monitoring = False
+        self._teardown_ev_listeners()
+        self._wakeup.set()   # deblokkeert de loop zodat hij netjes kan stoppen
         if self._task:
             self._task.cancel()
             try:
@@ -272,6 +348,10 @@ class PeakGuardController:
         _sensor_unavailable_count = 0   # teller voor herhaalde warnings
 
         while self._monitoring:
+            # Clear vóór het werk: een state-change die binnenkomt tijdens een await
+            # in de werklus zet het event; door hier te clearen en pas ná het werk
+            # te wachten mist de loop dat signaal niet.
+            self._wakeup.clear()
             try:
                 self._last_loop_at = datetime.now(timezone.utc).isoformat()
                 # Reset iteration tracking voor beslissingslog.
@@ -339,15 +419,13 @@ class PeakGuardController:
                     self._prev_consumption = None
             except Exception:
                 _LOGGER.exception("Peak Guard: fout in monitoring loop")
-            # Normaal wachten op interval, maar breek vroeg af als force_check gezet is
-            self._force_check = False
-            elapsed = 0.0
-            while elapsed < interval and self._monitoring:
-                await asyncio.sleep(1.0)
-                elapsed += 1.0
-                if self._force_check:
-                    self._force_check = False
-                    break
+            # Wacht op het interval of tot een EV-event (kabel, schakelaar) de
+            # loop vroeg wekt.
+            try:
+                await asyncio.wait_for(self._wakeup.wait(), timeout=interval)
+                _LOGGER.debug("Peak Guard: vroegtijdige wakeup door EV-event of force_check")
+            except asyncio.TimeoutError:
+                pass
 
 
     async def _log_decision(

@@ -786,7 +786,7 @@ class EVGuard:
                             device.name, err,
                         )
                 snap = snapshots.get(snap_key)
-                if snap is not None and snap.original_soc is not None:
+                if snap is not None:
                     await self._set_soc_override(device, override=False, original_soc=snap.original_soc)
                 guard.state = EVState.CABLE_DISCONNECTED
                 guard.last_switch_state = False
@@ -805,11 +805,11 @@ class EVGuard:
                 # De normale restore()-flow triggert pas als de injectie stopt, wat niet
                 # gebeurt als de kabel wordt ontkoppeld terwijl de zon nog schijnt.
                 snap = snapshots.get(snap_key)
-                if snap is not None and snap.original_state == "off" and snap.original_soc is not None:
+                if snap is not None and snap.original_state == "off":
                     _LOGGER.info(
                         "Peak Guard [SOLAR]: '%s' — kabel ontkoppeld, SOC-override herstellen "
                         "naar %.0f%%",
-                        device.name, snap.original_soc,
+                        device.name, snap.original_soc if snap.original_soc is not None else 100.0,
                     )
                     await self._set_soc_override(
                         device, override=False, original_soc=snap.original_soc
@@ -1023,6 +1023,19 @@ class EVGuard:
 
                 # SOC-override vóór turn_on: Tesla weigert turn_on als huidige SOC
                 # boven de geconfigureerde laadlimiet ligt ("Command was unsuccessful: complete").
+                # Lees de SOC opnieuw: de Tesla was eerder mogelijk slapend (state="unavailable"),
+                # waardoor original_soc=None in de snapshot zit. Nu de Tesla wakker is, kunnen
+                # we de echte oorspronkelijke waarde alsnog opslaan zodat het herstel correct werkt.
+                if device.ev_soc_entity:
+                    _soc_st = self.hass.states.get(device.ev_soc_entity)
+                    if _soc_st is not None:
+                        try:
+                            _soc_now = float(_soc_st.state)
+                            _snap_now = snapshots.get(snap_key)
+                            if _snap_now is not None and _snap_now.original_soc is None:
+                                _snap_now.original_soc = _soc_now
+                        except (ValueError, TypeError):
+                            pass
                 await self._set_soc_override(device, override=True)
 
                 try:

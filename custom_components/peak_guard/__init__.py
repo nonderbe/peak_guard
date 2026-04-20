@@ -68,7 +68,7 @@ class PeakGuardForceCheckView(HomeAssistantView):
         controller = hass.data.get(DOMAIN, {}).get("controller")
         if not controller:
             return self.json_message("Peak Guard niet geïnitialiseerd", status_code=503)
-        controller._force_check = True
+        controller.trigger_wakeup()
         return self.json({"status": "ok", "message": "force check getriggerd"})
 
 
