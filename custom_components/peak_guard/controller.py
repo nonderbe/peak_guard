@@ -214,13 +214,13 @@ class PeakGuardController:
             except Exception:
                 pass
 
-    def register_entity_listener(self, callback) -> None:
+    def register_entity_listener(self, cb) -> None:
         """Registreer een callback die wordt aangeroepen na elke cascade-update.
 
         Gebruikt door switch.py en number.py om dynamisch nieuwe entities
         aan te maken wanneer apparaten worden toegevoegd via de UI.
         """
-        self._entity_listeners.append(callback)
+        self._entity_listeners.append(cb)
 
     # ------------------------------------------------------------------ #
     #  EV state-change listeners                                           #
@@ -239,10 +239,16 @@ class PeakGuardController:
             # Laadkabelstatus — meest kritisch: kabel koppelen/ontkoppelen
             if device.ev_cable_entity:
                 entities.add(device.ev_cable_entity)
-            # Laadrschakelaar — detecteer handmatig aan/uit door gebruiker
+            # Laadschakelaar — detecteer handmatig aan/uit door gebruiker
             sw = device.ev_switch_entity or device.entity_id
             if sw:
                 entities.add(sw)
+            # Verbindingsstatus — detecteer wanneer Tesla wakker wordt (unavailable → online)
+            if device.ev_status_sensor:
+                entities.add(device.ev_status_sensor)
+            # Locatie — detecteer wanneer EV thuiskomt zodat solar-lading direct kan starten
+            if device.ev_location_tracker:
+                entities.add(device.ev_location_tracker)
         return entities
 
     def _setup_ev_listeners(self) -> None:
