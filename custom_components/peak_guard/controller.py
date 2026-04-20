@@ -230,26 +230,35 @@ class PeakGuardController:
         """Wek de monitoring loop onmiddellijk op, zonder te wachten op het interval."""
         self._wakeup.set()
 
-    def _ev_watched_entities(self) -> set:
-        """Verzamel alle EV-entiteit-IDs waarop we state-changes willen volgen."""
-        entities = set()
+    def _ev_watched_entities(self) -> tuple:
+        """Verzamel EV-entiteiten om op te luisteren.
+
+        Geeft een tuple (alle_entities, schakelaar_entities) terug.
+        Schakelaar-entities worden apart bijgehouden zodat de callback alleen
+        op '→ off'-transities reageert: turn_on wordt door PG zelf gestuurd en
+        vereist geen onmiddellijke hercheck; turn_off (handmatig of kabel) wel.
+        """
+        all_entities: set = set()
+        switch_entities: set = set()
         for device in self.inject_cascade:
             if device.action_type != ACTION_EV_CHARGER:
                 continue
             # Laadkabelstatus — meest kritisch: kabel koppelen/ontkoppelen
             if device.ev_cable_entity:
-                entities.add(device.ev_cable_entity)
-            # Laadschakelaar — detecteer handmatig aan/uit door gebruiker
+                all_entities.add(device.ev_cable_entity)
+            # Laadschakelaar — detecteer handmatig uitschakelen door gebruiker;
+            # turn_on wordt door PG zelf gedaan en hoeft geen extra loop te triggeren
             sw = device.ev_switch_entity or device.entity_id
             if sw:
-                entities.add(sw)
+                all_entities.add(sw)
+                switch_entities.add(sw)
             # Verbindingsstatus — detecteer wanneer Tesla wakker wordt (unavailable → online)
             if device.ev_status_sensor:
-                entities.add(device.ev_status_sensor)
+                all_entities.add(device.ev_status_sensor)
             # Locatie — detecteer wanneer EV thuiskomt zodat solar-lading direct kan starten
             if device.ev_location_tracker:
-                entities.add(device.ev_location_tracker)
-        return entities
+                all_entities.add(device.ev_location_tracker)
+        return all_entities, switch_entities
 
     def _setup_ev_listeners(self) -> None:
         """Registreer state-change listeners op alle EV-entiteiten in de inject-cascade.
@@ -259,8 +268,8 @@ class PeakGuardController:
         volgende interval.
         """
         self._teardown_ev_listeners()
-        entities = self._ev_watched_entities()
-        if not entities:
+        all_entities, switch_entities = self._ev_watched_entities()
+        if not all_entities:
             return
 
         @callback
@@ -270,17 +279,21 @@ class PeakGuardController:
             if old is None or new is None or old.state == new.state:
                 return
             entity_id = event.data.get("entity_id")
+            # Schakelaar-entiteiten: enkel reageren op '→ off'. Een '→ on'-transitie
+            # is door PG zelf geïnitieerd; die hoeft geen extra iteratie te triggeren.
+            if entity_id in switch_entities and new.state != "off":
+                return
             _LOGGER.debug(
                 "Peak Guard: EV-entity '%s' gewijzigd (%s → %s) — directe check",
                 entity_id, old.state, new.state,
             )
             self.trigger_wakeup()
 
-        unsub = async_track_state_change_event(self.hass, list(entities), _on_ev_state_changed)
+        unsub = async_track_state_change_event(self.hass, list(all_entities), _on_ev_state_changed)
         self._state_unsubs.append(unsub)
         _LOGGER.debug(
             "Peak Guard: state-change listeners geregistreerd op %d EV-entiteit(en): %s",
-            len(entities), sorted(entities),
+            len(all_entities), sorted(all_entities),
         )
 
     def _teardown_ev_listeners(self) -> None:
