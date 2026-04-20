@@ -122,7 +122,7 @@ class InjectionDecider(BaseDecider):
             return
         # Herstel één apparaat per cyclus (laagste prioriteit eerst)
         device, snapshot = snapshots_to_restore[0]
-        restored = await self._restore_device(device, snapshot)
+        restored = await self._restore_device(device, snapshot, cascade_type="solar")
         if restored:
             del self._snapshots[device.entity_id]
             _LOGGER.info("Peak Guard: '%s' hersteld", device.name)

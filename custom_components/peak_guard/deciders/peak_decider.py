@@ -142,7 +142,7 @@ class PeakDecider(BaseDecider):
                 # (meer vermogen) dat zeker ook — stop hier.
                 break
 
-            restored = await self._restore_device(device, snapshot)
+            restored = await self._restore_device(device, snapshot, cascade_type="peak")
             if restored:
                 del self._snapshots[device.entity_id]
                 remaining_headroom -= nominal_w

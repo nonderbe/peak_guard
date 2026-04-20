@@ -333,6 +333,7 @@ class BaseDecider:
         self,
         device: CascadeDevice,
         snapshot: DeviceSnapshot,
+        cascade_type: str = "peak",
     ) -> bool:
         """
         Herstel één apparaat naar zijn originele staat na een Peak Guard ingreep.
@@ -425,6 +426,7 @@ class BaseDecider:
                     snapshot=snapshot,
                     peak_tracker=self.peak_tracker,
                     solar_tracker=self.solar_tracker,
+                    cascade_type=cascade_type,
                 )
 
         except HomeAssistantError as err:

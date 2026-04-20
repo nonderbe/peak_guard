@@ -364,6 +364,7 @@ class EVGuard:
         snapshot: DeviceSnapshot,
         peak_tracker: "PeakAvoidTracker",
         solar_tracker: "SolarShiftTracker",
+        cascade_type: str = "peak",
     ) -> bool:
         """
         Herstel EV Charger na een Peak Guard ingreep.
@@ -422,11 +423,15 @@ class EVGuard:
                                 device.name, orig_a, max_a,
                             )
 
-                peak_tracker.start_measurement_on_turnon(
-                    device_id=device.id,
-                    device_name=device.name,
-                    ts=datetime.now(timezone.utc),
-                )
+                # peak_tracker alleen aanroepen in piekbeperkings-context.
+                # In solar-context met original_state="on" was het apparaat al aan
+                # vóór PG ingreep (gebruiker schakelde handmatig in) — geen piek-event.
+                if cascade_type == "peak":
+                    peak_tracker.start_measurement_on_turnon(
+                        device_id=device.id,
+                        device_name=device.name,
+                        ts=datetime.now(timezone.utc),
+                    )
                 guard = self.get_guard(device.id)
                 guard.state = EVState.CHARGING
                 guard.last_switch_state = True
