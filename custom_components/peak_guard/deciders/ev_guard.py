@@ -336,23 +336,13 @@ class EVGuard:
                 device.name, target_soc, soc_entity,
             )
         else:
+            target_soc = float(original_soc) if original_soc is not None else 80.0
             if original_soc is None:
-                current_st = self.hass.states.get(soc_entity)
-                current_val: Optional[float] = None
-                if current_st is not None:
-                    try:
-                        current_val = float(current_st.state)
-                    except (ValueError, TypeError):
-                        pass
                 _LOGGER.warning(
-                    "Peak Guard EV: '%s' SOC-limiet NIET hersteld — originele waarde was "
-                    "onbekend bij activering (Tesla sliep of rapporteerde 'none'). "
-                    "Huidige laadlimiet: %s%%. Controleer manueel de laadlimiet in de Tesla-app.",
+                    "Peak Guard EV: '%s' originele laadlimiet was onbekend bij activering "
+                    "(Tesla sliep of rapporteerde 'none') — hersteld naar standaard 80%%.",
                     device.name,
-                    f"{current_val:.0f}" if current_val is not None else "onbekend",
                 )
-                return
-            target_soc = float(original_soc)
             _LOGGER.warning(
                 "Peak Guard EV: '%s' SOC-limiet herstellen naar %.0f%% via '%s'",
                 device.name, target_soc, soc_entity,
