@@ -12,10 +12,6 @@ from typing import TYPE_CHECKING, Callable, Dict, List
 
 from homeassistant.core import HomeAssistant
 
-from ..const import (
-    CONF_BUFFER_WATTS,
-    DEFAULT_BUFFER_WATTS,
-)
 from ..models import CascadeDevice, DeviceSnapshot
 from .base import BaseDecider
 
@@ -30,8 +26,10 @@ class InjectionDecider(BaseDecider):
     """
     Beslisser voor injectiepreventie (Modus 2).
 
-    check()         — is het solar-overschot groter dan de buffer?
+    check()         — is er netto injectie op het net (consumption < 0)?
                       Zo ja, start de inject-cascade om verbruikers in te schakelen.
+                      Geen vaste watt-buffer: de cascade start zodra er injectie is.
+                      Individuele apparaten (EV) hebben hun eigen start-drempel.
     check_restore() — is het overschot verdwenen? Herstel dan de verbruikers.
     """
 
@@ -71,18 +69,16 @@ class InjectionDecider(BaseDecider):
         consumption: actueel netto-verbruik in W (negatief = injectie)
         """
         injection = abs(consumption)
-        buffer = float(self.config.get(CONF_BUFFER_WATTS, DEFAULT_BUFFER_WATTS))
         _LOGGER.debug(
-            "Peak Guard _check_injection: injectie=%.0f W, buffer=%.0f W, "
-            "actief=%d snapshot(s)",
-            injection, buffer, len(self._snapshots),
+            "Peak Guard _check_injection: injectie=%.0f W, actief=%d snapshot(s)",
+            injection, len(self._snapshots),
         )
-        if injection > buffer:
+        if injection > 0:
             enabled_devices = [d for d in self._cascade if d.enabled]
             _LOGGER.warning(
                 "Peak Guard [SOLAR cascade]: gestart — overschot = %.0f W "
-                "(buffer=%.0f W, %d apparaat/apparaten: %s)",
-                injection, buffer, len(enabled_devices),
+                "(%d apparaat/apparaten: %s)",
+                injection, len(enabled_devices),
                 ", ".join(f"'{d.name}'" for d in enabled_devices) or "–",
             )
             if not enabled_devices:
@@ -94,8 +90,8 @@ class InjectionDecider(BaseDecider):
             await self._run_cascade(self._cascade, injection, self._snapshots, "solar")
         else:
             _LOGGER.debug(
-                "Peak Guard: injectie %.0f W ≤ buffer %.0f W — geen actie vereist",
-                injection, buffer,
+                "Peak Guard: geen injectie (%.0f W) — geen actie vereist",
+                injection,
             )
 
     async def check_restore(self, consumption: float) -> None:

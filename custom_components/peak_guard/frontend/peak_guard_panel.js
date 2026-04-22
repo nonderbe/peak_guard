@@ -403,7 +403,7 @@ class PeakGuardPanel extends HTMLElement {
               ${
                 isPeak
                   ? "Apparaten worden in volgorde uitgeschakeld of teruggeschroefd wanneer het verbruik de maandpiek dreigt te overschrijden."
-                  : "Apparaten worden in volgorde ingeschakeld of opgeschroefd wanneer er te veel stroom wordt teruggeleverd aan het net."
+                  : "Apparaten worden in volgorde ingeschakeld of opgeschroefd zodra er stroom wordt teruggeleverd aan het net. Er is geen globale watt-buffer: de cascade start bij elke injectie. EV-laders hebben een eigen start-drempel (standaard 230 W ≈ 1 A) om onnodig starten en stoppen te voorkomen."
               }
             </div>
           </div>
@@ -1062,6 +1062,9 @@ class PeakGuardPanel extends HTMLElement {
             <div class="field-hint">
               Laagste toegelaten laadstroom. De meeste laders vereisen minimaal 6 A.
               Onder dit niveau schakelt Peak Guard de lader volledig uit.
+              Peak Guard start de lader pas wanneer het zonne-overschot minstens
+              de minimale laadstroom dekt (standaard 230 W), zodat de lader niet
+              voortdurend aan en uit schakelt.
             </div>
           </div>
           <div class="form-group">

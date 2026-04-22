@@ -205,9 +205,10 @@ class EVGuard:
             return not bool(device.ev_wake_button)
 
         # "complete" = lading gestopt omdat limiet bereikt; auto is wakker en verbonden.
+        # "off"     = Tesla binary sensor die aangeeft "niet aan het laden" — auto IS wakker.
         # Slapen → "unavailable"/"unknown" (Tesla integration gaat offline bij slaap).
-        CONNECTED = {"on", "true", "connected", "online", "home",
-                     "charging", "complete", "fully_charged", "pending", "1"}
+        CONNECTED = {"on", "off", "true", "false", "connected", "online", "home",
+                     "charging", "complete", "fully_charged", "pending", "1", "0"}
         if s in CONNECTED:
             return True
 
