@@ -180,10 +180,21 @@ class PeakGuardController:
                 "interval_s":    max(float(self.config.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL)), 60.0),
                 "ev_guards": {
                     device_id: {
-                        "state":          guard.state.value,
-                        "history_len":    len(guard.surplus_history),
-                        "pending_amps":   guard.pending_amps,
-                        "last_sent_amps": int(guard.last_sent_amps) if guard.last_sent_amps is not None else None,
+                        "state":               guard.state.value,
+                        "history_len":         len(guard.surplus_history),
+                        "history_secs":        (
+                            datetime.now(timezone.utc) - guard.surplus_history[0][0]
+                        ).total_seconds() if guard.surplus_history else 0.0,
+                        "pending_amps":        guard.pending_amps,
+                        "last_sent_amps":      int(guard.last_sent_amps) if guard.last_sent_amps is not None else None,
+                        "skip_reason":         guard.skip_reason,
+                        "turned_off_by_pg":    guard.turned_off_by_pg,
+                        "min_off_remaining_s": max(0.0, EV_MIN_OFF_DURATION_S - (
+                            datetime.now(timezone.utc) - guard.turned_off_at
+                        ).total_seconds()) if (guard.turned_off_at and guard.turned_off_by_pg) else 0.0,
+                        "wake_elapsed_s":      (
+                            datetime.now(timezone.utc) - guard.wake_requested_at
+                        ).total_seconds() if guard.wake_requested_at else 0.0,
                     }
                     for device_id, guard in self._ev_guard_decider.guards.items()
                 },

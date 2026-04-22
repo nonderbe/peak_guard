@@ -602,6 +602,7 @@ class EVGuard:
 
         now = datetime.now(timezone.utc)
         guard = self.get_guard(device.id)
+        guard.skip_reason = ""
 
         # ================================================================ #
         #  PIEKBEPERKING — floor, laadstroom verlagen                      #
@@ -803,10 +804,12 @@ class EVGuard:
                 guard.state = EVState.CABLE_DISCONNECTED
                 guard.last_switch_state = False
                 guard.surplus_history.clear()
-                self.last_skip_reason = f"laadkabel ontkoppeld tijdens laden ({cable_entity})"
+                guard.skip_reason = f"laadkabel ontkoppeld tijdens laden ({cable_entity})"
+                self.last_skip_reason = guard.skip_reason
             elif guard.state != EVState.CABLE_DISCONNECTED:
                 guard.state = EVState.CABLE_DISCONNECTED
-                self.last_skip_reason = f"laadkabel niet aangesloten ({cable_entity})"
+                guard.skip_reason = f"laadkabel niet aangesloten ({cable_entity})"
+                self.last_skip_reason = guard.skip_reason
                 _LOGGER.warning(
                     "Peak Guard [SOLAR]: '%s' — laadkabel NIET aangesloten "
                     "('%s' = '%s') — laden geblokkeerd",
@@ -827,7 +830,8 @@ class EVGuard:
                         device, override=False, original_soc=snap.original_soc
                     )
             else:
-                self.last_skip_reason = f"laadkabel niet aangesloten ({cable_entity})"
+                guard.skip_reason = f"laadkabel niet aangesloten ({cable_entity})"
+                self.last_skip_reason = guard.skip_reason
                 _LOGGER.debug(
                     "Peak Guard [SOLAR]: '%s' — kabel nog steeds niet aangesloten, wachten",
                     device.name,
@@ -856,9 +860,10 @@ class EVGuard:
                 # Val door naar stroom-aanpassing hieronder
             else:
                 # EV uit, surplus < drempel → geen actie
-                self.last_skip_reason = (
+                guard.skip_reason = (
                     f"surplus {excess:.0f} W < start-drempel {start_threshold_w:.0f} W"
                 )
+                self.last_skip_reason = guard.skip_reason
                 _LOGGER.info(
                     "Peak Guard [SOLAR]: '%s' staat uit — surplus %.0f W < "
                     "start-drempel %.0f W → geen actie",
@@ -885,7 +890,8 @@ class EVGuard:
                     "Peak Guard [SOLAR]: '%s' niet thuis — laden overgeslagen",
                     device.name,
                 )
-            self.last_skip_reason = "EV niet thuis"
+            guard.skip_reason = "EV niet thuis"
+            self.last_skip_reason = guard.skip_reason
             return excess
 
         # Detecteer handmatige start
@@ -915,10 +921,11 @@ class EVGuard:
                     history_secs = (now - guard.surplus_history[0][0]).total_seconds()
                 if guard.state != EVState.WAITING_FOR_STABLE:
                     guard.state = EVState.WAITING_FOR_STABLE
-                    self.last_skip_reason = (
+                    guard.skip_reason = (
                         f"opbouwen geschiedenis "
                         f"({history_secs:.0f}/{EV_DEBOUNCE_STABLE_S:.0f}s)"
                     )
+                    self.last_skip_reason = guard.skip_reason
                     _LOGGER.warning(
                         "Peak Guard [SOLAR]: '%s' NIET geactiveerd — "
                         "surplus-geschiedenis aan het opbouwen "
@@ -927,10 +934,11 @@ class EVGuard:
                         excess, EV_FLOOR_PERCENTILE,
                     )
                 else:
-                    self.last_skip_reason = (
+                    guard.skip_reason = (
                         f"opbouwen geschiedenis "
                         f"({history_secs:.0f}/{EV_DEBOUNCE_STABLE_S:.0f}s)"
                     )
+                    self.last_skip_reason = guard.skip_reason
                     _LOGGER.info(
                         "Peak Guard [SOLAR]: '%s' geschiedenis opbouwen "
                         "(%.0f/%.0f s, huidig=%.0f W)",
@@ -960,9 +968,10 @@ class EVGuard:
             if guard.turned_off_at is not None and guard.turned_off_by_pg:
                 off_secs = (now - guard.turned_off_at).total_seconds()
                 if off_secs < EV_MIN_OFF_DURATION_S:
-                    self.last_skip_reason = (
+                    guard.skip_reason = (
                         f"min OFF-duur: {off_secs:.0f}s < {EV_MIN_OFF_DURATION_S:.0f}s"
                     )
+                    self.last_skip_reason = guard.skip_reason
                     _LOGGER.info(
                         "Peak Guard [SOLAR]: '%s' aanzetten OVERGESLAGEN — "
                         "te kort geleden automatisch uitgeschakeld "
@@ -1006,6 +1015,8 @@ class EVGuard:
                             "Peak Guard [SOLAR]: '%s' — wake-up aanroep mislukt: %s",
                             device.name, wake_err,
                         )
+                    guard.state = EVState.SLEEPING
+                    guard.wake_requested_at = now
                     wake_ok = False
                     for _ in range(int(EV_WAKE_TIMEOUT_S)):
                         await asyncio.sleep(1.0)
@@ -1013,6 +1024,8 @@ class EVGuard:
                             wake_ok = True
                             break
                     if wake_ok:
+                        guard.state = EVState.IDLE
+                        guard.wake_requested_at = None
                         if device.ev_status_sensor:
                             _st2 = self.hass.states.get(device.ev_status_sensor)
                             status_val = _st2.state if _st2 else "verbonden"
@@ -1022,6 +1035,10 @@ class EVGuard:
                             device.name, status_entity, status_val, new_a,
                         )
                     else:
+                        guard.state = EVState.IDLE
+                        guard.wake_requested_at = None
+                        guard.skip_reason = "Tesla niet wakker na wake-up poging"
+                        self.last_skip_reason = guard.skip_reason
                         _LOGGER.warning(
                             "Peak Guard [SOLAR]: '%s' — Tesla niet wakker na %.0f s "
                             "('%s' = '%s') — laden uitgesteld tot volgende cyclus",
@@ -1079,6 +1096,7 @@ class EVGuard:
                 self._record_call()
                 self._track_action(sw_entity, "switch.turn_on")
                 guard.state = EVState.CHARGING
+                guard.skip_reason = ""
                 guard.last_switch_state = True
                 guard.turned_on_at = now
                 guard.surplus_history.clear()

@@ -107,6 +107,10 @@ class EVDeviceGuard:
     # Wordt gebruikt om te bepalen of de min-OFF-duur gate van toepassing is.
     turned_off_by_pg: bool = False
 
+    # Meest recente reden waarom de solar-evaluatie werd overgeslagen.
+    # Leeg als er geen skip was of als laden actief is.
+    skip_reason: str = ""
+
 
 # ──────────────────────────────────────────────────────────────────────────── #
 #  Globale EV rate-limiter                                                      #

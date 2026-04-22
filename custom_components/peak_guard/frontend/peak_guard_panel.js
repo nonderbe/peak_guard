@@ -226,24 +226,27 @@ class PeakGuardPanel extends HTMLElement {
         if (evEl) {
           evEl.textContent = this._evLiveDetail(device);
         }
-        // EV debounce-indicator
+        // EV stap-indicator op de tegel
         if (device.action_type === "ev_charger") {
           const wrapEl  = this.shadowRoot.querySelector(`#ev-debounce-${cascadeType}-${index}`);
           const fillEl  = this.shadowRoot.querySelector(`#ev-debounce-fill-${cascadeType}-${index}`);
           const labelEl = this.shadowRoot.querySelector(`#ev-debounce-label-${cascadeType}-${index}`);
-          if (wrapEl && fillEl) {
+          if (wrapEl && labelEl) {
             const guard = this._data?.status?.ev_guards?.[device.id];
-            const isWaiting = guard?.state === "waiting_for_stable_surplus";
-            wrapEl.style.display = isWaiting ? "" : "none";
-            if (isWaiting) {
-              if (guard.history_len > 0) {
-                const pct = Math.min(100, Math.round((guard.history_len / 2) * 100));
-                fillEl.style.width = `${pct}%`;
+            const stepInfo = this._evTileStepLabel(guard, device, cascadeType);
+            if (stepInfo) {
+              wrapEl.style.display = "";
+              labelEl.textContent = stepInfo.label;
+              if (fillEl) {
+                if (stepInfo.pct != null) {
+                  fillEl.style.display = "";
+                  fillEl.style.width = `${stepInfo.pct}%`;
+                } else {
+                  fillEl.style.display = "none";
+                }
               }
-              if (labelEl && guard.pending_amps != null) {
-                const from = guard.last_sent_amps != null ? `${guard.last_sent_amps} A` : "uit";
-                labelEl.textContent = `⏳ Wachten op stabiel overschot — beslissing: ${from} → ${guard.pending_amps} A`;
-              }
+            } else {
+              wrapEl.style.display = "none";
             }
           }
         }
@@ -528,7 +531,7 @@ class PeakGuardPanel extends HTMLElement {
           ${device.action_type === "ev_charger"
             ? `<div id="ev-live-${type}-${index}" class="ev-live-status"></div>
                <div id="ev-debounce-${type}-${index}" class="ev-debounce-bar-wrap" style="display:none;">
-                 <div id="ev-debounce-label-${type}-${index}" class="ev-debounce-label">⏳ Wachten op stabiel overschot…</div>
+                 <div id="ev-debounce-label-${type}-${index}" class="ev-debounce-label"></div>
                  <div class="ev-debounce-track"><div id="ev-debounce-fill-${type}-${index}" class="ev-debounce-fill" style="width:0%"></div></div>
                </div>`
             : ""}
@@ -575,8 +578,7 @@ class PeakGuardPanel extends HTMLElement {
       return s ?? "—";
     };
 
-    // Originele waarde (uit snapshot) of "ongewijzigd"
-    const origState   = snap ? stateLabel(snap.original_state) : "ongewijzigd";
+    // Originele waarden vóór PG-ingreep (uit snapshot)
     const origCurrent = snap?.original_current != null ? `${snap.original_current} A` : null;
     const origSoc     = snap?.original_soc     != null ? `${snap.original_soc}%`      : null;
 
@@ -609,24 +611,39 @@ class PeakGuardPanel extends HTMLElement {
     }
 
     // Bouw tabel-rijen
-    const row = (label, orig, mod) => `
+    const row = (label, huidig, origineel) => `
       <tr>
         <td class="info-label">${label}</td>
-        <td class="info-orig">${orig}</td>
-        <td class="info-mod">${mod}</td>
+        <td class="info-orig">${huidig}</td>
+        <td class="info-mod">${origineel}</td>
       </tr>`;
 
-    let rows = row("Schakelaar", modState, origState);
-    if (isEV && (origCurrent || modCurrent)) {
-      rows += row("Laadstroom", modCurrent ?? "—", origCurrent ?? "—");
+    // "Origineel" = waarde vóór PG-ingreep; als er geen snap is, toon de live waarde (ongewijzigd)
+    const origStateFmt   = snap ? stateLabel(snap.original_state) : stateLabel(liveVal);
+    const origCurrentFmt = origCurrent ?? modCurrent ?? "—";
+    const origSocFmt     = origSoc ?? (() => {
+      if (!device.ev_soc_entity) return null;
+      const s = this._hass?.states[device.ev_soc_entity];
+      return (s && s.state !== "unavailable" && s.state !== "unknown")
+        ? `${parseFloat(s.state)}%` : "—";
+    })();
+
+    let rows = row("Schakelaar", modState, origStateFmt);
+    if (isEV && device.ev_current_entity) {
+      rows += row("Laadstroom", modCurrent ?? "—", origCurrentFmt);
     }
-    if (isEV && origSoc != null) {
-      const socEntityId = device.ev_soc_entity;
-      const socState    = socEntityId ? this._hass?.states[socEntityId] : null;
-      const curSocVal   = socState && socState.state !== "unavailable"
+    if (isEV && device.ev_soc_entity) {
+      const socState  = this._hass?.states[device.ev_soc_entity];
+      const curSocVal = (socState && socState.state !== "unavailable" && socState.state !== "unknown")
         ? `${parseFloat(socState.state)}%` : "—";
-      rows += row("SoC-limiet", curSocVal, origSoc);
+      rows += row("Laadlimiet", curSocVal, origSocFmt ?? "—");
     }
+
+    // EV evaluatie-checklist (enkel solar-cascade, enkel EV)
+    const guard = this._data?.status?.ev_guards?.[device.id];
+    const evalChecklist = (isEV && !isPeak)
+      ? this._evEvalChecklist(device, guard)
+      : "";
 
     const activeLabel = snap
       ? `<span class="info-active-badge">Ingreep actief</span>`
@@ -649,7 +666,7 @@ class PeakGuardPanel extends HTMLElement {
     this._modalEl.style.display = "flex";
 
     this._modalEl.innerHTML = `
-      <div class="modal" id="modal-box" style="max-width:480px;">
+      <div class="modal" id="modal-box" style="max-width:520px;">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
           <h3 style="margin:0;">${this._esc(device.name)}</h3>
           ${activeLabel}
@@ -665,7 +682,8 @@ class PeakGuardPanel extends HTMLElement {
           </thead>
           <tbody>${rows}</tbody>
         </table>
-        <div class="info-restore-box">
+        ${evalChecklist}
+        <div class="info-restore-box" style="margin-top:14px;">
           <div class="info-restore-title">↩ Wanneer wordt hersteld?</div>
           <div class="info-restore-text">${restoreDesc}</div>
         </div>
@@ -820,9 +838,181 @@ class PeakGuardPanel extends HTMLElement {
     return parts.join(" · ");
   }
 
-  // ------------------------------------------------------------------ //
-  //  Modal — persistente DOM-node, nooit door _render() gewist           //
-  // ------------------------------------------------------------------ //
+  // Geeft {label, pct} terug voor de stap-indicator op de EV-tegel, of null als er niets te tonen is.
+  _evTileStepLabel(guard, device, cascadeType) {
+    if (!guard || cascadeType !== "inject") return null;
+    const state = guard.state;
+    const skip  = guard.skip_reason ?? "";
+
+    if (state === "charging") return null;
+
+    if (state === "sleeping") {
+      const elapsed = Math.round(guard.wake_elapsed_s ?? 0);
+      const pct = Math.min(100, Math.round(elapsed / 15 * 100));
+      return { label: `💤 Tesla aan het wekken… ${elapsed}s`, pct };
+    }
+    if (state === "waiting_for_stable_surplus") {
+      const secs = Math.round(guard.history_secs ?? 0);
+      const pct  = Math.min(100, Math.round(secs / 20 * 100));
+      const target = guard.pending_amps != null ? ` → ${guard.pending_amps} A` : "";
+      return { label: `☀️ Overschot aan het meten… ${secs}/20s${target}`, pct };
+    }
+    if (state === "cable_disconnected" || skip.includes("kabel")) {
+      return { label: "🔌 Laadkabel niet aangesloten — wachten tot die erin gaat", pct: null };
+    }
+    if (skip.includes("niet thuis") || skip.includes("EV niet thuis")) {
+      return { label: "🏠 Wagen is niet thuis", pct: null };
+    }
+    if (skip.includes("min OFF")) {
+      const rem = Math.ceil(guard.min_off_remaining_s ?? 0);
+      return { label: `⏱️ Even afkoelen na de vorige stop… nog ${rem}s`, pct: null };
+    }
+    if (skip.includes("start-drempel") || skip.includes("surplus")) {
+      return { label: "⏳ Wachten op genoeg zon… overschot is nog te klein", pct: null };
+    }
+    if (skip.includes("niet wakker")) {
+      return { label: "💤 Tesla reageert niet — volgende cyclus opnieuw proberen", pct: null };
+    }
+    return null;
+  }
+
+  // Bouwt de evaluatie-checklist voor een EV in de solar-cascade.
+  _evEvalChecklist(device, guard) {
+    if (!guard) {
+      return `<div class="ev-checklist">
+        <div class="ev-checklist-title">🔍 Evaluatiestappen</div>
+        <div style="font-size:.85em;color:var(--secondary-text-color,#888);">
+          Nog geen evaluatiedata — Peak Guard heeft dit apparaat nog niet beoordeeld.
+        </div>
+      </div>`;
+    }
+
+    // Haal surpluswaarde op via de consumptiesensor
+    const consumptionSensor = this._data?.config?.consumption_sensor;
+    const consumptionState  = consumptionSensor ? this._hass?.states[consumptionSensor] : null;
+    const consumption       = consumptionState ? parseFloat(consumptionState.state) : 0;
+    const surplus_w         = (consumption < 0) ? Math.abs(consumption) : 0;
+
+    const state  = guard.state ?? "idle";
+    const skip   = guard.skip_reason ?? "";
+    const startThr = parseFloat(device.start_threshold_w ?? 230);
+
+    // Bepaal welke stap momenteel blokkeert
+    let blockingStep = null;
+    let blockingMode = "active";  // 'active' = wachten/bezig, 'blocked' = mislukt
+    if (state === "charging") {
+      blockingStep = "done_all";
+    } else if (state === "cable_disconnected" || skip.includes("kabel")) {
+      blockingStep = "cable"; blockingMode = "blocked";
+    } else if (skip.includes("start-drempel") || skip.includes("surplus")) {
+      blockingStep = "surplus"; blockingMode = "blocked";
+    } else if (skip.includes("niet thuis") || skip.includes("EV niet thuis")) {
+      blockingStep = "location"; blockingMode = "blocked";
+    } else if (skip.includes("min OFF")) {
+      blockingStep = "min_off"; blockingMode = "active";
+    } else if (state === "waiting_for_stable_surplus") {
+      blockingStep = "debounce"; blockingMode = "active";
+    } else if (state === "sleeping") {
+      blockingStep = "wake"; blockingMode = "active";
+    } else if (skip.includes("niet wakker")) {
+      blockingStep = "wake"; blockingMode = "blocked";
+    } else if (surplus_w <= 0) {
+      blockingStep = "surplus"; blockingMode = "blocked";
+    }
+
+    const STEP_ORDER = ["cable", "surplus", "location", "min_off", "debounce", "wake", "start"];
+
+    const blockIdx = blockingStep === "done_all"
+      ? STEP_ORDER.length
+      : STEP_ORDER.indexOf(blockingStep);
+
+    const stepStatus = (id) => {
+      const idx = STEP_ORDER.indexOf(id);
+      if (blockingStep === "done_all") return "done";
+      if (idx < blockIdx) return "done";
+      if (idx === blockIdx) return blockingMode === "blocked" ? "blocked" : "active";
+      return "pending";
+    };
+
+    const ICONS = {
+      done: "✅", active: "⏳", blocked: "❌", pending: "⬜",
+    };
+
+    const step = (id, label, detail = "", barPct = null) => {
+      const status = stepStatus(id);
+      const icon   = ICONS[status];
+      const barHtml = (status === "active" && barPct != null)
+        ? `<div class="ev-step-bar-wrap"><div class="ev-step-bar-fill" style="width:${barPct}%"></div></div>`
+        : "";
+      const detailHtml = detail
+        ? `<div class="ev-step-detail">${detail}</div>` : "";
+      return `
+        <div class="ev-checklist-step ${status}">
+          <span class="ev-step-icon">${icon}</span>
+          <div class="ev-step-body">
+            <div class="ev-step-label">${label}</div>
+            ${barHtml}${detailHtml}
+          </div>
+        </div>`;
+    };
+
+    let html = `<div class="ev-checklist"><div class="ev-checklist-title">🔍 Evaluatiestappen</div>`;
+
+    // Stap: kabel (alleen als geconfigureerd)
+    if (device.ev_cable_entity) {
+      const cableState = this._hass?.states[device.ev_cable_entity];
+      const cableVal   = cableState?.state ?? "onbekend";
+      html += step("cable", "Laadkabel aangesloten", `entity: ${cableVal}`);
+    }
+
+    // Stap: surplus
+    const surplusDetail = surplus_w > 0
+      ? `${surplus_w.toFixed(0)} W ≥ drempel ${startThr.toFixed(0)} W`
+      : `geen overschot (drempel: ${startThr.toFixed(0)} W)`;
+    html += step("surplus", "Voldoende zonne-overschot", surplusDetail);
+
+    // Stap: locatie (alleen als geconfigureerd)
+    if (device.ev_location_tracker) {
+      const locState = this._hass?.states[device.ev_location_tracker];
+      const locVal   = locState?.state ?? "onbekend";
+      html += step("location", "Wagen thuis", `tracker: ${locVal}`);
+    }
+
+    // Stap: min OFF (alleen als PG eerder uitschakelde)
+    if (guard.turned_off_by_pg || (guard.min_off_remaining_s ?? 0) > 0) {
+      const rem  = Math.ceil(guard.min_off_remaining_s ?? 0);
+      const det  = rem > 0 ? `nog ${rem}s wachten` : "wachttijd verstreken";
+      html += step("min_off", "Wachttijd na vorige stop", det);
+    }
+
+    // Stap: debounce
+    const histSecs = Math.round(guard.history_secs ?? 0);
+    const histPct  = Math.min(100, Math.round(histSecs / 20 * 100));
+    const debDet   = state === "waiting_for_stable_surplus"
+      ? `${histSecs}/20s opgebouwd`
+      : (stepStatus("debounce") === "done" ? "stabiel ✓" : "");
+    html += step("debounce", "Overschot stabiel (20s meting)", debDet,
+      state === "waiting_for_stable_surplus" ? histPct : null);
+
+    // Stap: wake-up (alleen als geconfigureerd)
+    if (device.ev_wake_button) {
+      const wakeEl = Math.round(guard.wake_elapsed_s ?? 0);
+      const wakeDet = state === "sleeping"
+        ? `wekken… ${wakeEl}s / 15s`
+        : (stepStatus("wake") === "done" ? "wakker ✓" : "");
+      html += step("wake", "Tesla wakker maken", wakeDet,
+        state === "sleeping" ? Math.min(100, Math.round(wakeEl / 15 * 100)) : null);
+    }
+
+    // Stap: laden starten
+    const startDet = state === "charging"
+      ? (guard.last_sent_amps != null ? `${guard.last_sent_amps} A` : "")
+      : "";
+    html += step("start", "Laden starten", startDet);
+
+    html += `</div>`;
+    return html;
+  }
 
   // ------------------------------------------------------------------ //
   //  Modal — persistente DOM-node, nooit door _render() gewist           //
@@ -1807,7 +1997,7 @@ class PeakGuardPanel extends HTMLElement {
         }
         .btn-inline-warning:hover { background: #f57f17; }
 
-        /* EV debounce indicator */
+        /* EV debounce / step indicator */
         .ev-debounce-bar-wrap {
           margin-top: 6px;
         }
@@ -1824,6 +2014,41 @@ class PeakGuardPanel extends HTMLElement {
           background: linear-gradient(90deg, #f57c00, #ffb74d);
           transition: width 0.5s ease;
         }
+
+        /* EV evaluatie-checklist in info-popup */
+        .ev-checklist {
+          margin-top: 14px;
+        }
+        .ev-checklist-title {
+          font-size: .75em; font-weight: 700; text-transform: uppercase;
+          letter-spacing: .05em; color: var(--secondary-text-color,#757575);
+          margin-bottom: 8px;
+        }
+        .ev-checklist-step {
+          display: flex; align-items: flex-start; gap: 8px;
+          padding: 5px 0; font-size: .86em;
+          border-bottom: 1px solid var(--divider-color,#f0f0f0);
+        }
+        .ev-checklist-step:last-child { border-bottom: none; }
+        .ev-step-icon { flex-shrink: 0; width: 18px; text-align: center; }
+        .ev-step-body { flex: 1; }
+        .ev-step-label { line-height: 1.4; }
+        .ev-step-detail {
+          font-size: .82em; color: var(--secondary-text-color,#888);
+          margin-top: 2px;
+        }
+        .ev-step-bar-wrap {
+          margin-top: 4px; width: 100%; height: 4px; border-radius: 2px;
+          background: #ffe0b2; overflow: hidden;
+        }
+        .ev-step-bar-fill {
+          height: 100%; border-radius: 2px;
+          background: linear-gradient(90deg, #f57c00, #ffb74d);
+        }
+        .ev-checklist-step.done  .ev-step-label { color: var(--primary-text-color,#212121); }
+        .ev-checklist-step.active .ev-step-label { color: #f57c00; font-weight: 600; }
+        .ev-checklist-step.blocked .ev-step-label { color: #c62828; font-weight: 600; }
+        .ev-checklist-step.pending .ev-step-label { color: var(--secondary-text-color,#aaa); }
 
         .status-row {
           display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
