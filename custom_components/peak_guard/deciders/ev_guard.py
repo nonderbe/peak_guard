@@ -134,13 +134,18 @@ class EVGuard:
     def cable_connected(self, device: CascadeDevice) -> bool:
         """
         Geeft True als de laadkabel aangesloten is, of als er geen kabelentity
-        geconfigureerd is.
+        expliciet geconfigureerd is.
 
         Truthy-states: on, true, connected, charging, complete, fully_charged,
-        pending, 1 — of een numerieke waarde > 0.
+        pending, stopped, starting, nopower, 1 — of een numerieke waarde > 0.
+        "stopped"/"starting"/"nopower" zijn Tesla-laderstaten waarbij de kabel
+        WEL aangesloten is maar het laden tijdelijk gestopt/gepauzeerd is.
         Bij unavailable/unknown: True (niet blokkeren bij tijdelijke storing).
         """
-        cable_entity = device.ev_cable_entity or DEFAULT_EV_CABLE_ENTITY
+        # Gebruik alleen de expliciet geconfigureerde kabelentity.
+        # Geen fallback op DEFAULT_EV_CABLE_ENTITY: als de gebruiker geen kabel-
+        # sensor heeft ingesteld, nemen we aan dat de kabel aangesloten is.
+        cable_entity = device.ev_cable_entity
         if not cable_entity:
             return True
 
@@ -157,8 +162,12 @@ class EVGuard:
         if s in ("unavailable", "unknown", ""):
             return True
 
+        # Truthy-states: kabel fysiek aangesloten (ook als opladen gepauzeerd is).
+        # "stopped" / "starting" / "nopower" zijn Tesla-laderstaten waarbij
+        # de kabel WEL aangesloten is maar het laden (tijdelijk) gestopt is.
         CABLE_ON = {"on", "true", "connected", "charging", "complete",
-                    "fully_charged", "pending", "1"}
+                    "fully_charged", "pending", "1",
+                    "stopped", "starting", "nopower"}
         if s in CABLE_ON:
             return True
 

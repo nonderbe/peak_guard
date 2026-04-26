@@ -394,6 +394,13 @@ class SharedCapacityState:
                 for e in self.store.get_all_entries()
                 if self._entry_in_current_month(e, now)
             }
+            # Voeg ook het lopende open kwartier toe. Zonder deze stap berekent
+            # _recalc_hypo() de hypothetische piek als enkel extra_dict (de
+            # vermeden energie) zonder de basisbelasting van dat kwartier —
+            # waardoor hypo < actual_peak en besparing altijd 0 blijft.
+            q_start = self.calculator._current_quarter_start
+            if q_start is not None:
+                actual_quarters.setdefault(q_start, self.current_quarter_kw)
             self._peak_tracker.set_context(
                 actual_quarters=actual_quarters,
                 actual_monthly_peak=self.monthly_peak_kw or 0.0,
