@@ -52,6 +52,10 @@ EV_MIN_OFF_DURATION_S: float = 300.0    # 5 minuten
 # Maximale wachttijd (seconden) om te wachten tot de EV wakker is na wake-up.
 EV_WAKE_TIMEOUT_S: float = 15.0
 
+# Retry-gedrag voor EV schakelaarcommando's (bv. "Command was unsuccessful" van Tesla API).
+EV_CMD_MAX_RETRIES: int = 2        # 2 extra pogingen = 3 totaal
+EV_CMD_RETRY_DELAY_S: float = 3.0  # seconden wachten tussen pogingen
+
 # Globale rate-limiter: maximale EV-service calls per rollend venster.
 EV_RATE_LIMIT_MAX_CALLS: int = 12
 EV_RATE_LIMIT_WINDOW_S: float = 600.0   # 10 minuten

@@ -76,6 +76,14 @@ class BaseDecider:
     #  Hulpfuncties                                                        #
     # ------------------------------------------------------------------ #
 
+    def _warn(self, msg: str, *args) -> None:
+        """Log een waarschuwing én sla hem op in de GUI-buffer via EVGuard."""
+        _LOGGER.warning(msg, *args)
+        try:
+            self.ev_guard.add_warning(msg % args if args else msg)
+        except TypeError:
+            self.ev_guard.add_warning(str(msg))
+
     def _sensor_value(self, entity_id: Optional[str]) -> Optional[float]:
         """Lees een float-waarde uit een HA sensor state. Geeft None bij onbekend/unavailable."""
         if not entity_id:
@@ -148,7 +156,7 @@ class BaseDecider:
             [d for d in cascade if d.enabled], key=lambda x: x.priority
         )
         label = "PIEK" if cascade_type == "peak" else "SOLAR"
-        _LOGGER.warning(
+        self._warn(
             "Peak Guard [%s cascade]: start — overschot=%.0f W, %d apparaat/apparaten "
             "(prioriteitsvolgorde: %s)",
             label, excess, len(sorted_devices),
@@ -157,7 +165,7 @@ class BaseDecider:
         remaining = excess
         for device in sorted_devices:
             if remaining <= 0:
-                _LOGGER.warning(
+                self._warn(
                     "Peak Guard [%s cascade]: overschot opgelost (0 W resterend) — "
                     "verdere apparaten niet verwerkt",
                     label,
@@ -179,18 +187,18 @@ class BaseDecider:
                     label, device.name, abs(handled), remaining,
                 )
             else:
-                _LOGGER.warning(
+                self._warn(
                     "Peak Guard [%s cascade]:   · '%s' — geen actie: %s",
                     label, device.name, self._last_skip_reason or "zie detail-logs",
                 )
         if remaining > 0:
-            _LOGGER.warning(
+            self._warn(
                 "Peak Guard [%s cascade]: klaar — nog %.0f W overschot onverwerkt "
                 "(alle apparaten doorlopen)",
                 label, remaining,
             )
         else:
-            _LOGGER.warning(
+            self._warn(
                 "Peak Guard [%s cascade]: klaar — overschot volledig verwerkt ✓",
                 label,
             )
@@ -210,7 +218,7 @@ class BaseDecider:
         """
         state = self.hass.states.get(device.entity_id)
         if state is None:
-            _LOGGER.warning(
+            self._warn(
                 "Peak Guard: entity '%s' ('%s') niet gevonden in HA — apparaat overgeslagen",
                 device.entity_id, device.name,
             )
@@ -224,9 +232,18 @@ class BaseDecider:
                         entity_id=device.entity_id,
                         original_state=state.state,
                     )
-                await self.hass.services.async_call(
-                    "switch", "turn_off", {"entity_id": device.entity_id}, blocking=True
-                )
+                try:
+                    await self.hass.services.async_call(
+                        "switch", "turn_off", {"entity_id": device.entity_id}, blocking=True
+                    )
+                except HomeAssistantError as err:
+                    self._warn(
+                        "Peak Guard: '%s' niet bereikbaar voor turn_off — "
+                        "snapshot teruggedraaid, volgende cyclus opnieuw (%s)",
+                        device.name, err,
+                    )
+                    snapshots.pop(device.entity_id, None)
+                    return excess
                 self._track_action(device.entity_id, "switch.turn_off")
                 _LOGGER.info(
                     "Peak Guard: → '%s' UITgeschakeld "
@@ -256,9 +273,18 @@ class BaseDecider:
                         entity_id=device.entity_id,
                         original_state=state.state,
                     )
-                await self.hass.services.async_call(
-                    "switch", "turn_on", {"entity_id": device.entity_id}, blocking=True
-                )
+                try:
+                    await self.hass.services.async_call(
+                        "switch", "turn_on", {"entity_id": device.entity_id}, blocking=True
+                    )
+                except HomeAssistantError as err:
+                    self._warn(
+                        "Peak Guard: '%s' niet bereikbaar voor turn_on — "
+                        "snapshot teruggedraaid, volgende cyclus opnieuw (%s)",
+                        device.name, err,
+                    )
+                    snapshots.pop(device.entity_id, None)
+                    return excess
                 self._track_action(device.entity_id, "switch.turn_on")
                 _LOGGER.info(
                     "Peak Guard: → '%s' AANgeschakeld "
@@ -342,7 +368,7 @@ class BaseDecider:
         """
         state = self.hass.states.get(device.entity_id)
         if state is None:
-            _LOGGER.warning(
+            self._warn(
                 "Peak Guard: kan '%s' niet herstellen — entity niet gevonden",
                 device.name,
             )
@@ -430,7 +456,7 @@ class BaseDecider:
                 )
 
         except HomeAssistantError as err:
-            _LOGGER.warning(
+            self._warn(
                 "Peak Guard: '%s' niet bereikbaar bij herstel — "
                 "volgende cyclus opnieuw proberen (%s)",
                 device.name, err,

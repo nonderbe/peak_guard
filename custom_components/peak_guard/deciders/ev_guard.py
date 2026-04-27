@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Dict, Optional
 
@@ -42,6 +43,8 @@ from ..models import (
     EV_MIN_UPDATE_INTERVAL_S,
     EV_RATE_LIMIT_MAX_CALLS,
     EV_RATE_LIMIT_WINDOW_S,
+    EV_CMD_MAX_RETRIES,
+    EV_CMD_RETRY_DELAY_S,
     EV_VOLTS_1PHASE,
     EV_VOLTS_3PHASE,
     EV_WAKE_TIMEOUT_S,
@@ -71,6 +74,7 @@ class EVGuard:
         self._iteration_actions = iteration_actions   # gedeelde mutable lijst
         self._guards: Dict[str, EVDeviceGuard] = {}
         self._rate_limiter = EVRateLimiter()
+        self._recent_warnings: deque = deque(maxlen=20)
         # Wordt gezet door apply_action; BaseDecider leest dit na de aanroep.
         self.last_skip_reason: str = ""
 
@@ -103,7 +107,7 @@ class EVGuard:
         """
         if self._rate_limiter.is_allowed():
             return True
-        _LOGGER.warning(
+        self._warn(
             "Peak Guard EV '%s': service call OVERGESLAGEN wegens globale rate-limiter "
             "(%d/%d calls in %.0f s). Reden: %s",
             device_name,
@@ -126,6 +130,35 @@ class EVGuard:
         if value is not None:
             entry["value"] = value
         self._iteration_actions.append(entry)
+
+    # ------------------------------------------------------------------ #
+    #  GUI-waarschuwingsbuffer                                            #
+    # ------------------------------------------------------------------ #
+
+    def _warn(self, msg: str, *args) -> None:
+        """Log een waarschuwing én sla hem op in de GUI-buffer."""
+        _LOGGER.warning(msg, *args)
+        try:
+            self._recent_warnings.append({
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "message": msg % args if args else msg,
+            })
+        except TypeError:
+            self._recent_warnings.append({
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "message": str(msg),
+            })
+
+    def add_warning(self, message: str) -> None:
+        """Sla een waarschuwing op in de GUI-buffer (zonder opnieuw te loggen)."""
+        self._recent_warnings.append({
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "message": message,
+        })
+
+    @property
+    def recent_warnings(self) -> list:
+        return list(self._recent_warnings)
 
     # ------------------------------------------------------------------ #
     #  Kabeldetectie                                                       #
@@ -332,7 +365,7 @@ class EVGuard:
 
         soc_entity = device.ev_soc_entity
         if not soc_entity:
-            _LOGGER.warning(
+            self._warn(
                 "Peak Guard EV: '%s' SOC-limiet NIET aangepast — "
                 "geen soc_entity geconfigureerd in de wizard (stap 3: SoC-limiet entiteit)",
                 device.name,
@@ -341,19 +374,19 @@ class EVGuard:
 
         if override:
             target_soc = float(device.ev_max_soc)
-            _LOGGER.warning(
+            self._warn(
                 "Peak Guard EV: '%s' SOC-limiet instellen op %.0f%% via '%s'",
                 device.name, target_soc, soc_entity,
             )
         else:
             target_soc = float(original_soc) if original_soc is not None else 80.0
             if original_soc is None:
-                _LOGGER.warning(
+                self._warn(
                     "Peak Guard EV: '%s' originele laadlimiet was onbekend bij activering "
                     "(Tesla sliep of rapporteerde 'none') — hersteld naar standaard 80%%.",
                     device.name,
                 )
-            _LOGGER.warning(
+            self._warn(
                 "Peak Guard EV: '%s' SOC-limiet herstellen naar %.0f%% via '%s'",
                 device.name, target_soc, soc_entity,
             )
@@ -398,7 +431,7 @@ class EVGuard:
 
             sw_state = self.hass.states.get(sw_entity)
             if sw_state is None:
-                _LOGGER.warning(
+                self._warn(
                     "Peak Guard EV: schakelaar '%s' niet gevonden bij herstel", sw_entity
                 )
                 return False
@@ -527,7 +560,7 @@ class EVGuard:
                 return True
 
         except HomeAssistantError as err:
-            _LOGGER.warning(
+            self._warn(
                 "Peak Guard EV: '%s' offline of niet bereikbaar bij herstel — "
                 "volgende cyclus opnieuw proberen (%s)",
                 device.name, err,
@@ -576,7 +609,7 @@ class EVGuard:
 
         sw_state = self.hass.states.get(sw_entity)
         if sw_state is None:
-            _LOGGER.warning("Peak Guard EV: schakelaar '%s' niet gevonden", sw_entity)
+            self._warn("Peak Guard EV: schakelaar '%s' niet gevonden", sw_entity)
             return excess
 
         sw_on = sw_state.state == "on"
@@ -644,21 +677,52 @@ class EVGuard:
                 if not self._rate_check(device.name, "turn_off voor piekbeperking"):
                     return excess
 
-                await self.hass.services.async_call(
-                    "switch", "turn_off", {"entity_id": sw_entity}, blocking=True
-                )
+                turn_off_ok = False
+                _last_turn_off_err: Optional[HomeAssistantError] = None
+                for _attempt in range(EV_CMD_MAX_RETRIES + 1):
+                    try:
+                        await self.hass.services.async_call(
+                            "switch", "turn_off", {"entity_id": sw_entity}, blocking=True
+                        )
+                        turn_off_ok = True
+                        break
+                    except HomeAssistantError as ha_err:
+                        _last_turn_off_err = ha_err
+                        if _attempt < EV_CMD_MAX_RETRIES:
+                            self._warn(
+                                "Peak Guard EV peak: '%s' turn_off mislukt "
+                                "(poging %d/%d): %s — over %.0f s opnieuw proberen",
+                                device.name, _attempt + 1, EV_CMD_MAX_RETRIES + 1,
+                                ha_err, EV_CMD_RETRY_DELAY_S,
+                            )
+                            await asyncio.sleep(EV_CMD_RETRY_DELAY_S)
+
+                if not turn_off_ok:
+                    self._warn(
+                        "Peak Guard EV peak: '%s' turn_off definitief mislukt na %d pogingen: %s "
+                        "— piekbeperking niet uitgevoerd, volgende cyclus opnieuw proberen",
+                        device.name, EV_CMD_MAX_RETRIES + 1, _last_turn_off_err,
+                    )
+                    return excess
+
                 self._record_call()
                 self._track_action(sw_entity, "switch.turn_off")
 
                 if cur_entity and current_a is not None:
                     if self._rate_check(device.name, "set_value min_a na turn_off"):
-                        await self.hass.services.async_call(
-                            "number", "set_value",
-                            {"entity_id": cur_entity, "value": min_a},
-                            blocking=True,
-                        )
-                        self._record_call()
-                        self._track_action(cur_entity, "number.set_value", min_a)
+                        try:
+                            await self.hass.services.async_call(
+                                "number", "set_value",
+                                {"entity_id": cur_entity, "value": min_a},
+                                blocking=True,
+                            )
+                            self._record_call()
+                            self._track_action(cur_entity, "number.set_value", min_a)
+                        except HomeAssistantError as err:
+                            self._warn(
+                                "Peak Guard EV peak: '%s' set_value min_a mislukt na turn_off: %s",
+                                device.name, err,
+                            )
 
                 _LOGGER.info(
                     "Peak Guard EV peak: '%s' uitgeschakeld "
@@ -728,11 +792,18 @@ class EVGuard:
                 ):
                     return excess - actual_reduction_w
 
-                await self.hass.services.async_call(
-                    "number", "set_value",
-                    {"entity_id": cur_entity, "value": float(new_a)},
-                    blocking=True,
-                )
+                try:
+                    await self.hass.services.async_call(
+                        "number", "set_value",
+                        {"entity_id": cur_entity, "value": float(new_a)},
+                        blocking=True,
+                    )
+                except HomeAssistantError as err:
+                    self._warn(
+                        "Peak Guard EV peak: '%s' set_value %d A mislukt: %s",
+                        device.name, new_a, err,
+                    )
+                    return excess - actual_reduction_w
                 self._record_call()
                 self._track_action(cur_entity, "number.set_value", float(new_a))
                 _LOGGER.info(
@@ -789,7 +860,7 @@ class EVGuard:
                 # meld het overschot als onverwerkt. Zonder deze check berekent de code
                 # een fictief verbruik (new_a × voltage) en denkt de cascade ten onrechte
                 # dat het overschot volledig verwerkt is.
-                _LOGGER.warning(
+                self._warn(
                     "Peak Guard [SOLAR]: '%s' — laadkabel ontkoppeld TIJDENS het laden "
                     "('%s' = '%s') — schakelaar uitzetten",
                     device.name, cable_entity,
@@ -803,7 +874,7 @@ class EVGuard:
                         self._record_call()
                         self._track_action(sw_entity, "switch.turn_off")
                     except HomeAssistantError as err:
-                        _LOGGER.warning(
+                        self._warn(
                             "Peak Guard [SOLAR]: '%s' — turn_off na kabelontkoppeling mislukt: %s",
                             device.name, err,
                         )
@@ -819,7 +890,7 @@ class EVGuard:
                 guard.state = EVState.CABLE_DISCONNECTED
                 guard.skip_reason = f"laadkabel niet aangesloten ({cable_entity})"
                 self.last_skip_reason = guard.skip_reason
-                _LOGGER.warning(
+                self._warn(
                     "Peak Guard [SOLAR]: '%s' — laadkabel NIET aangesloten "
                     "('%s' = '%s') — laden geblokkeerd",
                     device.name, cable_entity,
@@ -935,7 +1006,7 @@ class EVGuard:
                         f"({history_secs:.0f}/{EV_DEBOUNCE_STABLE_S:.0f}s)"
                     )
                     self.last_skip_reason = guard.skip_reason
-                    _LOGGER.warning(
+                    self._warn(
                         "Peak Guard [SOLAR]: '%s' NIET geactiveerd — "
                         "surplus-geschiedenis aan het opbouwen "
                         "(%.0f/%.0f s, huidig=%.0f W, percentiel=%d%%)",
@@ -1020,7 +1091,7 @@ class EVGuard:
                             blocking=False,
                         )
                     except Exception as wake_err:
-                        _LOGGER.warning(
+                        self._warn(
                             "Peak Guard [SOLAR]: '%s' — wake-up aanroep mislukt: %s",
                             device.name, wake_err,
                         )
@@ -1048,7 +1119,7 @@ class EVGuard:
                         guard.wake_requested_at = None
                         guard.skip_reason = "Tesla niet wakker na wake-up poging"
                         self.last_skip_reason = guard.skip_reason
-                        _LOGGER.warning(
+                        self._warn(
                             "Peak Guard [SOLAR]: '%s' — Tesla niet wakker na %.0f s "
                             "('%s' = '%s') — laden uitgesteld tot volgende cyclus",
                             device.name, EV_WAKE_TIMEOUT_S, status_entity, status_val,
@@ -1083,7 +1154,7 @@ class EVGuard:
                                 device.name, _snap_now.original_soc,
                             )
                         except (ValueError, TypeError):
-                            _LOGGER.warning(
+                            self._warn(
                                 "Peak Guard EV: '%s' laadlimiet onleesbaar ('%s') na herbevraging"
                                 " — SOC-override wordt toegepast maar kan bij herstel niet worden"
                                 " hersteld. Controleer manueel de laadlimiet in de Tesla-app.",
@@ -1091,17 +1162,38 @@ class EVGuard:
                             )
                 await self._set_soc_override(device, override=True)
 
-                try:
-                    await self.hass.services.async_call(
-                        "switch", "turn_on", {"entity_id": sw_entity}, blocking=True
+                turn_on_ok = False
+                _last_turn_on_err: Optional[HomeAssistantError] = None
+                for _attempt in range(EV_CMD_MAX_RETRIES + 1):
+                    try:
+                        await self.hass.services.async_call(
+                            "switch", "turn_on", {"entity_id": sw_entity}, blocking=True
+                        )
+                        turn_on_ok = True
+                        break
+                    except HomeAssistantError as ha_err:
+                        _last_turn_on_err = ha_err
+                        if _attempt < EV_CMD_MAX_RETRIES:
+                            self._warn(
+                                "Peak Guard [SOLAR]: '%s' turn_on mislukt "
+                                "(poging %d/%d): %s — over %.0f s opnieuw proberen",
+                                device.name, _attempt + 1, EV_CMD_MAX_RETRIES + 1,
+                                ha_err, EV_CMD_RETRY_DELAY_S,
+                            )
+                            await asyncio.sleep(EV_CMD_RETRY_DELAY_S)
+
+                if not turn_on_ok:
+                    self._warn(
+                        "Peak Guard [SOLAR]: '%s' turn_on definitief mislukt na %d pogingen: %s "
+                        "— SOC herstellen naar originele waarde en volgende cyclus opnieuw proberen",
+                        device.name, EV_CMD_MAX_RETRIES + 1, _last_turn_on_err,
                     )
-                except HomeAssistantError as ha_err:
-                    _LOGGER.warning(
-                        "Peak Guard [SOLAR]: '%s' niet bereikbaar voor turn_on — "
-                        "volgende cyclus opnieuw proberen (%s)",
-                        device.name, ha_err,
+                    await self._set_soc_override(
+                        device, override=False,
+                        original_soc=_snap_now.original_soc if _snap_now else None,
                     )
                     return excess
+
                 self._record_call()
                 self._track_action(sw_entity, "switch.turn_on")
                 guard.state = EVState.CHARGING
@@ -1112,15 +1204,22 @@ class EVGuard:
 
                 if cur_entity:
                     if self._rate_check(device.name, f"set_value {new_a} A bij turn_on"):
-                        await self.hass.services.async_call(
-                            "number", "set_value",
-                            {"entity_id": cur_entity, "value": float(new_a)},
-                            blocking=True,
-                        )
-                        self._record_call()
-                        self._track_action(cur_entity, "number.set_value", float(new_a))
-                        guard.last_sent_amps = float(new_a)
-                        guard.last_current_update = now
+                        try:
+                            await self.hass.services.async_call(
+                                "number", "set_value",
+                                {"entity_id": cur_entity, "value": float(new_a)},
+                                blocking=True,
+                            )
+                            self._record_call()
+                            self._track_action(cur_entity, "number.set_value", float(new_a))
+                            guard.last_sent_amps = float(new_a)
+                            guard.last_current_update = now
+                        except HomeAssistantError as err:
+                            self._warn(
+                                "Peak Guard [SOLAR]: '%s' set_value %d A mislukt bij turn_on: %s "
+                                "— laden gestart, stroominstelling volgende cyclus opnieuw",
+                                device.name, new_a, err,
+                            )
 
                 actual_consumption_w = new_a * voltage
                 _LOGGER.info(
@@ -1198,11 +1297,19 @@ class EVGuard:
         ):
             return excess - actual_consumption_w
 
-        await self.hass.services.async_call(
-            "number", "set_value",
-            {"entity_id": cur_entity, "value": float(new_a)},
-            blocking=True,
-        )
+        try:
+            await self.hass.services.async_call(
+                "number", "set_value",
+                {"entity_id": cur_entity, "value": float(new_a)},
+                blocking=True,
+            )
+        except HomeAssistantError as err:
+            self._warn(
+                "Peak Guard [SOLAR]: '%s' set_value %d A mislukt: %s "
+                "— stroomaanpassing volgende cyclus opnieuw",
+                device.name, new_a, err,
+            )
+            return excess - actual_consumption_w
         self._record_call()
         self._track_action(cur_entity, "number.set_value", float(new_a))
         _LOGGER.info(

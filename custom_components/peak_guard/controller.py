@@ -204,6 +204,7 @@ class PeakGuardController:
                     "window_s":        EV_RATE_LIMIT_WINDOW_S,
                     "max_calls":       EV_RATE_LIMIT_MAX_CALLS,
                 },
+                "warnings": self._ev_guard_decider.recent_warnings,
             },
         }
 

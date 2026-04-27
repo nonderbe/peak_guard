@@ -317,6 +317,8 @@ class PeakGuardPanel extends HTMLElement {
 
         ${this._renderStatusCards()}
 
+        ${this._renderWarnings()}
+
         <nav class="tabs">
           <button class="tab ${this._activeTab === "peak" ? "active" : ""}" data-tab="peak">
             ⚡ Piekstroom vermijden
@@ -341,6 +343,30 @@ class PeakGuardPanel extends HTMLElement {
     }
 
     this._attachMainEvents();
+  }
+
+  // ------------------------------------------------------------------ //
+  //  Waarschuwingspaneel                                                 //
+  // ------------------------------------------------------------------ //
+
+  _renderWarnings() {
+    const warnings = this._data?.status?.warnings || [];
+    if (!warnings.length) return '';
+    const items = [...warnings].reverse().map(w => {
+      const ts = new Date(w.ts);
+      const timeStr = ts.toLocaleTimeString('nl-BE', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      return `<div class="warning-item">
+        <span class="warning-ts">${timeStr}</span>
+        <span class="warning-msg">${w.message.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</span>
+      </div>`;
+    }).join('');
+    return `
+      <div class="warning-panel">
+        <div class="warning-panel-header">
+          ⚠ ${warnings.length} recente waarschuwing${warnings.length !== 1 ? 'en' : ''}
+        </div>
+        <div class="warning-list">${items}</div>
+      </div>`;
   }
 
   // ------------------------------------------------------------------ //
@@ -2049,6 +2075,28 @@ class PeakGuardPanel extends HTMLElement {
         .ev-checklist-step.active .ev-step-label { color: #f57c00; font-weight: 600; }
         .ev-checklist-step.blocked .ev-step-label { color: #c62828; font-weight: 600; }
         .ev-checklist-step.pending .ev-step-label { color: var(--secondary-text-color,#aaa); }
+
+        .warning-panel {
+          background: #fff3e0; border: 1px solid #ffb300;
+          border-radius: 10px; margin-bottom: 20px; overflow: hidden;
+        }
+        .warning-panel-header {
+          display: flex; align-items: center; gap: 8px;
+          padding: 10px 16px; font-weight: 600; font-size: .9em;
+          color: #e65100;
+        }
+        .warning-list {
+          border-top: 1px solid #ffe082; max-height: 180px; overflow-y: auto;
+        }
+        .warning-item {
+          display: flex; gap: 12px; padding: 6px 16px; font-size: .82em;
+          border-bottom: 1px solid #fff8e1; align-items: baseline;
+        }
+        .warning-item:last-child { border-bottom: none; }
+        .warning-ts {
+          color: #999; flex-shrink: 0; font-family: monospace; font-size: .95em;
+        }
+        .warning-msg { color: #37474f; line-height: 1.4; }
 
         .status-row {
           display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
