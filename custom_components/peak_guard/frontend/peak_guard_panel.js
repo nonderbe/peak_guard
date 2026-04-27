@@ -25,6 +25,7 @@ class PeakGuardPanel extends HTMLElement {
     // Countdown timer state
     this._countdownInterval = null;  // setInterval handle
     this._nextCheckAt = null;        // Date wanneer de volgende check verwacht wordt
+    this._dataFetchedAt = null;      // Tijdstip waarop de laatste API-response ontvangen werd
   }
 
   // ------------------------------------------------------------------ //
@@ -79,6 +80,7 @@ class PeakGuardPanel extends HTMLElement {
       const resp = await this._hass.fetchWithAuth("/api/peak_guard/cascade");
       if (resp.ok) {
         this._data = await resp.json();
+        this._dataFetchedAt = Date.now();
         this._log('_fetchData() data ontvangen. modalVisible=' + this._modalVisible);
         // Bereken wanneer de volgende controller-check verwacht wordt
         this._recalcNextCheck();
@@ -111,11 +113,55 @@ class PeakGuardPanel extends HTMLElement {
   _tickCountdown() {
     const el = this.shadowRoot?.querySelector("#countdown-val");
     const bar = this.shadowRoot?.querySelector("#countdown-bar");
-    if (!el || !this._nextCheckAt || !this._data?.status?.interval_s) return;
-    const secLeft = Math.max(0, Math.round((this._nextCheckAt - Date.now()) / 1000));
-    const intervalS = this._data.status.interval_s;
-    el.textContent = secLeft > 0 ? `${secLeft}s` : "bezig…";
-    if (bar) bar.style.width = `${Math.round((1 - secLeft / intervalS) * 100)}%`;
+    if (el && this._nextCheckAt && this._data?.status?.interval_s) {
+      const secLeft = Math.max(0, Math.round((this._nextCheckAt - Date.now()) / 1000));
+      const intervalS = this._data.status.interval_s;
+      el.textContent = secLeft > 0 ? `${secLeft}s` : "bezig…";
+      if (bar) bar.style.width = `${Math.round((1 - secLeft / intervalS) * 100)}%`;
+    }
+    this._tickEVDebounce();
+  }
+
+  // Werkt EV-debounce timers elke seconde live bij zonder API-poll
+  _tickEVDebounce() {
+    if (!this._data || !this._dataFetchedAt) return;
+    const elapsed = (Date.now() - this._dataFetchedAt) / 1000;
+    const DEBOUNCE_TARGET = 20;
+
+    ["peak", "inject"].forEach((cascadeType) => {
+      const devices = this._data[cascadeType] || [];
+      devices.forEach((device, index) => {
+        if (device.action_type !== "ev_charger") return;
+        const guard = this._data?.status?.ev_guards?.[device.id];
+        if (!guard || guard.state !== "waiting_for_stable_surplus") return;
+
+        const wrapEl  = this.shadowRoot?.querySelector(`#ev-debounce-${cascadeType}-${index}`);
+        const fillEl  = this.shadowRoot?.querySelector(`#ev-debounce-fill-${cascadeType}-${index}`);
+        const labelEl = this.shadowRoot?.querySelector(`#ev-debounce-label-${cascadeType}-${index}`);
+        if (!wrapEl || !labelEl) return;
+
+        const liveSecs   = Math.round((guard.history_secs ?? 0) + elapsed);
+        const pendingAmps = guard.pending_amps != null ? ` → ${guard.pending_amps} A` : "";
+        let label, pct;
+
+        if (liveSecs < DEBOUNCE_TARGET) {
+          pct   = Math.min(99, Math.round(liveSecs / DEBOUNCE_TARGET * 100));
+          label = `☀️ Overschot aan het meten… ${liveSecs}/${DEBOUNCE_TARGET}s${pendingAmps}`;
+        } else {
+          // Criterium bereikt — wacht op de eerstvolgende loop-iteratie die de EV start
+          pct = 100;
+          const nextSecs = this._nextCheckAt
+            ? Math.max(0, Math.round((this._nextCheckAt - Date.now()) / 1000))
+            : null;
+          const waitStr = nextSecs != null ? ` over ~${nextSecs}s` : "";
+          label = `☀️ Meting klaar${pendingAmps} — cyclus start${waitStr}`;
+        }
+
+        wrapEl.style.display = "";
+        labelEl.textContent = label;
+        if (fillEl) { fillEl.style.display = ""; fillEl.style.width = `${pct}%`; }
+      });
+    });
   }
 
   // Roept de force_check API aan en reset de countdown
@@ -878,10 +924,14 @@ class PeakGuardPanel extends HTMLElement {
       return { label: `💤 Tesla aan het wekken… ${elapsed}s`, pct };
     }
     if (state === "waiting_for_stable_surplus") {
-      const secs = Math.round(guard.history_secs ?? 0);
-      const pct  = Math.min(100, Math.round(secs / 20 * 100));
-      const target = guard.pending_amps != null ? ` → ${guard.pending_amps} A` : "";
-      return { label: `☀️ Overschot aan het meten… ${secs}/20s${target}`, pct };
+      const secs        = Math.round(guard.history_secs ?? 0);
+      const pct         = Math.min(100, Math.round(secs / 20 * 100));
+      const pendingAmps = guard.pending_amps != null ? ` → ${guard.pending_amps} A` : "";
+      if (secs < 20) {
+        return { label: `☀️ Overschot aan het meten… ${secs}/20s${pendingAmps}`, pct };
+      } else {
+        return { label: `☀️ Meting klaar${pendingAmps} — wacht op cyclus`, pct: 100 };
+      }
     }
     if (state === "cable_disconnected" || skip.includes("kabel")) {
       return { label: "🔌 Laadkabel niet aangesloten — wachten tot die erin gaat", pct: null };
@@ -1014,9 +1064,14 @@ class PeakGuardPanel extends HTMLElement {
     // Stap: debounce
     const histSecs = Math.round(guard.history_secs ?? 0);
     const histPct  = Math.min(100, Math.round(histSecs / 20 * 100));
-    const debDet   = state === "waiting_for_stable_surplus"
-      ? `${histSecs}/20s opgebouwd`
-      : (stepStatus("debounce") === "done" ? "stabiel ✓" : "");
+    let debDet;
+    if (state === "waiting_for_stable_surplus") {
+      debDet = histSecs < 20
+        ? `${histSecs}/20s opgebouwd`
+        : `klaar — wacht op volgende cyclus (loop elke ${Math.round(this._data?.status?.interval_s ?? 60)}s)`;
+    } else {
+      debDet = stepStatus("debounce") === "done" ? "stabiel ✓" : "";
+    }
     html += step("debounce", "Overschot stabiel (20s meting)", debDet,
       state === "waiting_for_stable_surplus" ? histPct : null);
 
