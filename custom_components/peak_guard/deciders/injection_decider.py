@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Callable, Dict, List
 
 from homeassistant.core import HomeAssistant
 
+from ..const import ACTION_EV_CHARGER
 from ..models import CascadeDevice, DeviceSnapshot
 from .base import BaseDecider
 
@@ -118,6 +119,14 @@ class InjectionDecider(BaseDecider):
             return
         # Herstel één apparaat per cyclus (laagste prioriteit eerst)
         device, snapshot = snapshots_to_restore[0]
+
+        # EV-lader: verlaag eerst de laadstroom vóór een volledige stop.
+        # Zo blijft de wagen laden bij een tijdelijk dalend solar-overschot.
+        if device.action_type == ACTION_EV_CHARGER and consumption > 0:
+            throttled = await self.ev_guard.throttle_down_solar(device, consumption)
+            if throttled:
+                return  # stroom verlaagd — EV blijft laden, geen verdere actie
+
         restored = await self._restore_device(device, snapshot, cascade_type="solar")
         if restored:
             del self._snapshots[device.entity_id]

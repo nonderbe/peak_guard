@@ -3,9 +3,10 @@ Peak Guard — deciders/ev_guard.py
 
 Beheert de volledige EV-lader state machine, rate-limiting en debounce-logica.
 
-Publieke API (aangeroepen vanuit BaseDecider):
+Publieke API (aangeroepen vanuit BaseDecider / InjectionDecider):
   apply_action(device, excess, snapshots, cascade_type, peak_tracker, solar_tracker) -> float
   restore(device, snapshot, peak_tracker, solar_tracker) -> bool
+  throttle_down_solar(device, consumption) -> bool
 
 Properties (aangeroepen vanuit controller voor to_dict):
   guards      -> Dict[str, EVDeviceGuard]
@@ -574,6 +575,101 @@ class EVGuard:
             return False
 
         return False
+
+    # ------------------------------------------------------------------ #
+    #  Zachte stop: laadstroom verlagen vóór volledige stop               #
+    # ------------------------------------------------------------------ #
+
+    async def throttle_down_solar(
+        self,
+        device: CascadeDevice,
+        consumption: float,
+    ) -> bool:
+        """
+        Verlaag de EV-laadstroom met het minimum dat nodig is om de grid-import
+        te elimineren, zonder de EV te stoppen.
+
+        Wordt aangeroepen vanuit InjectionDecider.check_restore() vóór de
+        volledige restore (stop), zodat een dalend solar-overschot leidt tot
+        lagere laadstroom in plaats van een abrupte stop.
+
+        Returns:
+            True  — stroom verlaagd, EV blijft laden (stop NIET uitvoeren).
+            False — stroom staat al op hw-minimum of kan niet zinvol worden
+                    verlaagd; aanroeper moet EV volledig stoppen.
+        """
+        cur_entity = device.ev_current_entity
+        if not cur_entity:
+            return False
+
+        cur_state = self.hass.states.get(cur_entity)
+        if cur_state is None:
+            return False
+
+        try:
+            current_a = float(cur_state.state)
+        except (ValueError, TypeError):
+            return False
+
+        phases  = int(device.ev_phases) if device.ev_phases else 1
+        voltage = EV_VOLTS_3PHASE if phases == 3 else EV_VOLTS_1PHASE
+        hw_min_a = float(
+            device.ev_min_current if device.ev_min_current is not None
+            else (device.min_value if device.min_value is not None else DEFAULT_EV_MIN_AMPERE)
+        )
+        max_a = float(device.max_value if device.max_value is not None else DEFAULT_EV_MAX_AMPERE)
+
+        # Hoeveel ampère moeten we reduceren om de grid-import weg te werken?
+        reduction_a = math.ceil(consumption / voltage)
+        new_a = max(int(hw_min_a), min(int(max_a), int(current_a) - reduction_a))
+
+        if new_a >= int(current_a):
+            # Al op hw-minimum of reductie niet mogelijk → aanroeper stopt EV.
+            return False
+
+        guard = self.get_guard(device.id)
+        now   = datetime.now(timezone.utc)
+
+        # GATE: minimum update-interval — geef vorige commando tijd om effect te hebben.
+        if guard.last_current_update is not None:
+            elapsed = (now - guard.last_current_update).total_seconds()
+            if elapsed < EV_MIN_UPDATE_INTERVAL_S:
+                _LOGGER.debug(
+                    "Peak Guard [SOLAR]: '%s' throttle_down OVERGESLAGEN wegens "
+                    "update-interval (%.0f s geleden, minimum %.0f s) — EV blijft voorlopig laden",
+                    device.name, elapsed, EV_MIN_UPDATE_INTERVAL_S,
+                )
+                return True  # interval nog actief: wacht, stop EV niet
+
+        # GATE: global rate limiter
+        if not self._rate_check(device.name, f"throttle_down {int(current_a)} → {new_a} A"):
+            return True  # rate-limiter vol: probeer volgende cyclus, stop EV niet
+
+        try:
+            await self.hass.services.async_call(
+                "number", "set_value",
+                {"entity_id": cur_entity, "value": float(new_a)},
+                blocking=True,
+            )
+        except HomeAssistantError as err:
+            self._warn(
+                "Peak Guard [SOLAR]: '%s' throttle_down %d A mislukt: %s — EV stoppen",
+                device.name, new_a, err,
+            )
+            return False
+
+        self._record_call()
+        self._track_action(cur_entity, "number.set_value", float(new_a))
+        guard.last_sent_amps      = float(new_a)
+        guard.last_current_update = now
+        guard.state               = EVState.CHARGING
+
+        _LOGGER.info(
+            "Peak Guard [SOLAR]: '%s' laadstroom verlaagd %d → %d A "
+            "(grid-import %.0f W, reductie %d A, %d fase(n))",
+            device.name, int(current_a), new_a, consumption, reduction_a, phases,
+        )
+        return True
 
     # ------------------------------------------------------------------ #
     #  Cascade-actie (peak-pad + solar-pad)                               #
