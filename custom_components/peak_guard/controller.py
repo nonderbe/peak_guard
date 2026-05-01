@@ -82,6 +82,9 @@ class PeakGuardController:
         # Tijdstip van de laatste loop-iteratie (UTC ISO-string, voor de GUI).
         self._last_loop_at: Optional[str] = None
 
+        # Simulatiemodus: als ingesteld, gebruikt de loop deze waarde i.p.v. de echte sensor.
+        self._simulation_consumption: Optional[float] = None
+
         # Wakeup-event: als gezet wordt de volgende loop-iteratie onmiddellijk
         # uitgevoerd zonder te wachten op het interval. Vervangt de vroegere
         # boolean _force_check — Event is race-condition-vrij: een .set() die
@@ -206,6 +209,10 @@ class PeakGuardController:
                 },
                 "warnings": self._ev_guard_decider.recent_warnings,
             },
+            "simulation": {
+                "active":        self._simulation_consumption is not None,
+                "consumption_w": self._simulation_consumption,
+            },
         }
 
     def update_cascade(self, cascade_type: str, devices: list):
@@ -241,6 +248,29 @@ class PeakGuardController:
     def trigger_wakeup(self) -> None:
         """Wek de monitoring loop onmiddellijk op, zonder te wachten op het interval."""
         self._wakeup.set()
+
+    def set_simulation(self, consumption_w: Optional[float]) -> None:
+        """Activeer of deactiveer de simulatiemodus.
+
+        consumption_w=float → simuleer dat waarde (W) als verbruik; echte sensor wordt genegeerd.
+        consumption_w=None  → terug naar echte sensor.
+        """
+        self._simulation_consumption = consumption_w
+        if consumption_w is None:
+            _LOGGER.info("Peak Guard: simulatiemodus uitgeschakeld — echte sensor actief")
+        else:
+            _LOGGER.warning(
+                "Peak Guard: simulatiemodus ACTIEF — verbruik vastgezet op %.0f W", consumption_w
+            )
+        self._wakeup.set()
+
+    @property
+    def simulation_active(self) -> bool:
+        return self._simulation_consumption is not None
+
+    @property
+    def simulation_consumption(self) -> Optional[float]:
+        return self._simulation_consumption
 
     def _ev_watched_entities(self) -> tuple:
         """Verzamel EV-entiteiten om op te luisteren.
@@ -387,7 +417,14 @@ class PeakGuardController:
                 self._last_loop_at = datetime.now(timezone.utc).isoformat()
                 # Reset iteration tracking voor beslissingslog.
                 self._iteration_actions.clear()
-                consumption = self._sensor_value(self.config.get(CONF_CONSUMPTION_SENSOR))
+                if self._simulation_consumption is not None:
+                    consumption = self._simulation_consumption
+                    _LOGGER.warning(
+                        "Peak Guard [SIMULATIE] verbruik=%.0f W (echte sensor genegeerd)",
+                        consumption,
+                    )
+                else:
+                    consumption = self._sensor_value(self.config.get(CONF_CONSUMPTION_SENSOR))
                 if consumption is not None:
                     _sensor_unavailable_count = 0   # reset bij succesvolle lezing
 

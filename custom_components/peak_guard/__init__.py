@@ -72,6 +72,50 @@ class PeakGuardForceCheckView(HomeAssistantView):
         return self.json({"status": "ok", "message": "force check getriggerd"})
 
 
+class PeakGuardSimulateView(HomeAssistantView):
+    """REST endpoint voor simulatiemodus: injecteer een kunstmatige verbruikswaarde."""
+
+    url = "/api/peak_guard/simulate"
+    name = "peak_guard:simulate"
+    requires_auth = True
+
+    async def get(self, request):
+        hass = request.app["hass"]
+        controller = hass.data.get(DOMAIN, {}).get("controller")
+        if not controller:
+            return self.json_message("Peak Guard niet geïnitialiseerd", status_code=503)
+        return self.json({
+            "active":        controller.simulation_active,
+            "consumption_w": controller.simulation_consumption,
+        })
+
+    async def post(self, request):
+        hass = request.app["hass"]
+        controller = hass.data.get(DOMAIN, {}).get("controller")
+        if not controller:
+            return self.json_message("Peak Guard niet geïnitialiseerd", status_code=503)
+        try:
+            data = await request.json()
+        except Exception:
+            return self.json_message("Ongeldige JSON", status_code=400)
+
+        consumption_w = data.get("consumption_w")
+        if consumption_w is not None:
+            try:
+                consumption_w = float(consumption_w)
+            except (TypeError, ValueError):
+                return self.json_message(
+                    "'consumption_w' moet een getal zijn (W), of null om simulatie uit te zetten",
+                    status_code=400,
+                )
+        controller.set_simulation(consumption_w)
+        return self.json({
+            "status":        "ok",
+            "active":        controller.simulation_active,
+            "consumption_w": controller.simulation_consumption,
+        })
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Stel Peak Guard in vanuit een config entry."""
     # Merge entry.data (initial config) with entry.options (changeable via "Configureren").
@@ -87,6 +131,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # REST API
     hass.http.register_view(PeakGuardCascadeView())
     hass.http.register_view(PeakGuardForceCheckView())
+    hass.http.register_view(PeakGuardSimulateView())
 
     # Frontend panel (eenmalig)
     if not hass.data.get(_PANEL_REGISTERED_KEY):
