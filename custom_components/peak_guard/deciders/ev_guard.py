@@ -101,6 +101,13 @@ class EVGuard:
             self._guards[device_id] = EVDeviceGuard()
         return self._guards[device_id]
 
+    def _reset_debounce(self, guard: EVDeviceGuard) -> None:
+        """Wis de surplus-geschiedenis en reset de wallclock debounce-timer."""
+        guard.surplus_history.clear()
+        guard.debounce_start_at    = None
+        guard.debounce_remaining_s = 0.0
+        guard.debounce_floor_w     = 0.0
+
     def _rate_check(self, device_name: str, reason: str) -> bool:
         """
         Geeft True als een EV service call is toegestaan.
@@ -305,43 +312,47 @@ class EVGuard:
         """
         Bepaal de veilige ondergrens van het zonne-overschot uit de recente geschiedenis.
 
-        Werkt volledig drempelvrij: geen vaste watt-waarden. Enkel een tijdvenster
-        (EV_DEBOUNCE_STABLE_S) en een percentiel (EV_FLOOR_PERCENTILE).
+        Gebruikt een wallclock-timer (guard.debounce_start_at) in plaats van de tijdspanne
+        tussen het oudste en nieuwste sample.  Voordeel: EV_DEBOUNCE_STABLE_S klopt exact
+        ongeacht het loop-interval — bij een 60 s-interval wachtte de span-aanpak feitelijk
+        één cyclus (60 s) in plaats van de ingestelde 20 s.
 
         Algoritme:
-          1. Voeg het huidige sample toe aan de ringbuffer.
-          2. Selecteer alle samples binnen het tijdvenster.
-          3. Het venster is "gevuld" als het oudste sample minstens
-             EV_DEBOUNCE_STABLE_S seconden oud is.
-          4. floor_w = EV_FLOOR_PERCENTILE-percentiel van de vensterwaarden.
-             Bij 10 % en 20 samples = de 2e laagste waarde — robuust tegen
-             één incidentele dip, maar conservatief genoeg om oscillatie
-             te vermijden bij breed fluctuerend overschot.
+          1. Start de wallclock-timer op het eerste positieve sample.
+          2. Voeg het huidige sample toe aan de ringbuffer.
+          3. Bereken het EV_FLOOR_PERCENTILE-percentiel zodra er ≥ 2 samples zijn
+             (ook vóór het einde van de debounce, voor GUI-preview in debounce_floor_w).
+          4. Klaar als: timer ≥ EV_DEBOUNCE_STABLE_S ÉN ≥ 2 samples ÉN positieve floor.
+
+        Bijwerkt altijd:
+          guard.debounce_remaining_s  — resterende seconden (GUI-afteller)
+          guard.debounce_floor_w      — tentatieve floor in W (GUI-preview)
 
         Returns:
             (ready, floor_w)
-            ready   — True als het venster volledig gevuld is met positieve waarden.
+            ready   — True als debounce voltooid en floor positief.
             floor_w — veilige startwaarde in watt (0.0 als not ready).
         """
+        # Wallclock-timer: gezet op het eerste sample, daarna ongewijzigd.
+        if guard.debounce_start_at is None:
+            guard.debounce_start_at = now
+
         guard.surplus_history.append((now, current_surplus_w))
 
-        if len(guard.surplus_history) < 2:
+        elapsed_s = (now - guard.debounce_start_at).total_seconds()
+        guard.debounce_remaining_s = max(0.0, EV_DEBOUNCE_STABLE_S - elapsed_s)
+
+        # Percentiel berekenen zodra er ≥ 2 samples zijn (ook als timer nog loopt).
+        if len(guard.surplus_history) >= 2:
+            values = [w for _, w in guard.surplus_history]
+            sorted_vals = sorted(values)
+            idx = max(0, min(int(len(sorted_vals) * EV_FLOOR_PERCENTILE / 100), len(sorted_vals) - 1))
+            guard.debounce_floor_w = sorted_vals[idx]
+
+        if elapsed_s < EV_DEBOUNCE_STABLE_S or len(guard.surplus_history) < 2:
             return False, 0.0
 
-        oldest_ts = guard.surplus_history[0][0]
-        span_s = (now - oldest_ts).total_seconds()
-
-        # Gebruik de totale tijdsspanne van de history, niet een vast venster.
-        # Een vast venster (bijv. 20s) is korter dan een loop-interval van 60s,
-        # waardoor er nooit meer dan 1 sample in het venster valt en de check
-        # nooit slaagt. Met de span-check werkt het bij elk loop-interval.
-        if span_s < EV_DEBOUNCE_STABLE_S:
-            return False, 0.0
-
-        values = [w for _, w in guard.surplus_history]
-        sorted_vals = sorted(values)
-        idx = max(0, min(int(len(sorted_vals) * EV_FLOOR_PERCENTILE / 100), len(sorted_vals) - 1))
-        floor_w = sorted_vals[idx]
+        floor_w = guard.debounce_floor_w
         if floor_w <= 0:
             return False, 0.0
         return True, floor_w
@@ -486,7 +497,7 @@ class EVGuard:
                 guard.state = EVState.CHARGING
                 guard.last_switch_state = True
                 guard.turned_on_at = datetime.now(timezone.utc)
-                guard.surplus_history.clear()
+                self._reset_debounce(guard)
                 return True
 
             # ---- INJECTIEPREVENTIE: schakelaar was uit, nu aangezet ---- #
@@ -538,7 +549,7 @@ class EVGuard:
                     guard.state = EVState.IDLE
                     guard.turned_off_at = datetime.now(timezone.utc)
                     guard.turned_off_by_pg = True
-                    guard.surplus_history.clear()
+                    self._reset_debounce(guard)
                 else:
                     # Schakelaar staat al uit (bijv. kabel eerder ontkoppeld).
                     # Herstel de SOC-limiet voor het geval dat nog niet gebeurde
@@ -557,7 +568,7 @@ class EVGuard:
                     )
                     guard = self.get_guard(device.id)
                     guard.state = EVState.IDLE
-                    guard.surplus_history.clear()
+                    self._reset_debounce(guard)
                 return True
 
         except HomeAssistantError as err:
@@ -833,7 +844,7 @@ class EVGuard:
                 guard.turned_off_at = now
                 guard.turned_off_by_pg = True
                 guard.last_sent_amps = min_a
-                guard.surplus_history.clear()
+                self._reset_debounce(guard)
 
                 peak_tracker.record_pending_avoid(
                     device_id=device.id,
@@ -979,7 +990,7 @@ class EVGuard:
                     await self._set_soc_override(device, override=False, original_soc=snap.original_soc)
                 guard.state = EVState.CABLE_DISCONNECTED
                 guard.last_switch_state = False
-                guard.surplus_history.clear()
+                self._reset_debounce(guard)
                 guard.skip_reason = f"laadkabel ontkoppeld tijdens laden ({cable_entity})"
                 self.last_skip_reason = guard.skip_reason
             elif guard.state != EVState.CABLE_DISCONNECTED:
@@ -1019,7 +1030,7 @@ class EVGuard:
                 device.name,
             )
             guard.state = EVState.IDLE
-            guard.surplus_history.clear()
+            self._reset_debounce(guard)
 
         # GATE: start-drempel
         # EV aan: doorladen zolang er injectie is; stoppen enkel via check_restore (consumption ≥ 0).
@@ -1035,7 +1046,10 @@ class EVGuard:
                 )
                 # Val door naar stroom-aanpassing hieronder
             else:
-                # EV uit, surplus < drempel → geen actie
+                # EV uit, surplus < drempel → debounce-timer wissen en geen actie.
+                # Tijdstempelinformatie is ongeldig zodra surplus de drempel verlaat,
+                # zodat de 20 s opnieuw geteld wordt vanaf het volgende positieve surplus.
+                self._reset_debounce(guard)
                 guard.skip_reason = (
                     f"surplus {excess:.0f} W < start-drempel {start_threshold_w:.0f} W"
                 )
@@ -1060,7 +1074,7 @@ class EVGuard:
                     loc_st.state if loc_st else "onbekend",
                 )
                 guard.state = EVState.IDLE
-                guard.surplus_history.clear()
+                self._reset_debounce(guard)
             else:
                 _LOGGER.debug(
                     "Peak Guard [SOLAR]: '%s' niet thuis — laden overgeslagen",
@@ -1082,7 +1096,7 @@ class EVGuard:
             guard.turned_on_at = now
             guard.turned_off_at = None
             guard.turned_off_by_pg = False
-            guard.surplus_history.clear()
+            self._reset_debounce(guard)
 
         # ── Dynamische ondergrens-detectie ───────────────────────────
         # Alleen nodig als de EV nog niet aan het laden is.
@@ -1092,33 +1106,34 @@ class EVGuard:
             surplus_ready, floor_w = self._surplus_floor(guard, excess, now)
 
             if not surplus_ready:
-                history_secs = 0.0
-                if guard.surplus_history:
-                    history_secs = (now - guard.surplus_history[0][0]).total_seconds()
+                elapsed_s = EV_DEBOUNCE_STABLE_S - guard.debounce_remaining_s
+                floor_hint = ""
+                if guard.debounce_floor_w > 0:
+                    floor_a = max(
+                        int(hw_min_a),
+                        min(int(max_a), math.floor(guard.debounce_floor_w / voltage)),
+                    )
+                    floor_hint = f", floor ≈ {floor_a} A"
+                skip = (
+                    f"opbouwen ({elapsed_s:.0f}/{EV_DEBOUNCE_STABLE_S:.0f}s"
+                    f"{floor_hint})"
+                )
+                guard.skip_reason = skip
+                self.last_skip_reason = skip
                 if guard.state != EVState.WAITING_FOR_STABLE:
                     guard.state = EVState.WAITING_FOR_STABLE
-                    guard.skip_reason = (
-                        f"opbouwen geschiedenis "
-                        f"({history_secs:.0f}/{EV_DEBOUNCE_STABLE_S:.0f}s)"
-                    )
-                    self.last_skip_reason = guard.skip_reason
                     self._warn(
                         "Peak Guard [SOLAR]: '%s' NIET geactiveerd — "
-                        "surplus-geschiedenis aan het opbouwen "
-                        "(%.0f/%.0f s, huidig=%.0f W, percentiel=%d%%)",
-                        device.name, history_secs, EV_DEBOUNCE_STABLE_S,
-                        excess, EV_FLOOR_PERCENTILE,
+                        "debounce loopt (%.0f/%.0f s, huidig=%.0f W%s, percentiel=%d%%)",
+                        device.name, elapsed_s, EV_DEBOUNCE_STABLE_S,
+                        excess, floor_hint, EV_FLOOR_PERCENTILE,
                     )
                 else:
-                    guard.skip_reason = (
-                        f"opbouwen geschiedenis "
-                        f"({history_secs:.0f}/{EV_DEBOUNCE_STABLE_S:.0f}s)"
-                    )
-                    self.last_skip_reason = guard.skip_reason
                     _LOGGER.info(
-                        "Peak Guard [SOLAR]: '%s' geschiedenis opbouwen "
-                        "(%.0f/%.0f s, huidig=%.0f W)",
-                        device.name, history_secs, EV_DEBOUNCE_STABLE_S, excess,
+                        "Peak Guard [SOLAR]: '%s' debounce loopt "
+                        "(%.0f/%.0f s, huidig=%.0f W%s)",
+                        device.name, elapsed_s, EV_DEBOUNCE_STABLE_S,
+                        excess, floor_hint,
                     )
                 return excess
 
@@ -1296,7 +1311,7 @@ class EVGuard:
                 guard.skip_reason = ""
                 guard.last_switch_state = True
                 guard.turned_on_at = now
-                guard.surplus_history.clear()
+                self._reset_debounce(guard)
 
                 if cur_entity:
                     if self._rate_check(device.name, f"set_value {new_a} A bij turn_on"):

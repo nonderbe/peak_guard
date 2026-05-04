@@ -102,6 +102,15 @@ class EVDeviceGuard:
     # Slaat (tijdstempel, surplus_W) tuples op voor stabiliteitscheck
     surplus_history: Deque = field(default_factory=lambda: deque(maxlen=60))
 
+    # ---- wallclock debounce-timer ------------------------------------- #
+    # Gezet op het eerste moment waarop het surplus boven de start-drempel
+    # uitkwam. Gereset via EVGuard._reset_debounce() zodra het surplus
+    # wegvalt of de EV start. Ontkoppelt de debounce-timing volledig van
+    # het loop-interval zodat EV_DEBOUNCE_STABLE_S altijd klopt.
+    debounce_start_at:    Optional[datetime] = None
+    debounce_remaining_s: float             = 0.0   # seconden tot debounce klaar (GUI)
+    debounce_floor_w:     float             = 0.0   # tentatieve floor-waarde in W (GUI)
+
     # ---- debounce doelwaarde ------------------------------------------ #
     # Laadstroom (A) die PG wil instellen zodra het surplus stabiel is.
     # Ingesteld bij elke evaluatie zodat de GUI de gewenste actie kan tonen.
