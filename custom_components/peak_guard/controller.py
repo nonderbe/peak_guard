@@ -137,10 +137,18 @@ class PeakGuardController:
             # Houd decider-cascades gesynchroniseerd na herladen vanuit opslag.
             self._peak_decider._cascade      = self.peak_cascade
             self._injection_decider._cascade = self.inject_cascade
+            peak_entity_ids   = {d.entity_id for d in self.peak_cascade}
+            inject_entity_ids = {d.entity_id for d in self.inject_cascade}
             for k, v in data.get("peak_snapshots", {}).items():
-                self._peak_snapshots[k] = DeviceSnapshot(**v)
+                if k in peak_entity_ids:
+                    self._peak_snapshots[k] = DeviceSnapshot(**v)
+                else:
+                    _LOGGER.info("Peak Guard: verouderd piek-snapshot verwijderd voor '%s' (niet meer in cascade)", k)
             for k, v in data.get("inject_snapshots", {}).items():
-                self._inject_snapshots[k] = DeviceSnapshot(**v)
+                if k in inject_entity_ids:
+                    self._inject_snapshots[k] = DeviceSnapshot(**v)
+                else:
+                    _LOGGER.info("Peak Guard: verouderd inject-snapshot verwijderd voor '%s' (niet meer in cascade)", k)
             if self._peak_snapshots:
                 _LOGGER.warning(
                     "Peak Guard: %d apparaat/apparaten nog uitgeschakeld uit vorige sessie — "
@@ -217,12 +225,21 @@ class PeakGuardController:
 
     def update_cascade(self, cascade_type: str, devices: list):
         parsed = [CascadeDevice(**d) for d in devices]
+        new_entity_ids = {d.entity_id for d in parsed}
         if cascade_type == "peak":
             self.peak_cascade = parsed
             self._peak_decider._cascade = self.peak_cascade
+            for eid in list(self._peak_snapshots):
+                if eid not in new_entity_ids:
+                    del self._peak_snapshots[eid]
+                    _LOGGER.info("Peak Guard: snapshot verwijderd voor '%s' (niet meer in piek-cascade)", eid)
         elif cascade_type == "inject":
             self.inject_cascade = parsed
             self._injection_decider._cascade = self.inject_cascade
+            for eid in list(self._inject_snapshots):
+                if eid not in new_entity_ids:
+                    del self._inject_snapshots[eid]
+                    _LOGGER.info("Peak Guard: snapshot verwijderd voor '%s' (niet meer in inject-cascade)", eid)
         # Herregistreer EV listeners zodat nieuwe/gewijzigde apparaten meegenomen worden
         if self._monitoring:
             self._setup_ev_listeners()
