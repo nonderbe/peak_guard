@@ -60,6 +60,11 @@ EV_CMD_RETRY_DELAY_S: float = 3.0  # seconden wachten tussen pogingen
 EV_RATE_LIMIT_MAX_CALLS: int = 12
 EV_RATE_LIMIT_WINDOW_S: float = 600.0   # 10 minuten
 
+# Stroom-sensor ouder dan dit (seconden) wordt als stale beschouwd.
+# PG gebruikt dan last_sent_amps als referentie i.p.v. de (verouderde) sensorwaarde.
+# Bedoeld als workaround voor traag-updatende integraties zoals Tesla Fleet.
+EV_SENSOR_STALE_S: float = 180.0
+
 
 # ──────────────────────────────────────────────────────────────────────────── #
 #  EV State machine                                                             #

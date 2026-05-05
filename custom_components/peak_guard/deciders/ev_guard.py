@@ -46,6 +46,7 @@ from ..models import (
     EV_RATE_LIMIT_WINDOW_S,
     EV_CMD_MAX_RETRIES,
     EV_CMD_RETRY_DELAY_S,
+    EV_SENSOR_STALE_S,
     EV_VOLTS_1PHASE,
     EV_VOLTS_3PHASE,
     EV_WAKE_TIMEOUT_S,
@@ -641,6 +642,20 @@ class EVGuard:
         guard = self.get_guard(device.id)
         now   = datetime.now(timezone.utc)
 
+        # OPTIE C: stale sensor-check
+        if guard.last_sent_amps is not None:
+            _last_upd = cur_state.last_updated
+            if _last_upd.tzinfo is None:
+                _last_upd = _last_upd.replace(tzinfo=timezone.utc)
+            _sensor_age_s = (now - _last_upd).total_seconds()
+            if _sensor_age_s > EV_SENSOR_STALE_S:
+                _LOGGER.warning(
+                    "Peak Guard [SOLAR]: '%s' stroom-sensor stale (%.0f s oud) — "
+                    "eigen sturing (%.1f A) als referentie i.p.v. sensor (%.1f A)",
+                    device.name, _sensor_age_s, guard.last_sent_amps, current_a,
+                )
+                current_a = guard.last_sent_amps
+
         # GATE: minimum update-interval — geef vorige commando tijd om effect te hebben.
         if guard.last_current_update is not None:
             elapsed = (now - guard.last_current_update).total_seconds()
@@ -722,6 +737,7 @@ class EVGuard:
         sw_on = sw_state.state == "on"
 
         current_a: Optional[float] = None
+        cur_state = None
         if cur_entity:
             cur_state = self.hass.states.get(cur_entity)
             if cur_state is not None:
@@ -752,6 +768,22 @@ class EVGuard:
         now = datetime.now(timezone.utc)
         guard = self.get_guard(device.id)
         guard.skip_reason = ""
+
+        # OPTIE C: stale sensor-check (solar-pad)
+        # Tesla Fleet rapporteert soms verouderde waarden. Als de sensor ouder is dan
+        # EV_SENSOR_STALE_S en PG zelf een bekende waarde heeft, gebruik die als referentie.
+        if cascade_type == "solar" and cur_state is not None and guard.last_sent_amps is not None:
+            _last_upd = cur_state.last_updated
+            if _last_upd.tzinfo is None:
+                _last_upd = _last_upd.replace(tzinfo=timezone.utc)
+            _sensor_age_s = (now - _last_upd).total_seconds()
+            if _sensor_age_s > EV_SENSOR_STALE_S:
+                _LOGGER.warning(
+                    "Peak Guard [SOLAR]: '%s' stroom-sensor stale (%.0f s oud) — "
+                    "eigen sturing (%.1f A) als referentie i.p.v. sensor (%.1f A)",
+                    device.name, _sensor_age_s, guard.last_sent_amps, current_a,
+                )
+                current_a = guard.last_sent_amps
 
         # ================================================================ #
         #  PIEKBEPERKING — floor, laadstroom verlagen                      #
