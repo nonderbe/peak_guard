@@ -49,6 +49,7 @@ from ..models import (
     EV_SENSOR_STALE_S,
     EV_VOLTS_1PHASE,
     EV_VOLTS_3PHASE,
+    EV_WAKE_COOLDOWN_S,
     EV_WAKE_TIMEOUT_S,
 )
 
@@ -296,7 +297,15 @@ class EVGuard:
 
         s = state.state.lower().strip()
         if s in ("unavailable", "unknown", ""):
-            return True
+            # Locatie onbekend terwijl een tracker wél geconfigureerd is:
+            # conservatief blokkeren om onnodige wake-up API-calls te vermijden
+            # wanneer de auto buitenshuis is en de Tesla-integratie offline gaat.
+            _LOGGER.debug(
+                "Peak Guard EV: locatie-tracker '%s' rapporteert '%s' voor '%s' — "
+                "laden geblokkeerd (conservatief: locatie onzeker)",
+                tracker_entity, s, device.name,
+            )
+            return False
 
         return s in ("home", "on", "true", "1")
 
@@ -550,6 +559,7 @@ class EVGuard:
                     guard.state = EVState.IDLE
                     guard.turned_off_at = datetime.now(timezone.utc)
                     guard.turned_off_by_pg = True
+                    guard.soc_override_active = False
                     self._reset_debounce(guard)
                 else:
                     # Schakelaar staat al uit (bijv. kabel eerder ontkoppeld).
@@ -569,6 +579,7 @@ class EVGuard:
                     )
                     guard = self.get_guard(device.id)
                     guard.state = EVState.IDLE
+                    guard.soc_override_active = False
                     self._reset_debounce(guard)
                 return True
 
@@ -768,6 +779,23 @@ class EVGuard:
         now = datetime.now(timezone.utc)
         guard = self.get_guard(device.id)
         guard.skip_reason = ""
+
+        # ── Bug-fix: SOC-override ook toepassen als de schakelaar al aan is ─── #
+        # Normaal geval: EV staat uit → SOC-override wordt ingesteld vlak vóór turn_on.
+        # Probleemgeval: EV staat aan maar Tesla is gestopt omdat de batterij op de
+        # geconfigureerde laadlimiet zit (bijv. 80%). De schakelaar is "on" maar laden
+        # is gepauzeerd. Zonder override blijft de limiet staan en laadt de Tesla niet.
+        # Oplossing: zet de override op het moment dat de snapshot aangemaakt wordt,
+        # ongeacht of de schakelaar aan of uit is.
+        if (
+            cascade_type == "solar"
+            and device.ev_max_soc is not None
+            and not guard.soc_override_active
+        ):
+            if self._rate_check(device.name, "SOC-override activeren"):
+                await self._set_soc_override(device, override=True)
+                self._record_call()
+                guard.soc_override_active = True
 
         # OPTIE C: stale sensor-check (solar-pad)
         # Tesla Fleet rapporteert soms verouderde waarden. Als de sensor ouder is dan
@@ -1022,6 +1050,7 @@ class EVGuard:
                     await self._set_soc_override(device, override=False, original_soc=snap.original_soc)
                 guard.state = EVState.CABLE_DISCONNECTED
                 guard.last_switch_state = False
+                guard.soc_override_active = False
                 self._reset_debounce(guard)
                 guard.skip_reason = f"laadkabel ontkoppeld tijdens laden ({cable_entity})"
                 self.last_skip_reason = guard.skip_reason
@@ -1048,6 +1077,7 @@ class EVGuard:
                     await self._set_soc_override(
                         device, override=False, original_soc=snap.original_soc
                     )
+                    guard.soc_override_active = False
             else:
                 guard.skip_reason = f"laadkabel niet aangesloten ({cable_entity})"
                 self.last_skip_reason = guard.skip_reason
@@ -1215,6 +1245,20 @@ class EVGuard:
                 guard.state = EVState.IDLE
 
             if guard.last_switch_state is not True:
+                # GATE: wake-up cooldown — voorkomt dat een niet-thuis of slapende auto
+                # tientallen wake-up API-calls per uur genereert. Na een mislukte poging
+                # wachten we EV_WAKE_COOLDOWN_S seconden voor de volgende.
+                if guard.wake_cooldown_until is not None and now < guard.wake_cooldown_until:
+                    remaining_s = (guard.wake_cooldown_until - now).total_seconds()
+                    guard.skip_reason = f"wake-up cooldown ({remaining_s:.0f}s resterend)"
+                    self.last_skip_reason = guard.skip_reason
+                    _LOGGER.debug(
+                        "Peak Guard [SOLAR]: '%s' wake-up OVERGESLAGEN — cooldown actief "
+                        "(%.0f s resterend na mislukte wake-poging)",
+                        device.name, remaining_s,
+                    )
+                    return excess
+
                 # GATE: wake-up check
                 if device.ev_wake_button and not self.is_connected(device):
                     status_entity = device.ev_status_sensor or "(geen sensor)"
@@ -1249,6 +1293,7 @@ class EVGuard:
                     if wake_ok:
                         guard.state = EVState.IDLE
                         guard.wake_requested_at = None
+                        guard.wake_cooldown_until = None  # succesvolle wake-up: cooldown wissen
                         if device.ev_status_sensor:
                             _st2 = self.hass.states.get(device.ev_status_sensor)
                             status_val = _st2.state if _st2 else "verbonden"
@@ -1260,12 +1305,19 @@ class EVGuard:
                     else:
                         guard.state = EVState.IDLE
                         guard.wake_requested_at = None
-                        guard.skip_reason = "Tesla niet wakker na wake-up poging"
+                        # Cooldown instellen: voorkomt dat elke loop-iteratie een wake-up
+                        # API-call genereert wanneer de auto niet thuis of niet bereikbaar is.
+                        guard.wake_cooldown_until = now + timedelta(seconds=EV_WAKE_COOLDOWN_S)
+                        guard.skip_reason = (
+                            f"Tesla niet wakker na wake-up poging "
+                            f"(volgende poging over {EV_WAKE_COOLDOWN_S:.0f}s)"
+                        )
                         self.last_skip_reason = guard.skip_reason
                         self._warn(
                             "Peak Guard [SOLAR]: '%s' — Tesla niet wakker na %.0f s "
-                            "('%s' = '%s') — laden uitgesteld tot volgende cyclus",
+                            "('%s' = '%s') — laden uitgesteld, volgende wake-poging over %.0f s",
                             device.name, EV_WAKE_TIMEOUT_S, status_entity, status_val,
+                            EV_WAKE_COOLDOWN_S,
                         )
                         return excess
 
@@ -1273,8 +1325,6 @@ class EVGuard:
                 if not self._rate_check(device.name, "turn_on voor injectiepreventie"):
                     return excess
 
-                # SOC-override vóór turn_on: Tesla weigert turn_on als huidige SOC boven de
-                # geconfigureerde laadlimiet ligt ("Command was unsuccessful: complete").
                 # Als de Tesla sliep bij snapshot-aanmaak (original_soc=None), forceer nu een
                 # verse bevraging zodat we de originele waarde kunnen opslaan voor correct herstel.
                 _snap_now = snapshots.get(snap_key)
@@ -1303,7 +1353,11 @@ class EVGuard:
                                 " hersteld. Controleer manueel de laadlimiet in de Tesla-app.",
                                 device.name, _soc_st.state,
                             )
-                await self._set_soc_override(device, override=True)
+                # SOC-override: wordt eerder in apply_action ingesteld (vóór cascade-type check).
+                # Fallback voor het geval de rate-limiter dat verhinderde.
+                if not guard.soc_override_active and device.ev_max_soc is not None:
+                    await self._set_soc_override(device, override=True)
+                    guard.soc_override_active = True
 
                 turn_on_ok = False
                 _last_turn_on_err: Optional[HomeAssistantError] = None

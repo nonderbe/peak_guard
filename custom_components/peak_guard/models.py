@@ -65,6 +65,11 @@ EV_RATE_LIMIT_WINDOW_S: float = 600.0   # 10 minuten
 # Bedoeld als workaround voor traag-updatende integraties zoals Tesla Fleet.
 EV_SENSOR_STALE_S: float = 180.0
 
+# Na een mislukte wake-up poging: wachttijd (seconden) vóór de volgende poging.
+# 900 s = 15 minuten. Voorkomt dat een niet-thuis of slapende auto tientallen
+# API-calls per uur genereert.
+EV_WAKE_COOLDOWN_S: float = 900.0
+
 
 # ──────────────────────────────────────────────────────────────────────────── #
 #  EV State machine                                                             #
@@ -128,6 +133,14 @@ class EVDeviceGuard:
     # Meest recente reden waarom de solar-evaluatie werd overgeslagen.
     # Leeg als er geen skip was of als laden actief is.
     skip_reason: str = ""
+
+    # True als PG de SOC-laadlimiet heeft verhoogd via _set_soc_override(override=True).
+    # Voorkomt herhaalde API-calls per loop-iteratie.
+    soc_override_active: bool = False
+
+    # Tijdstip tot wanneer wake-up pogingen worden geblokkeerd na een mislukte poging.
+    # Reset bij succesvolle wake-up of als de EV zichzelf aanmeldt.
+    wake_cooldown_until: Optional[datetime] = None
 
 
 # ──────────────────────────────────────────────────────────────────────────── #
