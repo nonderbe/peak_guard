@@ -990,15 +990,9 @@ class EVGuard:
         # ================================================================ #
         #  INJECTIEPREVENTIE — laadstroom instellen op beschikbaar surplus #
         # ================================================================ #
-        # hw_min_a is losgekoppeld van start_threshold_w (zie klasdocstring).
         hw_min_a = float(
             device.ev_min_current if device.ev_min_current is not None
             else (device.min_value if device.min_value is not None else DEFAULT_EV_MIN_AMPERE)
-        )
-        from ..const import DEFAULT_EV_SOLAR_START_THRESHOLD_W
-        start_threshold_w = float(
-            device.start_threshold_w if device.start_threshold_w is not None
-            else DEFAULT_EV_SOLAR_START_THRESHOLD_W
         )
         hw_min_w = hw_min_a * voltage
 
@@ -1010,10 +1004,9 @@ class EVGuard:
             "Peak Guard [SOLAR]: '%s' evalueren — "
             "overschot=%.0f W, spanning=%dV (%d fase(n)), "
             "beschikbaar=%.2f A, doel=%d A (hw-min=%.0f A=%.0f W, max=%d A), "
-            "start-drempel=%.0f W, schakelaar=%s, laadstroom=%s A, guard-state=%s",
+            "schakelaar=%s, laadstroom=%s A, guard-state=%s",
             device.name, excess, int(voltage), phases,
             available_a_raw, new_a, hw_min_a, hw_min_w, int(max_a),
-            start_threshold_w,
             "AAN" if sw_on else "UIT",
             f"{current_a:.1f}" if current_a is not None else "onbekend",
             guard.state.value,
@@ -1094,36 +1087,27 @@ class EVGuard:
             guard.state = EVState.IDLE
             self._reset_debounce(guard)
 
-        # GATE: start-drempel
+        # GATE: injectie aanwezig?
         # EV aan: doorladen zolang er injectie is; stoppen enkel via check_restore (consumption ≥ 0).
-        # EV uit: alleen starten als excess ≥ start_threshold_w.
-        if excess < start_threshold_w:
+        # EV uit: starten zodra excess > 0 — geen debounce, geen watt-drempel.
+        if excess <= 0:
             if sw_on:
-                # EV draait — doorladen zolang er injectie is.
-                # Geen ondergrens-check nodig; stroomaanpassing hieronder.
                 _LOGGER.debug(
-                    "Peak Guard [SOLAR]: '%s' draait — surplus %.0f W < start-drempel %.0f W "
+                    "Peak Guard [SOLAR]: '%s' draait — surplus %.0f W ≤ 0 "
                     "→ doorladen (stop enkel als geen injectie meer)",
-                    device.name, excess, start_threshold_w,
+                    device.name, excess,
                 )
-                # Val door naar stroom-aanpassing hieronder
             else:
-                # EV uit, surplus < drempel → debounce-timer wissen en geen actie.
-                # Tijdstempelinformatie is ongeldig zodra surplus de drempel verlaat,
-                # zodat de 20 s opnieuw geteld wordt vanaf het volgende positieve surplus.
                 self._reset_debounce(guard)
-                guard.skip_reason = (
-                    f"surplus {excess:.0f} W < start-drempel {start_threshold_w:.0f} W"
-                )
+                guard.skip_reason = f"geen injectie (surplus {excess:.0f} W)"
                 self.last_skip_reason = guard.skip_reason
-                _LOGGER.info(
-                    "Peak Guard [SOLAR]: '%s' staat uit — surplus %.0f W < "
-                    "start-drempel %.0f W → geen actie",
-                    device.name, excess, start_threshold_w,
+                _LOGGER.debug(
+                    "Peak Guard [SOLAR]: '%s' staat uit — geen injectie (%.0f W) → geen actie",
+                    device.name, excess,
                 )
                 return excess
 
-        # surplus ≥ start_threshold_w — EV mag (of blijft) laden
+        # surplus > 0 — EV mag (of blijft) laden
 
         # GATE: locatie — EV moet thuis zijn om te laden
         if not self.is_home(device):
@@ -1160,59 +1144,13 @@ class EVGuard:
             guard.turned_off_by_pg = False
             self._reset_debounce(guard)
 
-        # ── Dynamische ondergrens-detectie ───────────────────────────
-        # Alleen nodig als de EV nog niet aan het laden is.
-        # Bouwt de surplus-geschiedenis op en berekent het EV_FLOOR_PERCENTILE-
-        # percentiel als "veilige startwaarde". Geen vaste watt-drempel.
+        # EV staat uit → starten op hardware-minimum laadstroom.
+        # Geen debounce: de EV start onmiddellijk zodra er enige injectie is.
+        # Anti-thrashing wordt gewaarborgd door EV_MIN_OFF_DURATION_S (na PG-uitschakeling)
+        # en door de hysterese-logica tijdens het laden.
         if not sw_on:
-            surplus_ready, floor_w = self._surplus_floor(guard, excess, now)
-
-            if not surplus_ready:
-                elapsed_s = EV_DEBOUNCE_STABLE_S - guard.debounce_remaining_s
-                floor_hint = ""
-                if guard.debounce_floor_w > 0:
-                    floor_a = max(
-                        int(hw_min_a),
-                        min(int(max_a), math.floor(guard.debounce_floor_w / voltage)),
-                    )
-                    floor_hint = f", floor ≈ {floor_a} A"
-                skip = (
-                    f"opbouwen ({elapsed_s:.0f}/{EV_DEBOUNCE_STABLE_S:.0f}s"
-                    f"{floor_hint})"
-                )
-                guard.skip_reason = skip
-                self.last_skip_reason = skip
-                if guard.state != EVState.WAITING_FOR_STABLE:
-                    guard.state = EVState.WAITING_FOR_STABLE
-                    self._warn(
-                        "Peak Guard [SOLAR]: '%s' NIET geactiveerd — "
-                        "debounce loopt (%.0f/%.0f s, huidig=%.0f W%s, percentiel=%d%%)",
-                        device.name, elapsed_s, EV_DEBOUNCE_STABLE_S,
-                        excess, floor_hint, EV_FLOOR_PERCENTILE,
-                    )
-                else:
-                    _LOGGER.info(
-                        "Peak Guard [SOLAR]: '%s' debounce loopt "
-                        "(%.0f/%.0f s, huidig=%.0f W%s)",
-                        device.name, elapsed_s, EV_DEBOUNCE_STABLE_S,
-                        excess, floor_hint,
-                    )
-                return excess
-
-            if guard.state == EVState.WAITING_FOR_STABLE:
-                _LOGGER.info(
-                    "Peak Guard [SOLAR]: '%s' ondergrens vastgesteld op %.0f W "
-                    "(%d-percentiel over %.0f s) — EV starten",
-                    device.name, floor_w, EV_FLOOR_PERCENTILE, EV_DEBOUNCE_STABLE_S,
-                )
-                guard.state = EVState.IDLE
-
-            # Overschrijf new_a: gebruik de veilige ondergrens als startlaadstroom.
-            # floor() garandeert dat het setpoint nooit boven de ondergrens uitkomt,
-            # ook niet als het surplus precies op de grens schommelt.
-            floor_a = max(int(hw_min_a), min(int(max_a), math.floor(floor_w / voltage)))
-            guard.pending_amps = floor_a
-            new_a = floor_a
+            guard.pending_amps = int(hw_min_a)
+            new_a = int(hw_min_a)
 
         if not sw_on:
             # EV staat uit → aanzetten op hardware-minimum laadstroom
@@ -1421,11 +1359,11 @@ class EVGuard:
                 actual_consumption_w = new_a * voltage
                 _LOGGER.info(
                     "Peak Guard [SOLAR]: → '%s' gestart met %d A (%.0f W) "
-                    "omdat injectie %.0f W > start-drempel %.0f W "
+                    "omdat injectie %.0f W > 0 "
                     "(hw-min=%.0f A, %d fase(n), SOC-override: %s%%, "
                     "rate-limiter: %d/%d calls in %.0f s)",
                     device.name, new_a, actual_consumption_w,
-                    excess, start_threshold_w, hw_min_a, phases,
+                    excess, hw_min_a, phases,
                     device.ev_max_soc if device.ev_max_soc is not None else "n.v.t.",
                     self._rate_limiter.calls_in_window,
                     EV_RATE_LIMIT_MAX_CALLS, EV_RATE_LIMIT_WINDOW_S,
