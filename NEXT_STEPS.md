@@ -22,7 +22,7 @@ Started: 2026-05-21. Working through the prioritized list from the architecture 
 | 7 | Anonymous class hack `type("", (), {"state": "??"})()` | ✅ | `ev_guard.py` |
 | 8 | `_log_decision` (260 lines) in controller instead of a dedicated class | ✅ | Extracted to `decision_logger.py` — `DecisionLogger` class |
 | 9 | `_warn` used for INFO-level cascade status messages | ✅ | `base.py` — changed to `_LOGGER.info` / `_LOGGER.warning` as appropriate |
-| 10 | 22 near-identical sensor classes (constructor boilerplate explosion) | ⏳ | `sensor.py` — SensorDef dataclass + factory. Medium effort. |
+| 10 | 22 near-identical sensor classes (constructor boilerplate explosion) | ✅ | `sensor.py` — `_SensorDef` dataclass + `_TrackerSensorBase`; 9 sensors each reduced to `super().__init__` |
 | 11 | Useless `f"peak_guard.peak_state"` f-string with no interpolation | ✅ | `sensor.py` |
 | 12 | In-function imports (`PeakEvent`, `SolarEvent`) | ✅ | `sensor.py` |
 | 13 | Dead `AvoidedPeakTracker = PeakAvoidTracker` alias | ✅ | `avoided_peak_tracker.py` |
@@ -32,10 +32,8 @@ Started: 2026-05-21. Working through the prioritized list from the architecture 
 ## How to resume
 
 1. Read this file first.
-2. Continue from the first ⏳ item — items 3 and 10 remain.
-3. Item 3 (`CascadeDevice` sealed hierarchy) is HIGH EFFORT; tackle separately.
-4. Item 10 (sensor boilerplate) is medium effort; a `SensorDef` dataclass or base class approach.
-5. The session limit policy (from CLAUDE.md) applies: commit all work before stopping.
+2. Only item 3 remains (`CascadeDevice` sealed hierarchy — HIGH EFFORT, defer to a dedicated session).
+3. The session limit policy (from CLAUDE.md) applies: commit all work before stopping.
 
 ## Key files map
 

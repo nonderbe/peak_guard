@@ -16,6 +16,7 @@ Definieert alle Peak Guard sensoren:
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 
@@ -698,25 +699,60 @@ DEVICE_INFO_SOLAR_SAVINGS = {
     "model": "Solar-module",
 }
 
+DEVICE_INFO_CAPACITY = {
+    "identifiers": {(DOMAIN, DEVICE_ID_CAPACITY)},
+    "name": "Peak Guard Capaciteitstarief",
+    "manufacturer": "Peak Guard",
+}
 
-class HypotheticalMonthlyPeakSensor(SensorEntity):
-    """Hypothetische maandpiek zonder Peak Guard (kW)."""
+
+@dataclass
+class _SensorDef:
+    """Static metadata for a tracker sensor; set once as a class attribute."""
+    unique_suffix: str
+    name: str
+    unit: str
+    state_class: SensorStateClass
+    icon: str
+    device_info: dict
+    device_class: Optional[SensorDeviceClass] = None
+    entity_id_override: Optional[str] = None
+
+
+class _TrackerSensorBase(SensorEntity):
+    """Eliminates the 8-line __init__ boilerplate shared by the 9 tracker sensors."""
     _attr_should_poll = False
+    _DEF: _SensorDef  # each subclass must define this
 
-    def __init__(self, shared: SharedCapacityState, tracker: PeakAvoidTracker) -> None:
+    def __init__(self, shared: SharedCapacityState, tracker) -> None:
+        d = self._DEF
         self._shared  = shared
         self._tracker = tracker
-        self._attr_unique_id = f"{DOMAIN}_hypothetical_monthly_peak_kw"
-        self._attr_name = "Peak Guard Hypothetische Maandpiek"
-        self._attr_native_unit_of_measurement = "kW"
-        self._attr_device_class = SensorDeviceClass.POWER
-        self._attr_state_class  = SensorStateClass.MEASUREMENT
-        self._attr_icon = "mdi:chart-line-variant"
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, DEVICE_ID_CAPACITY)},
-            "name": "Peak Guard Capaciteitstarief",
-            "manufacturer": "Peak Guard",
-        }
+        self._attr_unique_id                  = f"{DOMAIN}_{d.unique_suffix}"
+        self._attr_name                       = d.name
+        self._attr_native_unit_of_measurement = d.unit
+        self._attr_device_class               = d.device_class
+        self._attr_state_class                = d.state_class
+        self._attr_icon                       = d.icon
+        self._attr_device_info                = d.device_info
+        if d.entity_id_override is not None:
+            self.entity_id = d.entity_id_override
+
+
+class HypotheticalMonthlyPeakSensor(_TrackerSensorBase):
+    """Hypothetische maandpiek zonder Peak Guard (kW)."""
+    _DEF = _SensorDef(
+        unique_suffix="hypothetical_monthly_peak_kw",
+        name="Peak Guard Hypothetische Maandpiek",
+        unit="kW",
+        device_class=SensorDeviceClass.POWER,
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:chart-line-variant",
+        device_info=DEVICE_INFO_CAPACITY,
+    )
+
+    def __init__(self, shared: SharedCapacityState, tracker: PeakAvoidTracker) -> None:
+        super().__init__(shared, tracker)
 
     @property
     def native_value(self) -> Optional[float]:
@@ -733,40 +769,42 @@ class HypotheticalMonthlyPeakSensor(SensorEntity):
         }
 
 
-class PeakAvoidedKwThisMonthSensor(SensorEntity):
+class PeakAvoidedKwThisMonthSensor(_TrackerSensorBase):
     """Vermeden piekbijdrage (kW) deze maand — piek-modus."""
-    _attr_should_poll = False
+    _DEF = _SensorDef(
+        unique_suffix="peak_avoided_kw_this_month",
+        name="Peak Guard Vermeden Piek Deze Maand",
+        unit="kW",
+        device_class=SensorDeviceClass.POWER,
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:shield-check-outline",
+        device_info=DEVICE_INFO_PEAK_SAVINGS,
+        entity_id_override=f"sensor.{DOMAIN}_peak_avoided_kw_this_month",
+    )
 
     def __init__(self, shared: SharedCapacityState, tracker: PeakAvoidTracker) -> None:
-        self._shared = shared; self._tracker = tracker
-        self._attr_unique_id = f"{DOMAIN}_peak_avoided_kw_this_month"
-        self._attr_name = "Peak Guard Vermeden Piek Deze Maand"
-        self.entity_id = f"sensor.{DOMAIN}_peak_avoided_kw_this_month"
-        self._attr_native_unit_of_measurement = "kW"
-        self._attr_device_class = SensorDeviceClass.POWER
-        self._attr_state_class  = SensorStateClass.MEASUREMENT
-        self._attr_icon = "mdi:shield-check-outline"
-        self._attr_device_info = DEVICE_INFO_PEAK_SAVINGS
+        super().__init__(shared, tracker)
 
     @property
     def native_value(self) -> float:
         return round(self._tracker.avoided_kw_this_month, 3)
 
 
-class PeakSavingsEuroThisMonthSensor(SensorEntity):
+class PeakSavingsEuroThisMonthSensor(_TrackerSensorBase):
     """Besparing op capaciteitstarief deze maand (€)."""
-    _attr_should_poll = False
+    _DEF = _SensorDef(
+        unique_suffix="peak_savings_euro_this_month",
+        name="Peak Guard Piek Besparing Deze Maand",
+        unit="EUR",
+        device_class=SensorDeviceClass.MONETARY,
+        state_class=SensorStateClass.TOTAL,
+        icon="mdi:piggy-bank-outline",
+        device_info=DEVICE_INFO_PEAK_SAVINGS,
+        entity_id_override=f"sensor.{DOMAIN}_peak_savings_euro_this_month",
+    )
 
     def __init__(self, shared: SharedCapacityState, tracker: PeakAvoidTracker) -> None:
-        self._shared = shared; self._tracker = tracker
-        self._attr_unique_id = f"{DOMAIN}_peak_savings_euro_this_month"
-        self._attr_name = "Peak Guard Piek Besparing Deze Maand"
-        self.entity_id = f"sensor.{DOMAIN}_peak_savings_euro_this_month"
-        self._attr_native_unit_of_measurement = "EUR"
-        self._attr_device_class = SensorDeviceClass.MONETARY
-        self._attr_state_class  = SensorStateClass.TOTAL
-        self._attr_icon = "mdi:piggy-bank-outline"
-        self._attr_device_info = DEVICE_INFO_PEAK_SAVINGS
+        super().__init__(shared, tracker)
 
     @property
     def native_value(self) -> float:
@@ -780,39 +818,41 @@ class PeakSavingsEuroThisMonthSensor(SensorEntity):
         }
 
 
-class PeakSavingsEuroThisYearSensor(SensorEntity):
+class PeakSavingsEuroThisYearSensor(_TrackerSensorBase):
     """Cumulatieve piek-besparing dit jaar (€, persistent)."""
-    _attr_should_poll = False
+    _DEF = _SensorDef(
+        unique_suffix="peak_savings_euro_this_year",
+        name="Peak Guard Piek Besparing Dit Jaar",
+        unit="EUR",
+        device_class=SensorDeviceClass.MONETARY,
+        state_class=SensorStateClass.TOTAL,
+        icon="mdi:cash-check",
+        device_info=DEVICE_INFO_PEAK_SAVINGS,
+        entity_id_override=f"sensor.{DOMAIN}_peak_savings_euro_this_year",
+    )
 
     def __init__(self, shared: SharedCapacityState, tracker: PeakAvoidTracker) -> None:
-        self._shared = shared; self._tracker = tracker
-        self._attr_unique_id = f"{DOMAIN}_peak_savings_euro_this_year"
-        self._attr_name = "Peak Guard Piek Besparing Dit Jaar"
-        self.entity_id = f"sensor.{DOMAIN}_peak_savings_euro_this_year"
-        self._attr_native_unit_of_measurement = "EUR"
-        self._attr_device_class = SensorDeviceClass.MONETARY
-        self._attr_state_class  = SensorStateClass.TOTAL
-        self._attr_icon = "mdi:cash-check"
-        self._attr_device_info = DEVICE_INFO_PEAK_SAVINGS
+        super().__init__(shared, tracker)
 
     @property
     def native_value(self) -> float:
         return round(self._tracker.savings_euro_this_year, 2)
 
 
-class PeakAvoidedEventsSensor(SensorEntity):
+class PeakAvoidedEventsSensor(_TrackerSensorBase):
     """Log van de laatste 100 piek-vermijdings-events."""
-    _attr_should_poll = False
+    _DEF = _SensorDef(
+        unique_suffix="peak_avoided_events",
+        name="Peak Guard Piek Events Log",
+        unit="events",
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:format-list-bulleted-type",
+        device_info=DEVICE_INFO_PEAK_SAVINGS,
+        entity_id_override=f"sensor.{DOMAIN}_peak_avoided_events",
+    )
 
     def __init__(self, shared: SharedCapacityState, tracker: PeakAvoidTracker) -> None:
-        self._shared = shared; self._tracker = tracker
-        self._attr_unique_id = f"{DOMAIN}_peak_avoided_events"
-        self._attr_name = "Peak Guard Piek Events Log"
-        self.entity_id = f"sensor.{DOMAIN}_peak_avoided_events"
-        self._attr_native_unit_of_measurement = "events"
-        self._attr_state_class = SensorStateClass.MEASUREMENT
-        self._attr_icon = "mdi:format-list-bulleted-type"
-        self._attr_device_info = DEVICE_INFO_PEAK_SAVINGS
+        super().__init__(shared, tracker)
 
     @property
     def native_value(self) -> int:
@@ -839,40 +879,42 @@ class PeakAvoidedEventsSensor(SensorEntity):
 #  SOLAR-MODUS SENSOREN                                               #
 # ================================================================== #
 
-class SolarShiftedKwhThisMonthSensor(SensorEntity):
+class SolarShiftedKwhThisMonthSensor(_TrackerSensorBase):
     """Totaal verschoven energie via injectiepreventie deze maand (kWh)."""
-    _attr_should_poll = False
+    _DEF = _SensorDef(
+        unique_suffix="solar_verschoven_kwh_this_month",
+        name="Peak Guard Solar Verschoven kWh Deze Maand",
+        unit="kWh",
+        device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        icon="mdi:solar-power",
+        device_info=DEVICE_INFO_SOLAR_SAVINGS,
+        entity_id_override=f"sensor.{DOMAIN}_solar_verschoven_kwh_this_month",
+    )
 
     def __init__(self, shared: SharedCapacityState, tracker: SolarShiftTracker) -> None:
-        self._shared = shared; self._tracker = tracker
-        self._attr_unique_id = f"{DOMAIN}_solar_verschoven_kwh_this_month"
-        self._attr_name = "Peak Guard Solar Verschoven kWh Deze Maand"
-        self.entity_id = f"sensor.{DOMAIN}_solar_verschoven_kwh_this_month"
-        self._attr_native_unit_of_measurement = "kWh"
-        self._attr_device_class = SensorDeviceClass.ENERGY
-        self._attr_state_class  = SensorStateClass.TOTAL_INCREASING
-        self._attr_icon = "mdi:solar-power"
-        self._attr_device_info = DEVICE_INFO_SOLAR_SAVINGS
+        super().__init__(shared, tracker)
 
     @property
     def native_value(self) -> float:
         return round(self._tracker.shifted_kwh_this_month, 3)
 
 
-class SolarSavingsEuroThisMonthSensor(SensorEntity):
+class SolarSavingsEuroThisMonthSensor(_TrackerSensorBase):
     """Besparing via verschoven zonne-energie deze maand (€)."""
-    _attr_should_poll = False
+    _DEF = _SensorDef(
+        unique_suffix="solar_savings_euro_this_month",
+        name="Peak Guard Solar Besparing Deze Maand",
+        unit="EUR",
+        device_class=SensorDeviceClass.MONETARY,
+        state_class=SensorStateClass.TOTAL,
+        icon="mdi:solar-panel",
+        device_info=DEVICE_INFO_SOLAR_SAVINGS,
+        entity_id_override=f"sensor.{DOMAIN}_solar_savings_euro_this_month",
+    )
 
     def __init__(self, shared: SharedCapacityState, tracker: SolarShiftTracker) -> None:
-        self._shared = shared; self._tracker = tracker
-        self._attr_unique_id = f"{DOMAIN}_solar_savings_euro_this_month"
-        self._attr_name = "Peak Guard Solar Besparing Deze Maand"
-        self.entity_id = f"sensor.{DOMAIN}_solar_savings_euro_this_month"
-        self._attr_native_unit_of_measurement = "EUR"
-        self._attr_device_class = SensorDeviceClass.MONETARY
-        self._attr_state_class  = SensorStateClass.TOTAL
-        self._attr_icon = "mdi:solar-panel"
-        self._attr_device_info = DEVICE_INFO_SOLAR_SAVINGS
+        super().__init__(shared, tracker)
 
     @property
     def native_value(self) -> float:
@@ -886,39 +928,41 @@ class SolarSavingsEuroThisMonthSensor(SensorEntity):
         }
 
 
-class SolarSavingsEuroThisYearSensor(SensorEntity):
+class SolarSavingsEuroThisYearSensor(_TrackerSensorBase):
     """Cumulatieve solar-besparing dit jaar (€, persistent)."""
-    _attr_should_poll = False
+    _DEF = _SensorDef(
+        unique_suffix="solar_savings_euro_this_year",
+        name="Peak Guard Solar Besparing Dit Jaar",
+        unit="EUR",
+        device_class=SensorDeviceClass.MONETARY,
+        state_class=SensorStateClass.TOTAL,
+        icon="mdi:cash-check",
+        device_info=DEVICE_INFO_SOLAR_SAVINGS,
+        entity_id_override=f"sensor.{DOMAIN}_solar_savings_euro_this_year",
+    )
 
     def __init__(self, shared: SharedCapacityState, tracker: SolarShiftTracker) -> None:
-        self._shared = shared; self._tracker = tracker
-        self._attr_unique_id = f"{DOMAIN}_solar_savings_euro_this_year"
-        self._attr_name = "Peak Guard Solar Besparing Dit Jaar"
-        self.entity_id = f"sensor.{DOMAIN}_solar_savings_euro_this_year"
-        self._attr_native_unit_of_measurement = "EUR"
-        self._attr_device_class = SensorDeviceClass.MONETARY
-        self._attr_state_class  = SensorStateClass.TOTAL
-        self._attr_icon = "mdi:cash-check"
-        self._attr_device_info = DEVICE_INFO_SOLAR_SAVINGS
+        super().__init__(shared, tracker)
 
     @property
     def native_value(self) -> float:
         return round(self._tracker.savings_euro_this_year, 2)
 
 
-class SolarAvoidedEventsSensor(SensorEntity):
+class SolarAvoidedEventsSensor(_TrackerSensorBase):
     """Log van de laatste 100 solar-shift-events."""
-    _attr_should_poll = False
+    _DEF = _SensorDef(
+        unique_suffix="solar_avoided_events",
+        name="Peak Guard Solar Events Log",
+        unit="events",
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:format-list-bulleted-type",
+        device_info=DEVICE_INFO_SOLAR_SAVINGS,
+        entity_id_override=f"sensor.{DOMAIN}_solar_avoided_events",
+    )
 
     def __init__(self, shared: SharedCapacityState, tracker: SolarShiftTracker) -> None:
-        self._shared = shared; self._tracker = tracker
-        self._attr_unique_id = f"{DOMAIN}_solar_avoided_events"
-        self._attr_name = "Peak Guard Solar Events Log"
-        self.entity_id = f"sensor.{DOMAIN}_solar_avoided_events"
-        self._attr_native_unit_of_measurement = "events"
-        self._attr_state_class = SensorStateClass.MEASUREMENT
-        self._attr_icon = "mdi:format-list-bulleted-type"
-        self._attr_device_info = DEVICE_INFO_SOLAR_SAVINGS
+        super().__init__(shared, tracker)
 
     @property
     def native_value(self) -> int:
