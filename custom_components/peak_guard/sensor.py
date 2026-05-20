@@ -52,7 +52,7 @@ from .const import (
 from homeassistant.helpers.storage import Store
 from .quarter_calculator import QuarterCalculator
 from .quarter_store import QuarterStore
-from .avoided_peak_tracker import PeakAvoidTracker, SolarShiftTracker
+from .avoided_peak_tracker import PeakAvoidTracker, PeakEvent, SolarShiftTracker, SolarEvent
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -60,8 +60,8 @@ _LOGGER = logging.getLogger(__name__)
 _UPDATE_INTERVAL = timedelta(minutes=1)
 
 # Persistente opslag voor events en maandstatistieken
-_STORAGE_KEY_PEAK_STATE   = f"peak_guard.peak_state"
-_STORAGE_KEY_SOLAR_STATE  = f"peak_guard.solar_state"
+_STORAGE_KEY_PEAK_STATE   = "peak_guard.peak_state"
+_STORAGE_KEY_SOLAR_STATE  = "peak_guard.solar_state"
 _STORAGE_VERSION_STATE    = 1
 
 
@@ -80,18 +80,8 @@ async def async_setup_entry(
 
     calculator = QuarterCalculator()
 
-    # Gedeelde state-container zodat alle sensoren dezelfde berekeningen zien
-    shared = SharedCapacityState(
-        hass=hass,
-        energy_sensor_id=energy_sensor_id,
-        store=store,
-        calculator=calculator,
-        tarief=tarief,
-        regio=regio,
-    )
-
     # Haal controller + trackers op
-    controller  = hass.data[DOMAIN]["controller"]
+    controller    = hass.data[DOMAIN]["controller"]
     peak_tracker  = controller.peak_tracker
     solar_tracker = controller.solar_tracker
 
@@ -142,8 +132,6 @@ async def async_setup_entry(
                 max(0.0, peak_tracker.savings_euro_this_year - peak_tracker.savings_euro_this_month), 4
             )
             # Herstel events
-            from .avoided_peak_tracker import PeakEvent
-            from dataclasses import fields
             for ev_dict in peak_state.get("events", []):
                 try:
                     ev = PeakEvent(
@@ -178,7 +166,6 @@ async def async_setup_entry(
                 and solar_state.get("month") == current_month):
             solar_tracker.shifted_kwh_this_month  = float(solar_state.get("shifted_kwh_this_month", 0.0))
             solar_tracker.savings_euro_this_month = float(solar_state.get("savings_euro_this_month", 0.0))
-            from .avoided_peak_tracker import SolarEvent
             for ev_dict in solar_state.get("events", []):
                 try:
                     ev = SolarEvent(
@@ -198,6 +185,22 @@ async def async_setup_entry(
                 "Peak Guard: %d solar-events hersteld vanuit opslag",
                 len(solar_tracker.events),
             )
+
+    # Gedeelde state-container — alle afhankelijkheden volledig beschikbaar bij constructie
+    shared = SharedCapacityState(
+        hass=hass,
+        energy_sensor_id=energy_sensor_id,
+        store=store,
+        calculator=calculator,
+        tarief=tarief,
+        regio=regio,
+        peak_tracker=peak_tracker,
+        solar_tracker=solar_tracker,
+        savings_store=savings_store,
+        solar_savings_store=solar_savings_store,
+        peak_state_store=peak_state_store,
+        solar_state_store=solar_state_store,
+    )
 
     entities = [
         # ---- Capaciteitstarief-sensoren (ongewijzigd) ----------------
@@ -234,12 +237,6 @@ async def async_setup_entry(
     async_add_entities(entities)
 
     # Start minuut-timer
-    shared.set_peak_tracker(peak_tracker)
-    shared.set_solar_tracker(solar_tracker)
-    shared.set_savings_store(savings_store)
-    shared.set_solar_savings_store(solar_savings_store)
-    shared.set_peak_state_store(peak_state_store)
-    shared.set_solar_state_store(solar_state_store)
     await shared.async_start(entities)
 
     # Sla shared op zodat async_unload_entry de timer kan stoppen
@@ -260,6 +257,12 @@ class SharedCapacityState:
         calculator: QuarterCalculator,
         tarief: float,
         regio: str,
+        peak_tracker: PeakAvoidTracker,
+        solar_tracker: SolarShiftTracker,
+        savings_store,
+        solar_savings_store,
+        peak_state_store,
+        solar_state_store,
     ) -> None:
         self.hass = hass
         self.energy_sensor_id = energy_sensor_id
@@ -278,14 +281,14 @@ class SharedCapacityState:
 
         self._listeners: list = []
         self._unsub = None
-        self._peak_tracker:  Optional[PeakAvoidTracker]  = None
-        self._solar_tracker: Optional[SolarShiftTracker] = None
+        self._peak_tracker  = peak_tracker
+        self._solar_tracker = solar_tracker
         self._current_month: Optional[int] = None
         self._current_year:  Optional[int] = None
-        self._savings_store = None
-        self._solar_savings_store = None
-        self._peak_state_store = None
-        self._solar_state_store = None
+        self._savings_store       = savings_store
+        self._solar_savings_store = solar_savings_store
+        self._peak_state_store    = peak_state_store
+        self._solar_state_store   = solar_state_store
         self._last_persisted_peak_savings:       float = 0.0
         self._last_persisted_solar_savings:      float = 0.0
         self._last_peak_events_count:            int   = -1
@@ -302,24 +305,6 @@ class SharedCapacityState:
         self._unsub = async_track_time_interval(
             self.hass, self._async_update, _UPDATE_INTERVAL
         )
-
-    def set_peak_tracker(self, tracker: PeakAvoidTracker) -> None:
-        self._peak_tracker = tracker
-
-    def set_solar_tracker(self, tracker: SolarShiftTracker) -> None:
-        self._solar_tracker = tracker
-
-    def set_savings_store(self, store) -> None:
-        self._savings_store = store
-
-    def set_solar_savings_store(self, store) -> None:
-        self._solar_savings_store = store
-
-    def set_peak_state_store(self, store) -> None:
-        self._peak_state_store = store
-
-    def set_solar_state_store(self, store) -> None:
-        self._solar_state_store = store
 
     def stop(self) -> None:
         """Stop de timer (bij unload)."""

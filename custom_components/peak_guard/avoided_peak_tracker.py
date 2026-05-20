@@ -467,9 +467,3 @@ class SolarShiftTracker:
 
     def get_active_ids(self) -> list[str]:
         return list(self._active.keys())
-
-
-# ──────────────────────────────────────────────────────────────────── #
-#  Backwards-compat alias (gebruikt door bestaande sensor.py-imports) #
-# ──────────────────────────────────────────────────────────────────── #
-AvoidedPeakTracker = PeakAvoidTracker

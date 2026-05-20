@@ -35,6 +35,36 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 
 
+def track_action(
+    config: dict,
+    iteration_actions: list,
+    entity_id: str,
+    action: str,
+    value=None,
+) -> None:
+    """Record a service call in the shared iteration-actions list for the decision log.
+    No-op when CONF_DEBUG_DECISION_LOGGING is off."""
+    if not config.get(CONF_DEBUG_DECISION_LOGGING, False):
+        return
+    entry: dict = {"entity_id": entity_id, "action": action}
+    if value is not None:
+        entry["value"] = value
+    iteration_actions.append(entry)
+
+
+def read_sensor(hass: HomeAssistant, entity_id: Optional[str]) -> Optional[float]:
+    """Read a float value from a HA sensor state. Returns None when unknown/unavailable."""
+    if not entity_id:
+        return None
+    state = hass.states.get(entity_id)
+    if state is None or state.state in ("unknown", "unavailable", ""):
+        return None
+    try:
+        return float(state.state)
+    except (ValueError, TypeError):
+        return None
+
+
 class BaseDecider:
     """
     Basisklasse voor Peak Guard deciders.
@@ -85,34 +115,10 @@ class BaseDecider:
             self.ev_guard.add_warning(str(msg))
 
     def _sensor_value(self, entity_id: Optional[str]) -> Optional[float]:
-        """Lees een float-waarde uit een HA sensor state. Geeft None bij onbekend/unavailable."""
-        if not entity_id:
-            return None
-        state = self.hass.states.get(entity_id)
-        if state is None or state.state in ("unknown", "unavailable", ""):
-            return None
-        try:
-            return float(state.state)
-        except (ValueError, TypeError):
-            return None
+        return read_sensor(self.hass, entity_id)
 
-    def _track_action(
-        self,
-        entity_id: str,
-        action: str,
-        value=None,
-    ) -> None:
-        """
-        Registreer een uitgevoerde service-call voor de beslissingslog.
-
-        No-op als CONF_DEBUG_DECISION_LOGGING uitstaat; geen overhead in productie.
-        """
-        if not self.config.get(CONF_DEBUG_DECISION_LOGGING, False):
-            return
-        entry: dict = {"entity_id": entity_id, "action": action}
-        if value is not None:
-            entry["value"] = value
-        self._iteration_actions.append(entry)
+    def _track_action(self, entity_id: str, action: str, value=None) -> None:
+        track_action(self.config, self._iteration_actions, entity_id, action, value)
 
     # ------------------------------------------------------------------ #
     #  Herstel-kandidaten                                                  #
@@ -156,7 +162,7 @@ class BaseDecider:
             [d for d in cascade if d.enabled], key=lambda x: x.priority
         )
         label = "PIEK" if cascade_type == "peak" else "SOLAR"
-        self._warn(
+        _LOGGER.info(
             "Peak Guard [%s cascade]: start — overschot=%.0f W, %d apparaat/apparaten "
             "(prioriteitsvolgorde: %s)",
             label, excess, len(sorted_devices),
@@ -165,7 +171,7 @@ class BaseDecider:
         remaining = excess
         for device in sorted_devices:
             if remaining <= 0:
-                self._warn(
+                _LOGGER.info(
                     "Peak Guard [%s cascade]: overschot opgelost (0 W resterend) — "
                     "verdere apparaten niet verwerkt",
                     label,
@@ -187,7 +193,7 @@ class BaseDecider:
                     label, device.name, abs(handled), remaining,
                 )
             else:
-                self._warn(
+                _LOGGER.info(
                     "Peak Guard [%s cascade]:   · '%s' — geen actie: %s",
                     label, device.name, self._last_skip_reason or "zie detail-logs",
                 )
@@ -198,7 +204,7 @@ class BaseDecider:
                 label, remaining,
             )
         else:
-            self._warn(
+            _LOGGER.info(
                 "Peak Guard [%s cascade]: klaar — overschot volledig verwerkt ✓",
                 label,
             )
