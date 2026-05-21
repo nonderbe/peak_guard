@@ -28,7 +28,8 @@ from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN, ACTION_EV_CHARGER, DEFAULT_EV_MIN_AMPERE, DEFAULT_EV_MAX_AMPERE
-from .controller import CascadeDevice, PeakGuardController
+from .controller import PeakGuardController
+from .models import EVChargerDevice
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -56,9 +57,9 @@ async def async_setup_entry(
         all_devices = list(controller.peak_cascade) + list(controller.inject_cascade)
         seen_in_batch: set[str] = set()
         for device in all_devices:
-            if device.action_type != ACTION_EV_CHARGER:
+            if not isinstance(device, EVChargerDevice):
                 continue
-            if not (device.ev and device.ev.current_entity):
+            if not device.current_entity:
                 continue  # geen stroomsensor → kan stroom niet instellen
             if device.id in known_ids or device.id in seen_in_batch:
                 continue
@@ -102,22 +103,20 @@ class PeakGuardEVCurrentNumber(NumberEntity):
         self,
         hass: HomeAssistant,
         controller: PeakGuardController,
-        device: CascadeDevice,
+        device: EVChargerDevice,
     ) -> None:
         self._hass          = hass
         self._controller    = controller
         self._device        = device
-        self._current_entity = device.ev.current_entity if device.ev else None  # type: ignore[assignment]
+        self._current_entity = device.current_entity
 
         slug = device.id.replace("-", "_").lower()
         self._attr_unique_id = f"{DOMAIN}_ev_current_{slug}"
         self._attr_name      = f"{device.name} — laadstroom"
         self._attr_device_info = DEVICE_INFO_CASCADE
 
-        # Bereik uit device-configuratie
-        _ev_min = device.ev.min_current if device.ev else None
         self._attr_native_min_value = float(
-            _ev_min if _ev_min is not None
+            device.min_current if device.min_current is not None
             else (device.min_value if device.min_value is not None else DEFAULT_EV_MIN_AMPERE)
         )
         self._attr_native_max_value = float(
@@ -149,10 +148,10 @@ class PeakGuardEVCurrentNumber(NumberEntity):
 
     @property
     def extra_state_attributes(self) -> dict:
-        phases = (self._device.ev.phases if self._device.ev else None) or 1
+        phases = self._device.phases or 1
         voltage = 400.0 if phases == 3 else 230.0
         current_a = self.native_value
-        _ev_switch = (self._device.ev.switch_entity if self._device.ev else None) or self._device.entity_id
+        _ev_switch = self._device.switch_entity or self._device.entity_id
         return {
             "cascade_device_id":    self._device.id,
             "ev_current_entity":    self._current_entity,

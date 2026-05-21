@@ -32,7 +32,8 @@ from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN, ACTION_EV_CHARGER
-from .controller import CascadeDevice, PeakGuardController
+from .controller import PeakGuardController
+from .models import _BaseCascadeDevice, EVChargerDevice
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -104,18 +105,17 @@ class PeakGuardDeviceSwitch(SwitchEntity):
         self,
         hass: HomeAssistant,
         controller: PeakGuardController,
-        device: CascadeDevice,
+        device: _BaseCascadeDevice,
     ) -> None:
         self._hass       = hass
         self._controller = controller
         self._device     = device
 
-        # Voor EV: gebruik ev.switch_entity als primaire entity
-        self._target_entity = (
-            (device.ev.switch_entity if device.ev else None) or device.entity_id
-            if device.action_type == ACTION_EV_CHARGER
-            else device.entity_id
-        )
+        # Voor EV: gebruik switch_entity als primaire entity
+        if isinstance(device, EVChargerDevice):
+            self._target_entity = device.switch_entity or device.entity_id
+        else:
+            self._target_entity = device.entity_id
 
         slug = device.id.replace("-", "_").lower()
         self._attr_unique_id   = f"{DOMAIN}_switch_{slug}"
@@ -150,8 +150,8 @@ class PeakGuardDeviceSwitch(SwitchEntity):
             "action_type":         self._device.action_type,
             "onderliggende_entity": self._target_entity,
         }
-        if self._device.action_type == ACTION_EV_CHARGER:
-            attrs["laadstroom_entity"] = self._device.ev.current_entity if self._device.ev else None
+        if isinstance(self._device, EVChargerDevice):
+            attrs["laadstroom_entity"] = self._device.current_entity
         return attrs
 
     # ------------------------------------------------------------------ #

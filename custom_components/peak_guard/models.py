@@ -2,72 +2,50 @@
 Peak Guard — models.py
 
 Alle dataclasses, enums en waarde-objecten die door meerdere modules
-worden gebruikt.  Geen HA-afhankelijkheden; puur Python.
+worden gebruikt.
 """
 
+from __future__ import annotations
+
+import logging
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Deque, Optional
+from typing import TYPE_CHECKING, Any, Callable, Deque, Optional
+
+from homeassistant.exceptions import HomeAssistantError
+
+if TYPE_CHECKING:
+    pass
+
+_LOGGER = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────────────────────────────────── #
 #  EV spanning-constanten                                                       #
 # ──────────────────────────────────────────────────────────────────────────── #
 
-# 1-fase: U = 230 V  →  P = A × 230
-# 3-fasen: U = 400 V  →  P = A × 400
 EV_VOLTS_1PHASE: float = 230.0
 EV_VOLTS_3PHASE: float = 400.0
 
 
 # ──────────────────────────────────────────────────────────────────────────── #
 #  EV Rate-limiting & hysteresis constanten                                     #
-#  (allemaal instelbaar zonder logica aan te raken)                             #
 # ──────────────────────────────────────────────────────────────────────────── #
 
-# Minimale amp-delta voor een set_value call.
-# Tesla negeert sub-1A stappen; 1 A ≈ 230–400 W.
 EV_HYSTERESIS_AMPS: float = 1.0
-
-# Minimale seconden tussen opeenvolgende stroom-aanpassingen voor één EV-apparaat.
 EV_MIN_UPDATE_INTERVAL_S: float = 20.0
-
-# Tijdvenster (seconden) waarbinnen de surplus-geschiedenis wordt opgebouwd.
-# De EV start pas nadat dit venster volledig gevuld is met positieve waarden.
 EV_DEBOUNCE_STABLE_S: float = 20.0
-
-# Percentiel van de surplus-geschiedenis dat als "veilige ondergrens" (floor) wordt gebruikt.
-# 10 % betekent: de laadstroom wordt bepaald op de waarde die 90 % van de tijd gehaald wordt.
-# Lager = conservatiever (minder oscillatierisico), hoger = agressiever.
 EV_FLOOR_PERCENTILE: int = 10
-
-# Na het AAN-zetten van de lader weigeren we hem gedurende deze tijd UIT te zetten.
-EV_MIN_ON_DURATION_S: float = 360.0     # 6 minuten
-
-# Na het UIT-zetten van de lader weigeren we hem gedurende deze tijd AAN te zetten.
-EV_MIN_OFF_DURATION_S: float = 300.0    # 5 minuten
-
-# Maximale wachttijd (seconden) om te wachten tot de EV wakker is na wake-up.
+EV_MIN_ON_DURATION_S: float = 360.0
+EV_MIN_OFF_DURATION_S: float = 300.0
 EV_WAKE_TIMEOUT_S: float = 15.0
-
-# Retry-gedrag voor EV schakelaarcommando's (bv. "Command was unsuccessful" van Tesla API).
-EV_CMD_MAX_RETRIES: int = 2        # 2 extra pogingen = 3 totaal
-EV_CMD_RETRY_DELAY_S: float = 3.0  # seconden wachten tussen pogingen
-
-# Globale rate-limiter: maximale EV-service calls per rollend venster.
+EV_CMD_MAX_RETRIES: int = 2
+EV_CMD_RETRY_DELAY_S: float = 3.0
 EV_RATE_LIMIT_MAX_CALLS: int = 12
-EV_RATE_LIMIT_WINDOW_S: float = 600.0   # 10 minuten
-
-# Stroom-sensor ouder dan dit (seconden) wordt als stale beschouwd.
-# PG gebruikt dan last_sent_amps als referentie i.p.v. de (verouderde) sensorwaarde.
-# Bedoeld als workaround voor traag-updatende integraties zoals Tesla Fleet.
+EV_RATE_LIMIT_WINDOW_S: float = 600.0
 EV_SENSOR_STALE_S: float = 180.0
-
-# Na een mislukte wake-up poging: wachttijd (seconden) vóór de volgende poging.
-# 900 s = 15 minuten. Voorkomt dat een niet-thuis of slapende auto tientallen
-# API-calls per uur genereert.
 EV_WAKE_COOLDOWN_S: float = 900.0
 
 
@@ -79,8 +57,8 @@ class EVState(Enum):
     IDLE                = "idle"
     CHARGING            = "charging"
     WAITING_FOR_STABLE  = "waiting_for_stable_surplus"
-    CABLE_DISCONNECTED  = "cable_disconnected"   # laadkabel niet aangesloten
-    SLEEPING            = "sleeping"              # EV in slaapstand, wake-up bezig
+    CABLE_DISCONNECTED  = "cable_disconnected"
+    SLEEPING            = "sleeping"
 
 
 # ──────────────────────────────────────────────────────────────────────────── #
@@ -89,57 +67,21 @@ class EVState(Enum):
 
 @dataclass
 class EVDeviceGuard:
-    """
-    Alle per-apparaat rate-limiting & debounce-toestand voor één EV-lader.
-
-    Leeft in EVGuard._guards[device.id].
-    Reset bij HA-herstart; bewust NIET opgeslagen (veilige standaarden bij boot).
-    """
-    # ---- state machine ------------------------------------------------ #
     state: EVState = EVState.IDLE
-
-    # ---- laatste verzonden waarden (voor redundante calls) ------------ #
-    last_sent_amps:    Optional[float] = None   # ampère werkelijk verzonden
-    last_switch_state: Optional[bool]  = None   # True=aan, False=uit
-
-    # ---- tijdstempels ------------------------------------------------- #
-    last_current_update: Optional[datetime] = None   # laatste set_value call
-    turned_on_at:        Optional[datetime] = None   # wanneer laatste keer AAN gezet
-    turned_off_at:       Optional[datetime] = None   # wanneer laatste keer UIT gezet
-    wake_requested_at:   Optional[datetime] = None   # wake-up button aangeroepen
-
-    # ---- debounce ringbuffer ------------------------------------------ #
-    # Slaat (tijdstempel, surplus_W) tuples op voor stabiliteitscheck
+    last_sent_amps:    Optional[float] = None
+    last_switch_state: Optional[bool]  = None
+    last_current_update: Optional[datetime] = None
+    turned_on_at:        Optional[datetime] = None
+    turned_off_at:       Optional[datetime] = None
+    wake_requested_at:   Optional[datetime] = None
     surplus_history: Deque = field(default_factory=lambda: deque(maxlen=60))
-
-    # ---- wallclock debounce-timer ------------------------------------- #
-    # Gezet op het eerste moment waarop het surplus boven de start-drempel
-    # uitkwam. Gereset via EVGuard._reset_debounce() zodra het surplus
-    # wegvalt of de EV start. Ontkoppelt de debounce-timing volledig van
-    # het loop-interval zodat EV_DEBOUNCE_STABLE_S altijd klopt.
     debounce_start_at:    Optional[datetime] = None
-    debounce_remaining_s: float             = 0.0   # seconden tot debounce klaar (GUI)
-    debounce_floor_w:     float             = 0.0   # tentatieve floor-waarde in W (GUI)
-
-    # ---- debounce doelwaarde ------------------------------------------ #
-    # Laadstroom (A) die PG wil instellen zodra het surplus stabiel is.
-    # Ingesteld bij elke evaluatie zodat de GUI de gewenste actie kan tonen.
+    debounce_remaining_s: float             = 0.0
+    debounce_floor_w:     float             = 0.0
     pending_amps: Optional[int] = None
-
-    # True als Peak Guard zelf de laatste turn_off heeft gegeven (niet de gebruiker).
-    # Wordt gebruikt om te bepalen of de min-OFF-duur gate van toepassing is.
     turned_off_by_pg: bool = False
-
-    # Meest recente reden waarom de solar-evaluatie werd overgeslagen.
-    # Leeg als er geen skip was of als laden actief is.
     skip_reason: str = ""
-
-    # True als PG de SOC-laadlimiet heeft verhoogd via _set_soc_override(override=True).
-    # Voorkomt herhaalde API-calls per loop-iteratie.
     soc_override_active: bool = False
-
-    # Tijdstip tot wanneer wake-up pogingen worden geblokkeerd na een mislukte poging.
-    # Reset bij succesvolle wake-up of als de EV zichzelf aanmeldt.
     wake_cooldown_until: Optional[datetime] = None
 
 
@@ -148,12 +90,6 @@ class EVDeviceGuard:
 # ──────────────────────────────────────────────────────────────────────────── #
 
 class EVRateLimiter:
-    """
-    Sliding-window rate-limiter gedeeld door ALLE EV-lader service calls.
-
-    Bijgehouden tijdstempels van recente calls; weigert nieuwe als het venster vol is.
-    """
-
     def __init__(
         self,
         max_calls: int = EV_RATE_LIMIT_MAX_CALLS,
@@ -189,119 +125,427 @@ class EVRateLimiter:
 
 
 # ──────────────────────────────────────────────────────────────────────────── #
-#  Cascade dataclasses                                                           #
+#  DeviceSnapshot                                                               #
 # ──────────────────────────────────────────────────────────────────────────── #
 
 @dataclass
-class EVChargerConfig:
-    """EV-lader instellingen — onderdeel van CascadeDevice voor action_type == 'ev_charger'."""
-    switch_entity:     Optional[str]   = None   # schakelaar-entity (valt terug op entity_id)
-    current_entity:    Optional[str]   = None   # laadstroom-number entity
-    soc_entity:        Optional[str]   = None   # SOC-limiet-number entity
-    battery_entity:    Optional[str]   = None   # huidig batterijniveau sensor
-    max_soc:           Optional[int]   = None   # gewenst maximum SOC % bij zonne-overschot
-    phases:            int             = 1      # aantal fasen (1 of 3)
-    min_current:       Optional[float] = None   # hardware-minimum laadstroom (A)
-    start_threshold_w: Optional[float] = None   # solar start-drempel (W)
-    cable_entity:      Optional[str]   = None   # kabelaansluiting-sensor
-    wake_button:       Optional[str]   = None   # button.* om EV wakker te maken
-    status_sensor:     Optional[str]   = None   # verbindingsstatus-sensor
-    location_tracker:  Optional[str]   = None   # device_tracker.* — thuis = home/on
-
-
-@dataclass
-class CascadeDevice:
-    """
-    Beschrijft een apparaat in een cascade.
-
-    EV-laders (action_type == 'ev_charger') hebben hun configuratie in het ev-veld.
-    Alle andere action_types laten ev op None.
-
-    Velden voor throttle (legacy): min_value, max_value, power_per_unit.
-
-    Serialisatie: to_dict() geeft een plat dict (backward compat met opgeslagen JSON
-    en het frontend-paneel). from_dict() herstelt vanuit datzelfde platte formaat.
-    """
-    id:             str
-    name:           str
-    entity_id:      str
-    priority:       int
-    action_type:    str
-    power_watts:    int = 0
-    min_value:      Optional[float] = None
-    max_value:      Optional[float] = None
-    power_per_unit: Optional[float] = None
-    enabled:        bool = True
-    ev:             Optional[EVChargerConfig] = None
-
-    def to_dict(self) -> dict:
-        d: dict = {
-            "id":             self.id,
-            "name":           self.name,
-            "entity_id":      self.entity_id,
-            "priority":       self.priority,
-            "action_type":    self.action_type,
-            "power_watts":    self.power_watts,
-            "min_value":      self.min_value,
-            "max_value":      self.max_value,
-            "power_per_unit": self.power_per_unit,
-            "enabled":        self.enabled,
-        }
-        if self.ev is not None:
-            d.update({
-                "ev_switch_entity":    self.ev.switch_entity,
-                "ev_current_entity":   self.ev.current_entity,
-                "ev_soc_entity":       self.ev.soc_entity,
-                "ev_battery_entity":   self.ev.battery_entity,
-                "ev_max_soc":          self.ev.max_soc,
-                "ev_phases":           self.ev.phases,
-                "ev_min_current":      self.ev.min_current,
-                "start_threshold_w":   self.ev.start_threshold_w,
-                "ev_cable_entity":     self.ev.cable_entity,
-                "ev_wake_button":      self.ev.wake_button,
-                "ev_status_sensor":    self.ev.status_sensor,
-                "ev_location_tracker": self.ev.location_tracker,
-            })
-        return d
-
-    @classmethod
-    def from_dict(cls, d: dict) -> "CascadeDevice":
-        """Herstel vanuit een plat dict (opgeslagen formaat of API-payload)."""
-        ev: Optional[EVChargerConfig] = None
-        if d.get("action_type") == "ev_charger":
-            ev = EVChargerConfig(
-                switch_entity     = d.get("ev_switch_entity"),
-                current_entity    = d.get("ev_current_entity"),
-                soc_entity        = d.get("ev_soc_entity"),
-                battery_entity    = d.get("ev_battery_entity"),
-                max_soc           = d.get("ev_max_soc"),
-                phases            = d.get("ev_phases", 1),
-                min_current       = d.get("ev_min_current"),
-                start_threshold_w = d.get("start_threshold_w"),
-                cable_entity      = d.get("ev_cable_entity"),
-                wake_button       = d.get("ev_wake_button"),
-                status_sensor     = d.get("ev_status_sensor"),
-                location_tracker  = d.get("ev_location_tracker"),
-            )
-        return cls(
-            id            = d["id"],
-            name          = d["name"],
-            entity_id     = d["entity_id"],
-            priority      = d["priority"],
-            action_type   = d["action_type"],
-            power_watts   = d.get("power_watts", 0),
-            min_value     = d.get("min_value"),
-            max_value     = d.get("max_value"),
-            power_per_unit = d.get("power_per_unit"),
-            enabled       = d.get("enabled", True),
-            ev            = ev,
-        )
-
-
-@dataclass
 class DeviceSnapshot:
-    """Oorspronkelijke staat van een apparaat voor een Peak Guard ingreep."""
     entity_id:        str
     original_state:   str
     original_current: Optional[float] = None
     original_soc:     Optional[float] = None
+
+
+# ──────────────────────────────────────────────────────────────────────────── #
+#  Cascade context (dependency bundle for apply/restore methods)                #
+# ──────────────────────────────────────────────────────────────────────────── #
+
+@dataclass
+class CascadeContext:
+    hass: Any
+    cascade_type: str
+    peak_tracker: Any
+    solar_tracker: Any
+    ev_guard: Any
+    track_action: Callable
+    warn: Callable
+    last_skip_reason: str = ""
+
+
+# ──────────────────────────────────────────────────────────────────────────── #
+#  Cascade device hierarchy                                                     #
+# ──────────────────────────────────────────────────────────────────────────── #
+
+@dataclass
+class _BaseCascadeDevice:
+    """Base class for all cascade device entries."""
+    id:          str
+    name:        str
+    entity_id:   str
+    priority:    int
+    action_type: str
+    power_watts: int  = 0
+    enabled:     bool = True
+
+    # ---- factory ----------------------------------------------------- #
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "_BaseCascadeDevice":
+        return from_dict(d)
+
+    # ---- polymorphic apply / restore --------------------------------- #
+
+    async def apply(
+        self,
+        excess: float,
+        snapshots: dict,
+        ctx: CascadeContext,
+    ) -> float:
+        raise NotImplementedError(f"{type(self).__name__}.apply not implemented")
+
+    async def restore(
+        self,
+        snapshot: DeviceSnapshot,
+        ctx: CascadeContext,
+    ) -> bool:
+        raise NotImplementedError(f"{type(self).__name__}.restore not implemented")
+
+
+@dataclass
+class SwitchOffDevice(_BaseCascadeDevice):
+    """Peak-limiting switch: turns a device OFF to reduce peak demand."""
+
+    async def apply(self, excess: float, snapshots: dict, ctx: CascadeContext) -> float:
+        state = ctx.hass.states.get(self.entity_id)
+        if state is None:
+            ctx.warn(
+                "Peak Guard: entity '%s' ('%s') niet gevonden in HA — apparaat overgeslagen",
+                self.entity_id, self.name,
+            )
+            return excess
+        if state.state == "on":
+            if self.entity_id not in snapshots:
+                snapshots[self.entity_id] = DeviceSnapshot(
+                    entity_id=self.entity_id, original_state=state.state)
+            try:
+                await ctx.hass.services.async_call(
+                    "switch", "turn_off", {"entity_id": self.entity_id}, blocking=True)
+            except HomeAssistantError as err:
+                ctx.warn(
+                    "Peak Guard: '%s' niet bereikbaar voor turn_off — "
+                    "snapshot teruggedraaid, volgende cyclus opnieuw (%s)",
+                    self.name, err,
+                )
+                snapshots.pop(self.entity_id, None)
+                return excess
+            ctx.track_action(self.entity_id, "switch.turn_off")
+            _LOGGER.info(
+                "Peak Guard: → '%s' UITgeschakeld (piekbeperking, -%d W, overschot was %.0f W)",
+                self.name, self.power_watts, excess,
+            )
+            ctx.peak_tracker.record_pending_avoid(
+                device_id=self.id, device_name=self.name,
+                nominal_kw=self.power_watts / 1000.0, ts=datetime.now(timezone.utc),
+            )
+            return excess - self.power_watts
+        _LOGGER.info(
+            "Peak Guard: → '%s' al UIT — overgeslagen (piekbeperking, staat=%s)",
+            self.name, state.state,
+        )
+        return excess
+
+    async def restore(self, snapshot: DeviceSnapshot, ctx: CascadeContext) -> bool:
+        state = ctx.hass.states.get(self.entity_id)
+        if state is None:
+            ctx.warn("Peak Guard: kan '%s' niet herstellen — entity niet gevonden", self.name)
+            return False
+        try:
+            if snapshot.original_state == "on" and state.state != "on":
+                await ctx.hass.services.async_call(
+                    "switch", "turn_on", {"entity_id": self.entity_id}, blocking=True)
+                _LOGGER.info(
+                    "Peak Guard: '%s' terug ingeschakeld na piekbeperking (originele staat: %s)",
+                    self.name, snapshot.original_state,
+                )
+                ctx.peak_tracker.start_measurement_on_turnon(
+                    device_id=self.id, device_name=self.name, ts=datetime.now(timezone.utc))
+            elif snapshot.original_state == "on" and state.state == "on":
+                event = ctx.peak_tracker.complete_peak_calculation(
+                    device_id=self.id, now=datetime.now(timezone.utc))
+                if event:
+                    _LOGGER.info(
+                        "Peak Guard: piek-event afgerond voor '%s' — "
+                        "duur=%.1f min, vermeden=%.3f kW, besparing=€%.4f",
+                        self.name, event.measured_duration_min,
+                        event.avoided_peak_kw, event.savings_euro,
+                    )
+            return True
+        except HomeAssistantError as err:
+            ctx.warn(
+                "Peak Guard: '%s' niet bereikbaar bij herstel — "
+                "volgende cyclus opnieuw proberen (%s)", self.name, err)
+        except (ValueError, TypeError) as err:
+            _LOGGER.error("Peak Guard: fout bij herstellen '%s': %s", self.name, err)
+        return False
+
+
+@dataclass
+class SwitchOnDevice(_BaseCascadeDevice):
+    """Injection-prevention switch: turns a device ON to consume solar surplus."""
+
+    async def apply(self, excess: float, snapshots: dict, ctx: CascadeContext) -> float:
+        state = ctx.hass.states.get(self.entity_id)
+        if state is None:
+            ctx.warn(
+                "Peak Guard: entity '%s' ('%s') niet gevonden in HA — apparaat overgeslagen",
+                self.entity_id, self.name,
+            )
+            return excess
+        if state.state == "off":
+            if self.entity_id not in snapshots:
+                snapshots[self.entity_id] = DeviceSnapshot(
+                    entity_id=self.entity_id, original_state=state.state)
+            try:
+                await ctx.hass.services.async_call(
+                    "switch", "turn_on", {"entity_id": self.entity_id}, blocking=True)
+            except HomeAssistantError as err:
+                ctx.warn(
+                    "Peak Guard: '%s' niet bereikbaar voor turn_on — "
+                    "snapshot teruggedraaid, volgende cyclus opnieuw (%s)",
+                    self.name, err,
+                )
+                snapshots.pop(self.entity_id, None)
+                return excess
+            ctx.track_action(self.entity_id, "switch.turn_on")
+            _LOGGER.info(
+                "Peak Guard: → '%s' AANgeschakeld (injectiepreventie, +%d W, overschot was %.0f W)",
+                self.name, self.power_watts, excess,
+            )
+            ctx.solar_tracker.start_solar_measurement(
+                device_id=self.id, device_name=self.name,
+                nominal_kw=self.power_watts / 1000.0, ts=datetime.now(timezone.utc),
+            )
+            return excess - self.power_watts
+        _LOGGER.info(
+            "Peak Guard: → '%s' al AAN — overgeslagen (injectiepreventie, staat=%s)",
+            self.name, state.state,
+        )
+        return excess
+
+    async def restore(self, snapshot: DeviceSnapshot, ctx: CascadeContext) -> bool:
+        state = ctx.hass.states.get(self.entity_id)
+        if state is None:
+            ctx.warn("Peak Guard: kan '%s' niet herstellen — entity niet gevonden", self.name)
+            return False
+        try:
+            if snapshot.original_state == "off" and state.state != "off":
+                await ctx.hass.services.async_call(
+                    "switch", "turn_off", {"entity_id": self.entity_id}, blocking=True)
+                _LOGGER.info(
+                    "Peak Guard: '%s' terug uitgeschakeld na injectiepreventie", self.name)
+                event = ctx.solar_tracker.complete_solar_calculation(
+                    device_id=self.id, now=datetime.now(timezone.utc))
+                if event:
+                    _LOGGER.info(
+                        "Peak Guard: solar-event afgerond voor '%s' — "
+                        "duur=%.1f min, verschoven=%.4f kWh, besparing=€%.4f",
+                        self.name, event.measured_duration_min,
+                        event.shifted_kwh, event.savings_euro,
+                    )
+            return True
+        except HomeAssistantError as err:
+            ctx.warn(
+                "Peak Guard: '%s' niet bereikbaar bij herstel — "
+                "volgende cyclus opnieuw proberen (%s)", self.name, err)
+        except (ValueError, TypeError) as err:
+            _LOGGER.error("Peak Guard: fout bij herstellen '%s': %s", self.name, err)
+        return False
+
+
+@dataclass
+class ThrottleDevice(_BaseCascadeDevice):
+    """Legacy throttle: reduces a number entity to shed power."""
+    min_value:      Optional[float] = None
+    max_value:      Optional[float] = None
+    power_per_unit: Optional[float] = None
+
+    async def apply(self, excess: float, snapshots: dict, ctx: CascadeContext) -> float:
+        state = ctx.hass.states.get(self.entity_id)
+        if state is None:
+            ctx.warn(
+                "Peak Guard: entity '%s' ('%s') niet gevonden in HA — apparaat overgeslagen",
+                self.entity_id, self.name,
+            )
+            return excess
+        try:
+            current = float(state.state)
+            ppu = self.power_per_unit or 690.0
+            new_value = max(self.min_value or 0, current - (excess / ppu))
+            new_value = round(new_value, 1)
+            reduction = (current - new_value) * ppu
+            if new_value < current:
+                if self.entity_id not in snapshots:
+                    snapshots[self.entity_id] = DeviceSnapshot(
+                        entity_id=self.entity_id, original_state=str(current))
+                await ctx.hass.services.async_call(
+                    "number", "set_value",
+                    {"entity_id": self.entity_id, "value": new_value},
+                    blocking=True,
+                )
+                ctx.track_action(self.entity_id, "number.set_value", new_value)
+                _LOGGER.info(
+                    "Peak Guard: '%s' teruggeschroefd %.1f → %.1f (-%d W)",
+                    self.name, current, new_value, reduction,
+                )
+                return excess - reduction
+        except (ValueError, TypeError) as err:
+            _LOGGER.error("Peak Guard throttle '%s': %s", self.name, err)
+        return excess
+
+    async def restore(self, snapshot: DeviceSnapshot, ctx: CascadeContext) -> bool:
+        state = ctx.hass.states.get(self.entity_id)
+        if state is None:
+            ctx.warn("Peak Guard: kan '%s' niet herstellen — entity niet gevonden", self.name)
+            return False
+        try:
+            original = float(snapshot.original_state)
+            current  = float(state.state)
+            new_value = round(original, 1)
+            if new_value != round(current, 1):
+                await ctx.hass.services.async_call(
+                    "number", "set_value",
+                    {"entity_id": self.entity_id, "value": new_value},
+                    blocking=True,
+                )
+                _LOGGER.info(
+                    "Peak Guard: '%s' hersteld %s → %s", self.name, current, new_value)
+            return True
+        except HomeAssistantError as err:
+            ctx.warn(
+                "Peak Guard: '%s' niet bereikbaar bij herstel — "
+                "volgende cyclus opnieuw proberen (%s)", self.name, err)
+        except (ValueError, TypeError) as err:
+            _LOGGER.error("Peak Guard: fout bij herstellen '%s': %s", self.name, err)
+        return False
+
+
+@dataclass
+class EVChargerDevice(_BaseCascadeDevice):
+    """EV charger: variable-current injection-prevention and peak-limiting device."""
+    min_value:       Optional[float] = None
+    max_value:       Optional[float] = None
+    # EV-specific fields (absorbed from the former EVChargerConfig)
+    switch_entity:     Optional[str]   = None
+    current_entity:    Optional[str]   = None
+    soc_entity:        Optional[str]   = None
+    battery_entity:    Optional[str]   = None
+    max_soc:           Optional[int]   = None
+    phases:            int             = 1
+    min_current:       Optional[float] = None
+    start_threshold_w: Optional[float] = None
+    cable_entity:      Optional[str]   = None
+    wake_button:       Optional[str]   = None
+    status_sensor:     Optional[str]   = None
+    location_tracker:  Optional[str]   = None
+
+    async def apply(self, excess: float, snapshots: dict, ctx: CascadeContext) -> float:
+        result = await ctx.ev_guard.apply_action(
+            device=self,
+            excess=excess,
+            snapshots=snapshots,
+            cascade_type=ctx.cascade_type,
+            peak_tracker=ctx.peak_tracker,
+            solar_tracker=ctx.solar_tracker,
+        )
+        ctx.last_skip_reason = ctx.ev_guard.last_skip_reason
+        return result
+
+    async def restore(self, snapshot: DeviceSnapshot, ctx: CascadeContext) -> bool:
+        return await ctx.ev_guard.restore(
+            device=self,
+            snapshot=snapshot,
+            peak_tracker=ctx.peak_tracker,
+            solar_tracker=ctx.solar_tracker,
+            cascade_type=ctx.cascade_type,
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────── #
+#  Factory + migration                                                          #
+# ──────────────────────────────────────────────────────────────────────────── #
+
+def _migrate_flat_format(d: dict) -> dict:
+    """Convert old flat EV format (ev_switch_entity, ev_phases, …) to new format.
+
+    Also handles intermediate nested format {"ev": {...}} from Step 1.
+    Returns a new dict; never mutates the input.
+    """
+    has_old_keys = any(k.startswith("ev_") for k in d)
+    if not has_old_keys and "ev" not in d:
+        return d
+    d = dict(d)
+    # Intermediate nested format → flatten
+    if "ev" in d and isinstance(d.get("ev"), dict):
+        ev = d.pop("ev")
+        d.update(ev)
+        return d
+    # Old flat format with ev_ prefix → strip prefix
+    mapping = {
+        "ev_switch_entity":    "switch_entity",
+        "ev_current_entity":   "current_entity",
+        "ev_soc_entity":       "soc_entity",
+        "ev_battery_entity":   "battery_entity",
+        "ev_max_soc":          "max_soc",
+        "ev_phases":           "phases",
+        "ev_min_current":      "min_current",
+        "ev_cable_entity":     "cable_entity",
+        "ev_wake_button":      "wake_button",
+        "ev_status_sensor":    "status_sensor",
+        "ev_location_tracker": "location_tracker",
+        # start_threshold_w has no prefix — keep as-is
+    }
+    for old_key, new_key in mapping.items():
+        if old_key in d:
+            d[new_key] = d.pop(old_key)
+    return d
+
+
+def from_dict(d: dict) -> _BaseCascadeDevice:
+    """Factory: create the right device subclass from a serialised dict.
+
+    Accepts both the current format and old flat/nested EV formats (migrates
+    on the fly).
+    """
+    d = _migrate_flat_format(d)
+    action_type = d["action_type"]
+    base = {
+        "id":          d["id"],
+        "name":        d["name"],
+        "entity_id":   d["entity_id"],
+        "priority":    d["priority"],
+        "action_type": action_type,
+        "power_watts": d.get("power_watts", 0),
+        "enabled":     d.get("enabled", True),
+    }
+    if action_type == "switch_off":
+        return SwitchOffDevice(**base)
+    if action_type == "switch_on":
+        return SwitchOnDevice(**base)
+    if action_type == "throttle":
+        return ThrottleDevice(
+            **base,
+            min_value=d.get("min_value"),
+            max_value=d.get("max_value"),
+            power_per_unit=d.get("power_per_unit"),
+        )
+    if action_type == "ev_charger":
+        return EVChargerDevice(
+            **base,
+            min_value=d.get("min_value"),
+            max_value=d.get("max_value"),
+            switch_entity=d.get("switch_entity"),
+            current_entity=d.get("current_entity"),
+            soc_entity=d.get("soc_entity"),
+            battery_entity=d.get("battery_entity"),
+            max_soc=d.get("max_soc"),
+            phases=d.get("phases", 1),
+            min_current=d.get("min_current"),
+            start_threshold_w=d.get("start_threshold_w"),
+            cable_entity=d.get("cable_entity"),
+            wake_button=d.get("wake_button"),
+            status_sensor=d.get("status_sensor"),
+            location_tracker=d.get("location_tracker"),
+        )
+    # Unknown action_type: fall back to a SwitchOffDevice shell
+    _LOGGER.warning("Peak Guard: onbekend action_type '%s' voor '%s' — SwitchOff fallback",
+                    action_type, d.get("name", "?"))
+    return SwitchOffDevice(**base)
+
+
+# ──────────────────────────────────────────────────────────────────────────── #
+#  Backward-compat aliases (keeps old import sites working during transition)  #
+# ──────────────────────────────────────────────────────────────────────────── #
+
+# CascadeDevice used as a type alias for _BaseCascadeDevice so that
+# existing 'from .models import CascadeDevice' imports still resolve.
+CascadeDevice = _BaseCascadeDevice

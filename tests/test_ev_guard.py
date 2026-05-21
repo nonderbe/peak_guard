@@ -22,8 +22,8 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from custom_components.peak_guard.models import (
-    CascadeDevice,
-    EVChargerConfig,
+    _BaseCascadeDevice,
+    EVChargerDevice,
     EVDeviceGuard,
     EVRateLimiter,
     EVState,
@@ -32,6 +32,7 @@ from custom_components.peak_guard.models import (
     EV_MIN_UPDATE_INTERVAL_S,
     EV_HYSTERESIS_AMPS,
     EV_VOLTS_1PHASE,
+    from_dict as cascade_from_dict,
 )
 from custom_components.peak_guard.deciders.ev_guard import EVGuard
 from tests.conftest import (
@@ -132,11 +133,11 @@ class TestHelpers:
         self.hass = MockHass()
         self.guard_obj = EVGuard(hass=self.hass, config={}, iteration_actions=[])
 
-    def _device(self, **kwargs) -> CascadeDevice:
+    def _device(self, **kwargs) -> _BaseCascadeDevice:
         base = {"id": "ev1", "name": "Tesla", "entity_id": "switch.ev",
                 "priority": 1, "action_type": "ev_charger"}
         base.update(kwargs)
-        return CascadeDevice.from_dict(base)
+        return cascade_from_dict(base)
 
     def test_cable_connected_no_entity_assumes_connected(self):
         """Zonder geconfigureerde kabelentity → aannemen dat kabel aangesloten is."""
@@ -272,7 +273,7 @@ class TestApplyActionSolar:
         Kabel ontkoppeld terwijl EV aan het laden was
         → EV uitschakelen, staat = CABLE_DISCONNECTED.
         """
-        self.device.ev.cable_entity = "sensor.cable"
+        self.device.cable_entity = "sensor.cable"
         self.hass.states.set("switch.tesla_charge", "on")
         self.hass.states.set("sensor.cable", "disconnected")
         await self._apply_solar(5000.0)

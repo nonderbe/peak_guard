@@ -13,8 +13,11 @@ from .decision_logger import DecisionLogger
 from .deciders import EVGuard, InjectionDecider, PeakDecider
 from .deciders.base import read_sensor
 from .models import (
+    _BaseCascadeDevice,
     CascadeDevice,
     DeviceSnapshot,
+    EVChargerDevice,
+    from_dict as cascade_from_dict,
     EV_MIN_OFF_DURATION_S,
     EV_RATE_LIMIT_MAX_CALLS,
     EV_RATE_LIMIT_WINDOW_S,
@@ -54,8 +57,8 @@ class PeakGuardController:
     def __init__(self, hass: HomeAssistant, config: dict):
         self.hass = hass
         self.config = config
-        self.peak_cascade:   List[CascadeDevice] = []
-        self.inject_cascade: List[CascadeDevice] = []
+        self.peak_cascade:   List[_BaseCascadeDevice] = []
+        self.inject_cascade: List[_BaseCascadeDevice] = []
         self._monitoring = False
         self._task: Optional[asyncio.Task] = None
         self._store = Store(hass, STORAGE_VERSION, STORAGE_KEY)
@@ -136,9 +139,9 @@ class PeakGuardController:
         data = await self._store.async_load()
         if data:
             self.peak_cascade.clear()
-            self.peak_cascade.extend(CascadeDevice.from_dict(d) for d in data.get("peak", []))
+            self.peak_cascade.extend(cascade_from_dict(d) for d in data.get("peak", []))
             self.inject_cascade.clear()
-            self.inject_cascade.extend(CascadeDevice.from_dict(d) for d in data.get("inject", []))
+            self.inject_cascade.extend(cascade_from_dict(d) for d in data.get("inject", []))
             peak_entity_ids   = {d.entity_id for d in self.peak_cascade}
             inject_entity_ids = {d.entity_id for d in self.inject_cascade}
             for k, v in data.get("peak_snapshots", {}).items():
@@ -161,8 +164,8 @@ class PeakGuardController:
 
     async def async_save(self):
         await self._store.async_save({
-            "peak":   [d.to_dict() for d in self.peak_cascade],
-            "inject": [d.to_dict() for d in self.inject_cascade],
+            "peak":   [asdict(d) for d in self.peak_cascade],
+            "inject": [asdict(d) for d in self.inject_cascade],
             "peak_snapshots":   {k: asdict(v) for k, v in self._peak_snapshots.items()},
             "inject_snapshots": {k: asdict(v) for k, v in self._inject_snapshots.items()},
         })
@@ -174,11 +177,11 @@ class PeakGuardController:
     def to_dict(self) -> dict:
         return {
             "peak": [
-                d.to_dict()
+                asdict(d)
                 for d in sorted(self.peak_cascade, key=lambda x: x.priority)
             ],
             "inject": [
-                d.to_dict()
+                asdict(d)
                 for d in sorted(self.inject_cascade, key=lambda x: x.priority)
             ],
             "config": {
@@ -226,7 +229,7 @@ class PeakGuardController:
         }
 
     def update_cascade(self, cascade_type: str, devices: list):
-        parsed = [CascadeDevice.from_dict(d) for d in devices]
+        parsed = [cascade_from_dict(d) for d in devices]
         new_entity_ids = {d.entity_id for d in parsed}
         if cascade_type == "peak":
             self.peak_cascade.clear()
@@ -302,26 +305,18 @@ class PeakGuardController:
         all_entities: set = set()
         switch_entities: set = set()
         for device in self.inject_cascade:
-            if device.action_type != ACTION_EV_CHARGER:
+            if not isinstance(device, EVChargerDevice):
                 continue
-            ev = device.ev
-            if ev is None:
-                continue
-            # Laadkabelstatus — meest kritisch: kabel koppelen/ontkoppelen
-            if ev.cable_entity:
-                all_entities.add(ev.cable_entity)
-            # Laadschakelaar — detecteer handmatig uitschakelen door gebruiker;
-            # turn_on wordt door PG zelf gedaan en hoeft geen extra loop te triggeren
-            sw = ev.switch_entity or device.entity_id
+            if device.cable_entity:
+                all_entities.add(device.cable_entity)
+            sw = device.switch_entity or device.entity_id
             if sw:
                 all_entities.add(sw)
                 switch_entities.add(sw)
-            # Verbindingsstatus — detecteer wanneer Tesla wakker wordt (unavailable → online)
-            if ev.status_sensor:
-                all_entities.add(ev.status_sensor)
-            # Locatie — detecteer wanneer EV thuiskomt zodat solar-lading direct kan starten
-            if ev.location_tracker:
-                all_entities.add(ev.location_tracker)
+            if device.status_sensor:
+                all_entities.add(device.status_sensor)
+            if device.location_tracker:
+                all_entities.add(device.location_tracker)
         return all_entities, switch_entities
 
     def _setup_ev_listeners(self) -> None:

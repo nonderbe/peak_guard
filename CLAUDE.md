@@ -76,3 +76,24 @@ EV chargers are significantly more complex than simple switches:
 ## No external Python dependencies
 
 The integration imports only from the Python standard library and Home Assistant built-ins. Do not add third-party packages.
+
+# Session limit recovery policy
+
+When approaching session or quota exhaustion:
+
+1. Stop unsafe operations
+2. Commit all current work to git
+3. Update NEXT_STEPS.md with:
+
+   * current status
+   * pending tasks
+   * unresolved issues
+4. Never rely on session-only timers
+5. Use persistent resume mechanisms only:
+
+   * crontab
+   * tmux + cron
+   * launchd (macOS)
+6. Automatically resume after quota reset when possible
+
+If automatic resume is impossible, clearly write the exact resume command in NEXT_STEPS.md.

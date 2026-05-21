@@ -32,7 +32,7 @@ from ..const import (
 )
 from .base import track_action
 from ..models import (
-    CascadeDevice,
+    EVChargerDevice,
     DeviceSnapshot,
     EVDeviceGuard,
     EVRateLimiter,
@@ -168,7 +168,7 @@ class EVGuard:
     #  Kabeldetectie                                                       #
     # ------------------------------------------------------------------ #
 
-    def cable_connected(self, device: CascadeDevice) -> bool:
+    def cable_connected(self, device: EVChargerDevice) -> bool:
         """
         Geeft True als de laadkabel aangesloten is, of als er geen kabelentity
         expliciet geconfigureerd is.
@@ -182,7 +182,7 @@ class EVGuard:
         # Gebruik alleen de expliciet geconfigureerde kabelentity.
         # Geen fallback op DEFAULT_EV_CABLE_ENTITY: als de gebruiker geen kabel-
         # sensor heeft ingesteld, nemen we aan dat de kabel aangesloten is.
-        cable_entity = device.ev.cable_entity
+        cable_entity = device.cable_entity
         if not cable_entity:
             return True
 
@@ -219,7 +219,7 @@ class EVGuard:
     #  Verbindingsstatus (wake-up check)                                   #
     # ------------------------------------------------------------------ #
 
-    def is_connected(self, device: CascadeDevice) -> bool:
+    def is_connected(self, device: EVChargerDevice) -> bool:
         """
         Geeft True als de EV verbonden/wakker is.
 
@@ -231,7 +231,7 @@ class EVGuard:
         blokkeren we niet (True).
         Bij ontbrekende sensor: True (geen blokkering).
         """
-        status_entity = device.ev.status_sensor
+        status_entity = device.status_sensor
         if not status_entity:
             return True
 
@@ -248,7 +248,7 @@ class EVGuard:
         if s in ("unavailable", "unknown", ""):
             # Tesla-sensoren worden unavailable als de auto slaapt. Als er een
             # wake-button is, triggeren we de wake-up; anders blokkeren we niet.
-            return not bool(device.ev.wake_button)
+            return not bool(device.wake_button)
 
         # "complete" = lading gestopt omdat limiet bereikt; auto is wakker en verbonden.
         # "off"     = Tesla binary sensor die aangeeft "niet aan het laden" — auto IS wakker.
@@ -269,14 +269,14 @@ class EVGuard:
     #  Locatie helper                                                      #
     # ------------------------------------------------------------------ #
 
-    def is_home(self, device: CascadeDevice) -> bool:
+    def is_home(self, device: EVChargerDevice) -> bool:
         """
         Geeft True als de EV thuis is, of als er geen locatie-tracker is.
 
         Ondersteunt device_tracker (home/not_home) en binary_sensor (on/off).
         Bij ontbrekende, unavailable of onbekende sensor: True (geen blokkering).
         """
-        tracker_entity = device.ev.location_tracker
+        tracker_entity = device.location_tracker
         if not tracker_entity:
             return True
 
@@ -367,19 +367,19 @@ class EVGuard:
 
     async def _set_soc_override(
         self,
-        device: CascadeDevice,
+        device: EVChargerDevice,
         override: bool,
         original_soc: Optional[float] = None,
     ) -> None:
         """Stel de SOC-limiet in (override=True) of herstel hem (override=False)."""
-        if device.ev.max_soc is None:
+        if device.max_soc is None:
             _LOGGER.debug(
                 "Peak Guard EV: '%s' SOC-limiet overgeslagen — ev_max_soc niet geconfigureerd",
                 device.name,
             )
             return
 
-        soc_entity = device.ev.soc_entity
+        soc_entity = device.soc_entity
         if not soc_entity:
             self._warn(
                 "Peak Guard EV: '%s' SOC-limiet NIET aangepast — "
@@ -389,7 +389,7 @@ class EVGuard:
             return
 
         if override:
-            target_soc = float(device.ev.max_soc)
+            target_soc = float(device.max_soc)
             self._warn(
                 "Peak Guard EV: '%s' SOC-limiet instellen op %.0f%% via '%s'",
                 device.name, target_soc, soc_entity,
@@ -425,7 +425,7 @@ class EVGuard:
 
     async def restore(
         self,
-        device: CascadeDevice,
+        device: EVChargerDevice,
         snapshot: DeviceSnapshot,
         peak_tracker: "PeakAvoidTracker",
         solar_tracker: "SolarShiftTracker",
@@ -442,8 +442,8 @@ class EVGuard:
           voltooi solar duurmeting.
         """
         try:
-            sw_entity  = device.ev.switch_entity or device.entity_id
-            cur_entity = device.ev.current_entity
+            sw_entity  = device.switch_entity or device.entity_id
+            cur_entity = device.current_entity
 
             sw_state = self.hass.states.get(sw_entity)
             if sw_state is None:
@@ -599,7 +599,7 @@ class EVGuard:
 
     async def throttle_down_solar(
         self,
-        device: CascadeDevice,
+        device: EVChargerDevice,
         consumption: float,
     ) -> bool:
         """
@@ -615,7 +615,7 @@ class EVGuard:
             False — stroom staat al op hw-minimum of kan niet zinvol worden
                     verlaagd; aanroeper moet EV volledig stoppen.
         """
-        cur_entity = device.ev.current_entity
+        cur_entity = device.current_entity
         if not cur_entity:
             return False
 
@@ -628,10 +628,10 @@ class EVGuard:
         except (ValueError, TypeError):
             return False
 
-        phases  = int(device.ev.phases) if device.ev.phases else 1
+        phases  = int(device.phases) if device.phases else 1
         voltage = EV_VOLTS_3PHASE if phases == 3 else EV_VOLTS_1PHASE
         hw_min_a = float(
-            device.ev.min_current if device.ev.min_current is not None
+            device.min_current if device.min_current is not None
             else (device.min_value if device.min_value is not None else DEFAULT_EV_MIN_AMPERE)
         )
         max_a = float(device.max_value if device.max_value is not None else DEFAULT_EV_MAX_AMPERE)
@@ -708,7 +708,7 @@ class EVGuard:
 
     async def apply_action(
         self,
-        device: CascadeDevice,
+        device: EVChargerDevice,
         excess: float,
         snapshots: dict,
         cascade_type: str,
@@ -720,11 +720,11 @@ class EVGuard:
 
         min_a   = float(device.min_value if device.min_value is not None else DEFAULT_EV_MIN_AMPERE)
         max_a   = float(device.max_value if device.max_value is not None else DEFAULT_EV_MAX_AMPERE)
-        phases  = int(device.ev.phases) if device.ev.phases else 1
+        phases  = int(device.phases) if device.phases else 1
         voltage = EV_VOLTS_3PHASE if phases == 3 else EV_VOLTS_1PHASE
 
-        sw_entity  = device.ev.switch_entity or device.entity_id
-        cur_entity = device.ev.current_entity
+        sw_entity  = device.switch_entity or device.entity_id
+        cur_entity = device.current_entity
 
         sw_state = self.hass.states.get(sw_entity)
         if sw_state is None:
@@ -744,8 +744,8 @@ class EVGuard:
                     current_a = None
 
         current_soc: Optional[float] = None
-        if device.ev.soc_entity:
-            soc_state = self.hass.states.get(device.ev.soc_entity)
+        if device.soc_entity:
+            soc_state = self.hass.states.get(device.soc_entity)
             if soc_state is not None:
                 try:
                     current_soc = float(soc_state.state)
@@ -776,7 +776,7 @@ class EVGuard:
         # SOC-override: apply as soon as snapshot is created so that a
         # Tesla stopped at its charge limit (but switch still "on") will
         # resume.  Must happen before the solar path reads guard state.
-        if device.ev.max_soc is not None and not guard.soc_override_active:
+        if device.max_soc is not None and not guard.soc_override_active:
             if self._rate_check(device.name, "SOC-override activeren"):
                 await self._set_soc_override(device, override=True)
                 self._record_call()
@@ -798,7 +798,7 @@ class EVGuard:
                 current_a = guard.last_sent_amps
 
         hw_min_a = float(
-            device.ev.min_current if device.ev.min_current is not None
+            device.min_current if device.min_current is not None
             else (device.min_value if device.min_value is not None else DEFAULT_EV_MIN_AMPERE)
         )
         return await self._apply_solar(
@@ -813,7 +813,7 @@ class EVGuard:
 
     async def _apply_peak(
         self,
-        device: CascadeDevice,
+        device: EVChargerDevice,
         excess: float,
         snapshots: dict,
         peak_tracker: "PeakAvoidTracker",
@@ -1001,7 +1001,7 @@ class EVGuard:
 
     async def _apply_solar(
         self,
-        device: CascadeDevice,
+        device: EVChargerDevice,
         excess: float,
         snapshots: dict,
         peak_tracker: "PeakAvoidTracker",
@@ -1038,7 +1038,7 @@ class EVGuard:
         )
 
         # GATE: cable detection
-        cable_entity = device.ev.cable_entity or DEFAULT_EV_CABLE_ENTITY
+        cable_entity = device.cable_entity or DEFAULT_EV_CABLE_ENTITY
         if not self.cable_connected(device):
             if sw_on:
                 _cable_st = self.hass.states.get(cable_entity)
@@ -1129,11 +1129,11 @@ class EVGuard:
         # GATE: EV must be home
         if not self.is_home(device):
             if guard.state != EVState.IDLE:
-                loc_st = self.hass.states.get(device.ev.location_tracker) if device.ev.location_tracker else None
+                loc_st = self.hass.states.get(device.location_tracker) if device.location_tracker else None
                 _LOGGER.info(
                     "Peak Guard [SOLAR]: '%s' niet thuis (tracker='%s', staat='%s') — "
                     "toestand gereset naar IDLE",
-                    device.name, device.ev.location_tracker or "(geen)",
+                    device.name, device.location_tracker or "(geen)",
                     loc_st.state if loc_st else "onbekend",
                 )
                 guard.state = EVState.IDLE
@@ -1180,6 +1180,30 @@ class EVGuard:
                     )
                     return excess
 
+            start_thr_w = float(device.start_threshold_w) if device.start_threshold_w is not None else hw_min_w
+            if excess < start_thr_w:
+                self._reset_debounce(guard)
+                guard.skip_reason = f"surplus {excess:.0f} W < start-drempel {start_thr_w:.0f} W"
+                self.last_skip_reason = guard.skip_reason
+                return excess
+
+            # Debounce: wacht op stabiel surplus voor EV te starten.
+            _ready, _floor_w = self._surplus_floor(guard, excess, now)
+            if not _ready:
+                guard.state = EVState.WAITING_FOR_STABLE
+                if guard.debounce_floor_w > 0:
+                    floor_a = math.ceil(guard.debounce_floor_w / voltage)
+                    guard.skip_reason = (
+                        f"debounce wachten op stabiel surplus "
+                        f"(floor: {floor_a} A, {guard.debounce_remaining_s:.0f}s resterend)"
+                    )
+                else:
+                    guard.skip_reason = (
+                        f"debounce wachten op stabiel surplus ({guard.debounce_remaining_s:.0f}s resterend)"
+                    )
+                self.last_skip_reason = guard.skip_reason
+                return excess
+
             if guard.last_switch_state is True:
                 _LOGGER.info(
                     "Peak Guard [SOLAR]: '%s' — schakelaar nog steeds UIT na eerder "
@@ -1202,21 +1226,21 @@ class EVGuard:
                     )
                     return excess
 
-                if device.ev.wake_button and not self.is_connected(device):
-                    status_entity = device.ev.status_sensor or "(geen sensor)"
+                if device.wake_button and not self.is_connected(device):
+                    status_entity = device.status_sensor or "(geen sensor)"
                     status_val    = "onbekend"
-                    if device.ev.status_sensor:
-                        _st = self.hass.states.get(device.ev.status_sensor)
+                    if device.status_sensor:
+                        _st = self.hass.states.get(device.status_sensor)
                         status_val = _st.state if _st else "niet gevonden"
                     _LOGGER.info(
                         "Peak Guard [SOLAR]: '%s' — Tesla in slaapstand "
                         "('%s' = '%s') → wake button '%s' aanroepen",
-                        device.name, status_entity, status_val, device.ev.wake_button,
+                        device.name, status_entity, status_val, device.wake_button,
                     )
                     try:
                         await self.hass.services.async_call(
                             "button", "press",
-                            {"entity_id": device.ev.wake_button},
+                            {"entity_id": device.wake_button},
                             blocking=False,
                         )
                     except Exception as wake_err:
@@ -1236,8 +1260,8 @@ class EVGuard:
                         guard.state             = EVState.IDLE
                         guard.wake_requested_at = None
                         guard.wake_cooldown_until = None
-                        if device.ev.status_sensor:
-                            _st2 = self.hass.states.get(device.ev.status_sensor)
+                        if device.status_sensor:
+                            _st2 = self.hass.states.get(device.status_sensor)
                             status_val = _st2.state if _st2 else "verbonden"
                         _LOGGER.info(
                             "Peak Guard [SOLAR]: '%s' — Tesla nu wakker "
@@ -1267,16 +1291,16 @@ class EVGuard:
                 # If Tesla was asleep when the snapshot was made (original_soc=None),
                 # force a fresh poll so we can restore correctly later.
                 _snap_now = snapshots.get(snap_key)
-                if device.ev.soc_entity and _snap_now is not None and _snap_now.original_soc is None:
+                if device.soc_entity and _snap_now is not None and _snap_now.original_soc is None:
                     try:
                         await self.hass.services.async_call(
                             "homeassistant", "update_entity",
-                            {"entity_id": device.ev.soc_entity},
+                            {"entity_id": device.soc_entity},
                             blocking=True,
                         )
                     except Exception:
                         pass
-                    _soc_st = self.hass.states.get(device.ev.soc_entity)
+                    _soc_st = self.hass.states.get(device.soc_entity)
                     if _soc_st is not None:
                         try:
                             _snap_now.original_soc = float(_soc_st.state)
@@ -1294,7 +1318,7 @@ class EVGuard:
                             )
 
                 # SOC-override fallback in case rate-limiter blocked it earlier
-                if not guard.soc_override_active and device.ev.max_soc is not None:
+                if not guard.soc_override_active and device.max_soc is not None:
                     await self._set_soc_override(device, override=True)
                     guard.soc_override_active = True
 
@@ -1365,7 +1389,7 @@ class EVGuard:
                     "rate-limiter: %d/%d calls in %.0f s)",
                     device.name, new_a, actual_consumption_w,
                     excess, hw_min_a, phases,
-                    device.ev.max_soc if device.ev.max_soc is not None else "n.v.t.",
+                    device.max_soc if device.max_soc is not None else "n.v.t.",
                     self._rate_limiter.calls_in_window,
                     EV_RATE_LIMIT_MAX_CALLS, EV_RATE_LIMIT_WINDOW_S,
                 )

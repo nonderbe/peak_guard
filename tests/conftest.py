@@ -116,9 +116,10 @@ sys.modules["custom_components.peak_guard.deciders"] = _dec
 # ──────────────────────────────────────────────────────────────────────────── #
 
 from custom_components.peak_guard.models import (  # noqa: E402
-    CascadeDevice,
+    _BaseCascadeDevice,
+    EVChargerDevice,
+    CascadeDevice,        # backward-compat alias
     DeviceSnapshot,
-    EVChargerConfig,
     EVDeviceGuard,
     EVRateLimiter,
     EVState,
@@ -126,6 +127,7 @@ from custom_components.peak_guard.models import (  # noqa: E402
     EV_MIN_OFF_DURATION_S,
     EV_MIN_UPDATE_INTERVAL_S,
     EV_HYSTERESIS_AMPS,
+    from_dict as cascade_from_dict,
 )
 from custom_components.peak_guard.deciders.ev_guard import EVGuard  # noqa: E402
 
@@ -138,6 +140,8 @@ class MockState:
     """Nep-state object zoals hass.states.get() retourneert."""
     def __init__(self, state_str: str) -> None:
         self.state = state_str
+        from datetime import timezone
+        self.last_updated = datetime.now(timezone.utc)
 
 
 class MockStateRegistry:
@@ -153,10 +157,6 @@ class MockStateRegistry:
 
 
 class MockServiceRegistry:
-    """
-    Registreert service-aanroepen. Kan geconfigureerd worden om
-    HomeAssistantError te gooien op specifieke services.
-    """
     def __init__(self, raise_on: set[str] | None = None) -> None:
         self.calls: list[dict] = []
         self._raise_on: set[str] = raise_on or set()
@@ -223,9 +223,9 @@ def hass() -> MockHass:
 
 
 @pytest.fixture
-def ev_device() -> CascadeDevice:
+def ev_device() -> EVChargerDevice:
     """Standaard 1-fase Tesla-configuratie zonder optionele sensors."""
-    return CascadeDevice(
+    return EVChargerDevice(
         id="ev_tesla",
         name="Tesla",
         entity_id="switch.tesla_charge",
@@ -233,13 +233,11 @@ def ev_device() -> CascadeDevice:
         action_type="ev_charger",
         min_value=6.0,
         max_value=32.0,
-        ev=EVChargerConfig(
-            switch_entity="switch.tesla_charge",
-            current_entity="number.tesla_charge_current",
-            phases=1,
-            min_current=6.0,
-            start_threshold_w=230.0,
-        ),
+        switch_entity="switch.tesla_charge",
+        current_entity="number.tesla_charge_current",
+        phases=1,
+        min_current=6.0,
+        start_threshold_w=230.0,
     )
 
 

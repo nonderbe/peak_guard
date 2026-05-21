@@ -298,25 +298,25 @@ class PeakGuardPanel extends HTMLElement {
         }
         // EV SoC chips live bijwerken
         if (device.action_type === "ev_charger" && this._hass) {
-          // Chip 1: huidig max laadniveau via ev_soc_entity
+          // Chip 1: huidig max laadniveau via soc_entity
           const limEl = this.shadowRoot.querySelector(`#ev-soc-lim-${cascadeType}-${index}`);
-          if (limEl && device.ev_soc_entity) {
-            const s = this._hass.states[device.ev_soc_entity];
+          if (limEl && device.soc_entity) {
+            const s = this._hass.states[device.soc_entity];
             if (s && s.state !== "unavailable" && s.state !== "unknown") {
               const v = parseFloat(s.state);
               if (!isNaN(v)) limEl.textContent = `⬆ ${v}%`;
             }
           }
-          // Chip 2: huidig batterijniveau via ev_battery_entity
+          // Chip 2: huidig batterijniveau via battery_entity
           const batEl = this.shadowRoot.querySelector(`#ev-soc-bat-${cascadeType}-${index}`);
-          if (batEl && device.ev_battery_entity) {
-            const s = this._hass.states[device.ev_battery_entity];
+          if (batEl && device.battery_entity) {
+            const s = this._hass.states[device.battery_entity];
             if (s && s.state !== "unavailable" && s.state !== "unknown") {
               const v = parseFloat(s.state);
               if (!isNaN(v)) batEl.textContent = `🔋 ${v}%`;
             }
           }
-          // Chip 3: doel bij zon is statisch (ev_max_soc), geen live update nodig
+          // Chip 3: doel bij zon is statisch (max_soc), geen live update nodig
         }
       });
     });
@@ -517,7 +517,7 @@ class PeakGuardPanel extends HTMLElement {
     // Vermogenschip: voor EV dynamisch berekend, voor andere types opgeslagen power_watts
     let powerChip;
     if (device.action_type === "ev_charger") {
-      const phases    = device.ev_phases || 1;
+      const phases    = device.phases || 1;
       const maxA      = device.max_value ?? 32;
       const voltage   = this._evVoltage(phases);
       const calcW     = Math.round(maxA * voltage);
@@ -533,11 +533,11 @@ class PeakGuardPanel extends HTMLElement {
     let socChips = "";
     if (device.action_type === "ev_charger") {
 
-      // Chip 1: Huidig maximaal laadniveau (live via ev_soc_entity)
-      if (device.ev_soc_entity) {
+      // Chip 1: Huidig maximaal laadniveau (live via soc_entity)
+      if (device.soc_entity) {
         let limDisplay = "—";
         if (this._hass) {
-          const s = this._hass.states[device.ev_soc_entity];
+          const s = this._hass.states[device.soc_entity];
           if (s && s.state !== "unavailable" && s.state !== "unknown") {
             const v = parseFloat(s.state);
             if (!isNaN(v)) limDisplay = `${v}%`;
@@ -548,11 +548,11 @@ class PeakGuardPanel extends HTMLElement {
           >⬆ ${limDisplay}</span>`;
       }
 
-      // Chip 2: Huidig batterijniveau (live via ev_battery_entity)
-      if (device.ev_battery_entity) {
+      // Chip 2: Huidig batterijniveau (live via battery_entity)
+      if (device.battery_entity) {
         let batDisplay = "—";
         if (this._hass) {
-          const s = this._hass.states[device.ev_battery_entity];
+          const s = this._hass.states[device.battery_entity];
           if (s && s.state !== "unavailable" && s.state !== "unknown") {
             const v = parseFloat(s.state);
             if (!isNaN(v)) batDisplay = `${v}%`;
@@ -564,11 +564,11 @@ class PeakGuardPanel extends HTMLElement {
       }
 
       // Chip 3: Gewenste max SoC bij zonne-overschot (statisch, uit configuratie)
-      if (device.ev_max_soc != null) {
-        const hasEntity = !!device.ev_soc_entity;
+      if (device.max_soc != null) {
+        const hasEntity = !!device.soc_entity;
         socChips += `<span class="chip chip-soc-target"
           title="Maximaal gewenst laadniveau bij overtollige zonne-energie. Peak Guard stelt de batterijlimiet tijdelijk in op dit percentage wanneer er zonne-overschot is.${hasEntity ? "" : " Koppel een SoC-limiet entiteit om dit automatisch te laten werken."}"
-          >☀ ${device.ev_max_soc}%</span>`;
+          >☀ ${device.max_soc}%</span>`;
       }
     }
 
@@ -607,7 +607,7 @@ class PeakGuardPanel extends HTMLElement {
                  <div class="ev-debounce-track"><div id="ev-debounce-fill-${type}-${index}" class="ev-debounce-fill" style="width:0%"></div></div>
                </div>`
             : ""}
-          ${device.action_type === "ev_charger" && type === "inject" && !device.ev_location_tracker
+          ${device.action_type === "ev_charger" && type === "inject" && !device.location_tracker
             ? `<div class="ev-location-warning">
                  <span>Geen locatie-tracker ingesteld. Peak Guard kan niet controleren of de wagen thuis is.</span>
                  <button class="btn-inline-warning" data-action="configure-location" data-index="${index}" data-type="${type}">Configureren</button>
@@ -639,7 +639,7 @@ class PeakGuardPanel extends HTMLElement {
     const snap      = isPeak ? peakSnap : injectSnap;
 
     // Huidige staat van de primaire entity
-    const entityId  = (isEV && device.ev_switch_entity) ? device.ev_switch_entity : device.entity_id;
+    const entityId  = (isEV && device.switch_entity) ? device.switch_entity : device.entity_id;
     const liveState = this._hass?.states[entityId];
     const liveVal   = liveState?.state ?? "—";
 
@@ -656,7 +656,7 @@ class PeakGuardPanel extends HTMLElement {
 
     // Aangepaste waarde = huidige live staat
     const modState   = stateLabel(liveVal);
-    const curEntityId= isEV ? device.ev_current_entity : null;
+    const curEntityId= isEV ? device.current_entity : null;
     const curState   = curEntityId ? this._hass?.states[curEntityId] : null;
     const modCurrent = curState && curState.state !== "unavailable"
       ? `${parseFloat(curState.state)} A` : null;
@@ -694,18 +694,18 @@ class PeakGuardPanel extends HTMLElement {
     const origStateFmt   = snap ? stateLabel(snap.original_state) : stateLabel(liveVal);
     const origCurrentFmt = origCurrent ?? modCurrent ?? "—";
     const origSocFmt     = origSoc ?? (() => {
-      if (!device.ev_soc_entity) return null;
-      const s = this._hass?.states[device.ev_soc_entity];
+      if (!device.soc_entity) return null;
+      const s = this._hass?.states[device.soc_entity];
       return (s && s.state !== "unavailable" && s.state !== "unknown")
         ? `${parseFloat(s.state)}%` : "—";
     })();
 
     let rows = row("Schakelaar", modState, origStateFmt);
-    if (isEV && device.ev_current_entity) {
+    if (isEV && device.current_entity) {
       rows += row("Laadstroom", modCurrent ?? "—", origCurrentFmt);
     }
-    if (isEV && device.ev_soc_entity) {
-      const socState  = this._hass?.states[device.ev_soc_entity];
+    if (isEV && device.soc_entity) {
+      const socState  = this._hass?.states[device.soc_entity];
       const curSocVal = (socState && socState.state !== "unavailable" && socState.state !== "unknown")
         ? `${parseFloat(socState.state)}%` : "—";
       rows += row("Laadlimiet", curSocVal, origSocFmt ?? "—");
@@ -777,8 +777,8 @@ class PeakGuardPanel extends HTMLElement {
     if (!this._hass) return "";
 
     const isEV = device.action_type === "ev_charger";
-    const entityId = (isEV && device.ev_switch_entity)
-      ? device.ev_switch_entity : device.entity_id;
+    const entityId = (isEV && device.switch_entity)
+      ? device.switch_entity : device.entity_id;
     const state = this._hass.states[entityId];
     if (!state || state.state === "unavailable" || state.state === "unknown") return "";
 
@@ -789,20 +789,20 @@ class PeakGuardPanel extends HTMLElement {
     const toggleCls = isOn ? "on" : "off";
 
     let ampereControl = "";
-    if (isEV && device.ev_current_entity) {
-      const curState = this._hass.states[device.ev_current_entity];
+    if (isEV && device.current_entity) {
+      const curState = this._hass.states[device.current_entity];
       const curA = curState && curState.state !== "unavailable"
         ? parseFloat(curState.state) : null;
-      const minA = device.ev_min_current ?? device.min_value ?? 6;
+      const minA = device.min_current ?? device.min_value ?? 6;
       const maxA = device.max_value ?? 32;
       const valA = (!isNaN(curA) ? curA : minA);
       ampereControl = `
-        <div class="ampere-control" data-ev-current="${this._esc(device.ev_current_entity)}">
+        <div class="ampere-control" data-ev-current="${this._esc(device.current_entity)}">
           <label>⚡</label>
           <input type="range" class="ampere-slider"
             min="${minA}" max="${maxA}" step="1" value="${valA}"
             data-action="set-ampere"
-            data-entity="${this._esc(device.ev_current_entity)}"
+            data-entity="${this._esc(device.current_entity)}"
             data-index="${index}" data-type="${type}"
             title="Laadstroom instellen (${minA}–${maxA} A)" />
           <span class="ampere-value" id="ampere-val-${type}-${index}">${valA} A</span>
@@ -827,9 +827,9 @@ class PeakGuardPanel extends HTMLElement {
   _deviceStatus(device) {
     if (!this._hass) return { text: "—", cls: "status-unknown" };
 
-    // Voor EV: gebruik de schakelaar-entity (ev_switch_entity), niet de primaire entity_id
-    const entityId = (device.action_type === "ev_charger" && device.ev_switch_entity)
-      ? device.ev_switch_entity
+    // Voor EV: gebruik de schakelaar-entity (switch_entity), niet de primaire entity_id
+    const entityId = (device.action_type === "ev_charger" && device.switch_entity)
+      ? device.switch_entity
       : device.entity_id;
 
     const state = this._hass.states[entityId];
@@ -844,7 +844,7 @@ class PeakGuardPanel extends HTMLElement {
       if (guardCharging) return { text: "laden", cls: "status-on" };
 
       if (state.state === "off") {
-        const cableEntity = device.ev_cable_entity || "sensor.tesla_opladen";
+        const cableEntity = device.cable_entity || "sensor.tesla_opladen";
         const cableState  = this._hass?.states[cableEntity];
         const cs = cableState?.state?.toLowerCase().trim();
         const CABLE_ON = new Set(["on", "true", "connected", "charging",
@@ -875,7 +875,7 @@ class PeakGuardPanel extends HTMLElement {
   _evLiveDetail(device) {
     if (!this._hass || device.action_type !== "ev_charger") return "";
 
-    const swEntity = device.ev_switch_entity || device.entity_id;
+    const swEntity = device.switch_entity || device.entity_id;
     const swState  = this._hass.states[swEntity];
     const guardCharging = this._data?.status?.ev_guards?.[device.id]?.state === "charging";
     if (!swState || (swState.state === "off" && !guardCharging)) return "";
@@ -883,13 +883,13 @@ class PeakGuardPanel extends HTMLElement {
     const parts = [];
 
     // Actuele laadstroom
-    const curEntity = device.ev_current_entity;
+    const curEntity = device.current_entity;
     if (curEntity) {
       const curState = this._hass.states[curEntity];
       if (curState && curState.state !== "unavailable" && curState.state !== "unknown") {
         const currentA = parseFloat(curState.state);
         if (!isNaN(currentA)) {
-          const phases   = device.ev_phases || 1;
+          const phases   = device.phases || 1;
           const voltage  = this._evVoltage(phases);
           const currentW = Math.round(currentA * voltage);
           parts.push(`${currentA} A · ${currentW} W`);
@@ -898,7 +898,7 @@ class PeakGuardPanel extends HTMLElement {
     }
 
     // Huidige SoC-limiet (de ingestelde limietwaarde, niet de actuele SoC)
-    const socEntity = device.ev_soc_entity;
+    const socEntity = device.soc_entity;
     if (socEntity) {
       const socState = this._hass.states[socEntity];
       if (socState && socState.state !== "unavailable" && socState.state !== "unknown") {
@@ -1035,8 +1035,8 @@ class PeakGuardPanel extends HTMLElement {
     let html = `<div class="ev-checklist"><div class="ev-checklist-title">🔍 Evaluatiestappen</div>`;
 
     // Stap: kabel (alleen als geconfigureerd)
-    if (device.ev_cable_entity) {
-      const cableState = this._hass?.states[device.ev_cable_entity];
+    if (device.cable_entity) {
+      const cableState = this._hass?.states[device.cable_entity];
       const cableVal   = cableState?.state ?? "onbekend";
       html += step("cable", "Laadkabel aangesloten", `entity: ${cableVal}`);
     }
@@ -1048,8 +1048,8 @@ class PeakGuardPanel extends HTMLElement {
     html += step("surplus", "Voldoende zonne-overschot", surplusDetail);
 
     // Stap: locatie (alleen als geconfigureerd)
-    if (device.ev_location_tracker) {
-      const locState = this._hass?.states[device.ev_location_tracker];
+    if (device.location_tracker) {
+      const locState = this._hass?.states[device.location_tracker];
       const locVal   = locState?.state ?? "onbekend";
       html += step("location", "Wagen thuis", `tracker: ${locVal}`);
     }
@@ -1076,7 +1076,7 @@ class PeakGuardPanel extends HTMLElement {
       state === "waiting_for_stable_surplus" ? histPct : null);
 
     // Stap: wake-up (alleen als geconfigureerd)
-    if (device.ev_wake_button) {
+    if (device.wake_button) {
       const wakeEl = Math.round(guard.wake_elapsed_s ?? 0);
       const wakeDet = state === "sleeping"
         ? `wekken… ${wakeEl}s / 15s`
@@ -1272,7 +1272,7 @@ class PeakGuardPanel extends HTMLElement {
           <label>Oplaadschakelaar</label>
           <div class="entity-picker">
             <input id="f-ev-switch" type="text"
-              value="${this._esc(d.ev_switch_entity || d.entity_id || "")}"
+              value="${this._esc(d.switch_entity || d.entity_id || "")}"
               placeholder="switch.laadpaal_schakelaar" autocomplete="off" />
             <div id="ev-switch-dropdown" class="entity-dropdown" style="display:none;"></div>
           </div>
@@ -1286,7 +1286,7 @@ class PeakGuardPanel extends HTMLElement {
           <label>Stroomsensor <span style="font-weight:400;text-transform:none;">(optioneel)</span></label>
           <div class="entity-picker">
             <input id="f-ev-current" type="text"
-              value="${this._esc(d.ev_current_entity || "")}"
+              value="${this._esc(d.current_entity || "")}"
               placeholder="number.laadpaal_stroom" autocomplete="off" />
             <div id="ev-current-dropdown" class="entity-dropdown" style="display:none;"></div>
           </div>
@@ -1300,7 +1300,7 @@ class PeakGuardPanel extends HTMLElement {
           <label>Kabeldetectiesensor</label>
           <div class="entity-picker">
             <input id="f-ev-cable" type="text"
-              value="${this._esc(d.ev_cable_entity != null ? d.ev_cable_entity : 'sensor.tesla_opladen')}"
+              value="${this._esc(d.cable_entity != null ? d.cable_entity : 'sensor.tesla_opladen')}"
               placeholder="sensor.tesla_opladen" autocomplete="off" />
             <div id="ev-cable-dropdown" class="entity-dropdown" style="display:none;"></div>
           </div>
@@ -1316,8 +1316,8 @@ class PeakGuardPanel extends HTMLElement {
         <div class="form-group">
           <label>Aantal fasen</label>
           <select id="f-ev-phases">
-            <option value="1" ${(d.ev_phases ?? 1) == 1 ? "selected" : ""}>1 fase — 230 V</option>
-            <option value="3" ${(d.ev_phases ?? 1) == 3 ? "selected" : ""}>3 fasen — 400 V</option>
+            <option value="1" ${(d.phases ?? 1) == 1 ? "selected" : ""}>1 fase — 230 V</option>
+            <option value="3" ${(d.phases ?? 1) == 3 ? "selected" : ""}>3 fasen — 400 V</option>
           </select>
           <div class="field-hint">
             De meeste thuisladers laden 1-fasig (230 V). Controleer het typeplaatje of de handleiding van uw laadpaal.
@@ -1363,7 +1363,7 @@ class PeakGuardPanel extends HTMLElement {
           <label>SoC-limiet entiteit <span style="font-weight:400;text-transform:none;">(optioneel)</span></label>
           <div class="entity-picker">
             <input id="f-ev-soc-entity" type="text"
-              value="${this._esc(d.ev_soc_entity || "")}"
+              value="${this._esc(d.soc_entity || "")}"
               placeholder="number.laadpaal_batterijlimiet" autocomplete="off" />
             <div id="ev-soc-entity-dropdown" class="entity-dropdown" style="display:none;"></div>
           </div>
@@ -1379,7 +1379,7 @@ class PeakGuardPanel extends HTMLElement {
           <label>Batterijniveau-sensor <span style="font-weight:400;text-transform:none;">(optioneel)</span></label>
           <div class="entity-picker">
             <input id="f-ev-battery-entity" type="text"
-              value="${this._esc(d.ev_battery_entity || "")}"
+              value="${this._esc(d.battery_entity || "")}"
               placeholder="sensor.mijn_auto_batterij" autocomplete="off" />
             <div id="ev-battery-entity-dropdown" class="entity-dropdown" style="display:none;"></div>
           </div>
@@ -1393,7 +1393,7 @@ class PeakGuardPanel extends HTMLElement {
         <div class="form-group">
           <label>Gewenst maximum bij zonne-overschot (%)</label>
           <input id="f-ev-soc" type="number" min="1" max="100"
-            value="${d.ev_max_soc ?? 100}" placeholder="100" />
+            value="${d.max_soc ?? 100}" placeholder="100" />
           <div class="field-hint">
             Peak Guard stelt de SoC-limiet tijdelijk in op dit percentage wanneer er overtollig zonne-energie
             beschikbaar is — zodat de auto meer opneemt dan normaal.
@@ -1413,7 +1413,7 @@ class PeakGuardPanel extends HTMLElement {
           <label>Locatie-tracker <span style="font-weight:400;text-transform:none;">(optioneel)</span></label>
           <div class="entity-picker">
             <input id="f-ev-location-tracker" type="text"
-              value="${this._esc(d.ev_location_tracker || '')}"
+              value="${this._esc(d.location_tracker || '')}"
               placeholder="device_tracker.tesla" autocomplete="off" />
             <div id="ev-location-tracker-dropdown" class="entity-dropdown" style="display:none;"></div>
           </div>
@@ -1434,7 +1434,7 @@ class PeakGuardPanel extends HTMLElement {
           <label>Status-sensor <span style="font-weight:400;text-transform:none;">(optioneel)</span></label>
           <div class="entity-picker">
             <input id="f-ev-status-sensor" type="text"
-              value="${this._esc(d.ev_status_sensor || '')}"
+              value="${this._esc(d.status_sensor || '')}"
               placeholder="binary_sensor.tesla_status" autocomplete="off" />
             <div id="ev-status-sensor-dropdown" class="entity-dropdown" style="display:none;"></div>
           </div>
@@ -1449,7 +1449,7 @@ class PeakGuardPanel extends HTMLElement {
           <label>Wake-up knop <span style="font-weight:400;text-transform:none;">(optioneel)</span></label>
           <div class="entity-picker">
             <input id="f-ev-wake-button" type="text"
-              value="${this._esc(d.ev_wake_button || '')}"
+              value="${this._esc(d.wake_button || '')}"
               placeholder="button.tesla_wakker" autocomplete="off" />
             <div id="ev-wake-button-dropdown" class="entity-dropdown" style="display:none;"></div>
           </div>
@@ -1602,10 +1602,10 @@ class PeakGuardPanel extends HTMLElement {
             ...(this._editDevice || {}),
             name:             naam,
             action_type:      "ev_charger",
-            ev_switch_entity: evSwitch,
+            switch_entity: evSwitch,
             entity_id:        evSwitch,
-            ev_current_entity: root.querySelector("#f-ev-current")?.value?.trim() || null,
-            ev_cable_entity:   root.querySelector("#f-ev-cable")?.value?.trim() || "sensor.tesla_opladen",
+            current_entity: root.querySelector("#f-ev-current")?.value?.trim() || null,
+            cable_entity:   root.querySelector("#f-ev-cable")?.value?.trim() || "sensor.tesla_opladen",
           };
           this._wizardStep = 2;
           this._renderEVWizard(this._editDevice);
@@ -1644,7 +1644,7 @@ class PeakGuardPanel extends HTMLElement {
           if (minA >= maxA) { alert("Minimum laadstroom moet lager zijn dan het maximum."); return; }
           this._editDevice = {
             ...(this._editDevice || {}),
-            ev_phases: phases,
+            phases: phases,
             min_value: minA,
             max_value: maxA,
           };
@@ -1718,17 +1718,17 @@ class PeakGuardPanel extends HTMLElement {
       const evBattEntity   = val("#f-ev-battery-entity") || null;
       const evSoc          = parseInt(val("#f-ev-soc")) || 100;
       const evMaxA   = d.max_value  ?? 32;
-      const evPhases = d.ev_phases  ?? 1;
-      const evSwitch = d.ev_switch_entity || d.entity_id || "";
+      const evPhases = d.phases  ?? 1;
+      const evSwitch = d.switch_entity || d.entity_id || "";
 
       if (!d.name)    { alert("Naam is verplicht."); return; }
       if (!evSwitch)  { alert("Oplaadschakelaar is verplicht."); return; }
 
       const power_watts = Math.round(evMaxA * this._evVoltage(evPhases));
 
-      const evStatusSensor    = val("#f-ev-status-sensor")    || d.ev_status_sensor    || null;
-      const evWakeButton      = val("#f-ev-wake-button")      || d.ev_wake_button      || null;
-      const evLocationTracker = val("#f-ev-location-tracker") || d.ev_location_tracker || null;
+      const evStatusSensor    = val("#f-ev-status-sensor")    || d.status_sensor    || null;
+      const evWakeButton      = val("#f-ev-wake-button")      || d.wake_button      || null;
+      const evLocationTracker = val("#f-ev-location-tracker") || d.location_tracker || null;
 
       device = {
         id:               d.id || `dev_${Date.now()}`,
@@ -1741,16 +1741,16 @@ class PeakGuardPanel extends HTMLElement {
         power_per_unit:   null,
         enabled:          true,
         priority:         d.priority ?? 999,
-        ev_switch_entity:  evSwitch,
-        ev_current_entity: d.ev_current_entity || null,
-        ev_cable_entity:   (d.ev_cable_entity != null && d.ev_cable_entity !== "") ? d.ev_cable_entity : "sensor.tesla_opladen",
-        ev_soc_entity:     evSocEntity,
-        ev_battery_entity: evBattEntity,
-        ev_max_soc:        evSoc,
-        ev_phases:         evPhases,
-        ev_status_sensor:    evStatusSensor,
-        ev_wake_button:      evWakeButton,
-        ev_location_tracker: evLocationTracker,
+        switch_entity:  evSwitch,
+        current_entity: d.current_entity || null,
+        cable_entity:   (d.cable_entity != null && d.cable_entity !== "") ? d.cable_entity : "sensor.tesla_opladen",
+        soc_entity:     evSocEntity,
+        battery_entity: evBattEntity,
+        max_soc:        evSoc,
+        phases:         evPhases,
+        status_sensor:    evStatusSensor,
+        wake_button:      evWakeButton,
+        location_tracker: evLocationTracker,
       };
 
     } else {
@@ -1775,16 +1775,16 @@ class PeakGuardPanel extends HTMLElement {
         power_per_unit: isThrottle ? (parseFloat(val("#f-ppu")) || 690) : null,
         enabled:        true,
         priority:       this._editDevice?.priority ?? 999,
-        ev_switch_entity:  null,
-        ev_current_entity: null,
-        ev_cable_entity:   null,
-        ev_soc_entity:     null,
-        ev_battery_entity: null,
-        ev_max_soc:        null,
-        ev_phases:         null,
-        ev_status_sensor:    null,
-        ev_wake_button:      null,
-        ev_location_tracker: null,
+        switch_entity:  null,
+        current_entity: null,
+        cable_entity:   null,
+        soc_entity:     null,
+        battery_entity: null,
+        max_soc:        null,
+        phases:         null,
+        status_sensor:    null,
+        wake_button:      null,
+        location_tracker: null,
       };
     }
 

@@ -25,7 +25,8 @@ from .const import (
 )
 from .deciders.base import read_sensor
 from .models import (
-    CascadeDevice,
+    _BaseCascadeDevice,
+    EVChargerDevice,
     DeviceSnapshot,
     EV_DEBOUNCE_STABLE_S,
     EV_MIN_OFF_DURATION_S,
@@ -50,8 +51,8 @@ class DecisionLogger:
         self,
         hass: HomeAssistant,
         config: dict,
-        peak_cascade: List[CascadeDevice],
-        inject_cascade: List[CascadeDevice],
+        peak_cascade: List[_BaseCascadeDevice],
+        inject_cascade: List[_BaseCascadeDevice],
         peak_snapshots: Dict[str, DeviceSnapshot],
         inject_snapshots: Dict[str, DeviceSnapshot],
         ev_guard: "EVGuard",
@@ -204,7 +205,7 @@ class DecisionLogger:
                 if d.action_type == ACTION_EV_CHARGER:
                     g = self._ev_guard.guards.get(d.id)
                     if g and g.last_sent_amps is not None:
-                        phases = int(d.ev.phases) if (d.ev and d.ev.phases) else 1
+                        phases = int(d.phases) if isinstance(d, EVChargerDevice) and d.phases else 1
                         v = EV_VOLTS_3PHASE if phases == 3 else EV_VOLTS_1PHASE
                         total_managed_w += g.last_sent_amps * v
                 else:
@@ -245,7 +246,7 @@ class DecisionLogger:
     def _append_device_lines(
         self,
         lines: list,
-        d: CascadeDevice,
+        d: _BaseCascadeDevice,
         pre_states: dict,
         snapshots: Dict[str, DeviceSnapshot],
         cascade: str,
