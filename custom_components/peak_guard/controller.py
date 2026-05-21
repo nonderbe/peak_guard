@@ -17,9 +17,6 @@ from .models import (
     DeviceSnapshot,
     EVChargerDevice,
     from_dict as cascade_from_dict,
-    EV_MIN_OFF_DURATION_S,
-    EV_RATE_LIMIT_MAX_CALLS,
-    EV_RATE_LIMIT_WINDOW_S,
 )
 from .const import (
     STORAGE_KEY,
@@ -182,36 +179,10 @@ class PeakGuardController:
                 "update_interval":    self.config.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL),
             },
             "status": {
-                "monitoring":    self._monitoring,
-                "last_loop_at":  self._last_loop_at,
-                "interval_s":    max(float(self.config.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL)), 60.0),
-                "ev_guards": {
-                    device_id: {
-                        "state":               guard.state.value,
-                        "history_len":         len(guard.surplus_history),
-                        "history_secs":        (
-                            datetime.now(timezone.utc) - guard.surplus_history[0][0]
-                        ).total_seconds() if guard.surplus_history else 0.0,
-                        "pending_amps":        guard.pending_amps,
-                        "last_sent_amps":      int(guard.last_sent_amps) if guard.last_sent_amps is not None else None,
-                        "skip_reason":         guard.skip_reason,
-                        "turned_off_by_pg":    guard.turned_off_by_pg,
-                        "min_off_remaining_s": max(0.0, EV_MIN_OFF_DURATION_S - (
-                            datetime.now(timezone.utc) - guard.turned_off_at
-                        ).total_seconds()) if (guard.turned_off_at and guard.turned_off_by_pg) else 0.0,
-                        "wake_elapsed_s":      (
-                            datetime.now(timezone.utc) - guard.wake_requested_at
-                        ).total_seconds() if guard.wake_requested_at else 0.0,
-                    }
-                    for device_id, guard in self._ev_guard_decider.guards.items()
-                },
-                "ev_rate_limiter": {
-                    "calls_in_window": self._ev_guard_decider.rate_limiter.calls_in_window,
-                    "remaining":       self._ev_guard_decider.rate_limiter.remaining,
-                    "window_s":        EV_RATE_LIMIT_WINDOW_S,
-                    "max_calls":       EV_RATE_LIMIT_MAX_CALLS,
-                },
-                "warnings": self._ev_guard_decider.recent_warnings,
+                "monitoring":   self._monitoring,
+                "last_loop_at": self._last_loop_at,
+                "interval_s":   max(float(self.config.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL)), 60.0),
+                **self._ev_guard_decider.status_dict(),
             },
             "simulation": {
                 "active":        self._simulation_consumption is not None,
@@ -392,29 +363,63 @@ class PeakGuardController:
                 pass
         _LOGGER.info("Peak Guard: monitoring gestopt")
 
-    async def _monitor_loop(self):
-        # ── CHANGED: default raised from 5 s → 60 s ──────────────────── #
-        # The original DEFAULT_UPDATE_INTERVAL = 5 caused up to 12 loop
-        # iterations per minute, each potentially generating EV API calls.
-        # At 60 s we get at most 1 loop/min → ~98 % fewer potential calls
-        # before any other guard kicks in.
-        raw_interval = float(self.config.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL))
-        interval = max(raw_interval, 60.0)   # never run faster than 60 s
-        if raw_interval < 60.0:
+    def _resolve_interval(self) -> float:
+        """Return the effective loop interval (minimum 60 s), warning if adjusted."""
+        raw = float(self.config.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL))
+        if raw < 60.0:
             _LOGGER.warning(
                 "Peak Guard: geconfigureerd update_interval (%.0f s) is te laag voor EV-beveiliging. "
                 "Verhoogd naar 60 s.",
-                raw_interval,
+                raw,
             )
+        return max(raw, 60.0)
+
+    def _read_consumption(self) -> Optional[float]:
+        """Return the current consumption in W (simulation takes priority)."""
+        if self._simulation_consumption is not None:
+            _LOGGER.warning(
+                "Peak Guard [SIMULATIE] verbruik=%.0f W (echte sensor genegeerd)",
+                self._simulation_consumption,
+            )
+            return self._simulation_consumption
+        return self._sensor_value(self.config.get(CONF_CONSUMPTION_SENSOR))
+
+    async def _dispatch(self, consumption: float) -> None:
+        """Run peak/inject cascade and restore logic for one loop tick."""
+        _LOGGER.debug(
+            "Peak Guard loop: verbruik=%.0f W — %s",
+            consumption,
+            "EXPORT (solar cascade actief)" if consumption < 0
+            else "import (piek-cascade actief)" if consumption > 0
+            else "nul",
+        )
+        await self._check_power_drop(consumption)
+        if consumption > 0:
+            await self._peak_decider.check(consumption)
+            await self._peak_decider.check_restore(consumption)
+            await self._injection_decider.check_restore(consumption)
+        elif consumption < 0:
+            _LOGGER.debug(
+                "Peak Guard: zonne-overschot gedetecteerd — sensor=%.0f W "
+                "(export %.0f W) — solar cascade wordt gecontroleerd",
+                consumption, abs(consumption),
+            )
+            await self._injection_decider.check(consumption)
+            await self._peak_decider.check_restore(consumption)
+            await self._injection_decider.check_restore(consumption)
+        else:
+            await self._peak_decider.check_restore(0.0)
+            await self._injection_decider.check_restore(0.0)
+
+    async def _monitor_loop(self):
+        interval = self._resolve_interval()
 
         # Opstart-vertraging: HA-entities zijn bij het laden van de integratie
-        # soms nog in staat unknown/unavailable. Na 10 s zijn ze normaal gezien
-        # beschikbaar. Zo vermijden we valse "sensor niet beschikbaar"-warnings
-        # in het logboek direct na het opstarten.
+        # soms nog in staat unknown/unavailable.
         _LOGGER.debug("Peak Guard: wacht 10 s op HA-opstart vóór eerste loop-iteratie")
         await asyncio.sleep(10.0)
 
-        _sensor_unavailable_count = 0   # teller voor herhaalde warnings
+        _sensor_unavailable_count = 0
 
         while self._monitoring:
             # Clear vóór het werk: een state-change die binnenkomt tijdens een await
@@ -423,20 +428,12 @@ class PeakGuardController:
             self._wakeup.clear()
             try:
                 self._last_loop_at = datetime.now(timezone.utc).isoformat()
-                # Reset iteration tracking voor beslissingslog.
                 self._iteration_actions.clear()
-                if self._simulation_consumption is not None:
-                    consumption = self._simulation_consumption
-                    _LOGGER.warning(
-                        "Peak Guard [SIMULATIE] verbruik=%.0f W (echte sensor genegeerd)",
-                        consumption,
-                    )
-                else:
-                    consumption = self._sensor_value(self.config.get(CONF_CONSUMPTION_SENSOR))
-                if consumption is not None:
-                    _sensor_unavailable_count = 0   # reset bij succesvolle lezing
 
-                    # ── Pre-states voor beslissingslog ────────────────── #
+                consumption = self._read_consumption()
+                if consumption is not None:
+                    _sensor_unavailable_count = 0
+
                     _debug_logging = self.config.get(CONF_DEBUG_DECISION_LOGGING, False)
                     _pre_states: dict = {}
                     if _debug_logging:
@@ -444,33 +441,8 @@ class PeakGuardController:
                             _s = self.hass.states.get(_d.entity_id)
                             _pre_states[_d.entity_id] = _s.state if _s else "?"
 
-                    _LOGGER.debug(
-                        "Peak Guard loop: verbruik=%.0f W — %s",
-                        consumption,
-                        "EXPORT (solar cascade actief)" if consumption < 0
-                        else "import (piek-cascade actief)" if consumption > 0
-                        else "nul",
-                    )
-                    await self._check_power_drop(consumption)
-                    if consumption > 0:
-                        await self._peak_decider.check(consumption)
-                        await self._peak_decider.check_restore(consumption)
-                        await self._injection_decider.check_restore(consumption)
-                    elif consumption < 0:
-                        # Negatief verbruik = export naar net (zonne-overschot)
-                        _LOGGER.debug(
-                            "Peak Guard: zonne-overschot gedetecteerd — sensor=%.0f W "
-                            "(export %.0f W) — solar cascade wordt gecontroleerd",
-                            consumption, abs(consumption),
-                        )
-                        await self._injection_decider.check(consumption)
-                        await self._peak_decider.check_restore(consumption)
-                        await self._injection_decider.check_restore(consumption)
-                    else:
-                        await self._peak_decider.check_restore(0.0)
-                        await self._injection_decider.check_restore(0.0)
+                    await self._dispatch(consumption)
 
-                    # ── Beslissingslog schrijven ──────────────────────── #
                     if _debug_logging:
                         await self._decision_logger.log(consumption, _pre_states)
 
@@ -478,8 +450,6 @@ class PeakGuardController:
                 else:
                     sensor_id = self.config.get(CONF_CONSUMPTION_SENSOR)
                     _sensor_unavailable_count += 1
-                    # Eerste keer: debug (kan normaal zijn bij opstart of korte onderbreking).
-                    # Herhaaldelijk: warning zodat echte problemen zichtbaar blijven.
                     if _sensor_unavailable_count == 1:
                         _LOGGER.debug(
                             "Peak Guard: verbruikssensor '%s' nog niet beschikbaar — "
@@ -495,8 +465,6 @@ class PeakGuardController:
                     self._prev_consumption = None
             except Exception:
                 _LOGGER.exception("Peak Guard: fout in monitoring loop")
-            # Wacht op het interval of tot een EV-event (kabel, schakelaar) de
-            # loop vroeg wekt.
             try:
                 await asyncio.wait_for(self._wakeup.wait(), timeout=interval)
                 _LOGGER.debug("Peak Guard: vroegtijdige wakeup door EV-event of force_check")

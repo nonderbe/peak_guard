@@ -92,6 +92,39 @@ class EVGuard:
     def rate_limiter(self) -> EVRateLimiter:
         return self._rate_limiter
 
+    def status_dict(self) -> dict:
+        """Return serialisable guard status for the REST API / to_dict()."""
+        now = datetime.now(timezone.utc)
+        return {
+            "ev_guards": {
+                device_id: {
+                    "state":               guard.state.value,
+                    "history_len":         len(guard.surplus_history),
+                    "history_secs":        (
+                        now - guard.surplus_history[0][0]
+                    ).total_seconds() if guard.surplus_history else 0.0,
+                    "pending_amps":        guard.pending_amps,
+                    "last_sent_amps":      int(guard.last_sent_amps) if guard.last_sent_amps is not None else None,
+                    "skip_reason":         guard.skip_reason,
+                    "turned_off_by_pg":    guard.turned_off_by_pg,
+                    "min_off_remaining_s": max(0.0, EV_MIN_OFF_DURATION_S - (
+                        now - guard.turned_off_at
+                    ).total_seconds()) if (guard.turned_off_at and guard.turned_off_by_pg) else 0.0,
+                    "wake_elapsed_s":      (
+                        now - guard.wake_requested_at
+                    ).total_seconds() if guard.wake_requested_at else 0.0,
+                }
+                for device_id, guard in self._guards.items()
+            },
+            "ev_rate_limiter": {
+                "calls_in_window": self._rate_limiter.calls_in_window,
+                "remaining":       self._rate_limiter.remaining,
+                "window_s":        EV_RATE_LIMIT_WINDOW_S,
+                "max_calls":       EV_RATE_LIMIT_MAX_CALLS,
+            },
+            "warnings": list(self._recent_warnings),
+        }
+
     # ------------------------------------------------------------------ #
     #  Interne helpers                                                     #
     # ------------------------------------------------------------------ #
