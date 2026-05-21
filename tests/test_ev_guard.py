@@ -22,7 +22,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from custom_components.peak_guard.models import (
-    _BaseCascadeDevice,
+    BaseCascadeDevice,
     EVChargerDevice,
     EVDeviceGuard,
     EVRateLimiter,
@@ -133,7 +133,7 @@ class TestHelpers:
         self.hass = MockHass()
         self.guard_obj = EVGuard(hass=self.hass, config={}, iteration_actions=[])
 
-    def _device(self, **kwargs) -> _BaseCascadeDevice:
+    def _device(self, **kwargs) -> BaseCascadeDevice:
         base = {"id": "ev1", "name": "Tesla", "entity_id": "switch.ev",
                 "priority": 1, "action_type": "ev_charger"}
         base.update(kwargs)

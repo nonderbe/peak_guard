@@ -134,6 +134,30 @@ class EVGuard:
     def _track_action(self, entity_id: str, action: str, value=None) -> None:
         track_action(self.config, self._iteration_actions, entity_id, action, value)
 
+    def _effective_current_amps(
+        self,
+        device: "EVChargerDevice",
+        guard: "EVDeviceGuard",
+        cur_state,
+        now: datetime,
+        current_a: Optional[float],
+    ) -> Optional[float]:
+        """Return current_a, substituting guard.last_sent_amps when the sensor is stale."""
+        if cur_state is None or guard.last_sent_amps is None or current_a is None:
+            return current_a
+        last_upd = cur_state.last_updated
+        if last_upd.tzinfo is None:
+            last_upd = last_upd.replace(tzinfo=timezone.utc)
+        age_s = (now - last_upd).total_seconds()
+        if age_s > EV_SENSOR_STALE_S:
+            _LOGGER.warning(
+                "Peak Guard [SOLAR]: '%s' stroom-sensor stale (%.0f s oud) — "
+                "eigen sturing (%.1f A) als referentie i.p.v. sensor (%.1f A)",
+                device.name, age_s, guard.last_sent_amps, current_a,
+            )
+            return guard.last_sent_amps
+        return current_a
+
     # ------------------------------------------------------------------ #
     #  GUI-waarschuwingsbuffer                                            #
     # ------------------------------------------------------------------ #
@@ -646,19 +670,7 @@ class EVGuard:
         guard = self.get_guard(device.id)
         now   = datetime.now(timezone.utc)
 
-        # OPTIE C: stale sensor-check
-        if guard.last_sent_amps is not None:
-            _last_upd = cur_state.last_updated
-            if _last_upd.tzinfo is None:
-                _last_upd = _last_upd.replace(tzinfo=timezone.utc)
-            _sensor_age_s = (now - _last_upd).total_seconds()
-            if _sensor_age_s > EV_SENSOR_STALE_S:
-                _LOGGER.warning(
-                    "Peak Guard [SOLAR]: '%s' stroom-sensor stale (%.0f s oud) — "
-                    "eigen sturing (%.1f A) als referentie i.p.v. sensor (%.1f A)",
-                    device.name, _sensor_age_s, guard.last_sent_amps, current_a,
-                )
-                current_a = guard.last_sent_amps
+        current_a = self._effective_current_amps(device, guard, cur_state, now, current_a)
 
         # GATE: minimum update-interval — geef vorige commando tijd om effect te hebben.
         if guard.last_current_update is not None:
@@ -781,20 +793,7 @@ class EVGuard:
                 self._record_call()
                 guard.soc_override_active = True
 
-        # Stale sensor workaround: Tesla Fleet sometimes reports stale
-        # current values.  Use our last-sent value as the reference.
-        if cur_state is not None and guard.last_sent_amps is not None:
-            _last_upd = cur_state.last_updated
-            if _last_upd.tzinfo is None:
-                _last_upd = _last_upd.replace(tzinfo=timezone.utc)
-            _sensor_age_s = (now - _last_upd).total_seconds()
-            if _sensor_age_s > EV_SENSOR_STALE_S:
-                _LOGGER.warning(
-                    "Peak Guard [SOLAR]: '%s' stroom-sensor stale (%.0f s oud) — "
-                    "eigen sturing (%.1f A) als referentie i.p.v. sensor (%.1f A)",
-                    device.name, _sensor_age_s, guard.last_sent_amps, current_a,
-                )
-                current_a = guard.last_sent_amps
+        current_a = self._effective_current_amps(device, guard, cur_state, now, current_a)
 
         hw_min_a = float(
             device.min_current if device.min_current is not None

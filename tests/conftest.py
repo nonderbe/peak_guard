@@ -116,9 +116,8 @@ sys.modules["custom_components.peak_guard.deciders"] = _dec
 # ──────────────────────────────────────────────────────────────────────────── #
 
 from custom_components.peak_guard.models import (  # noqa: E402
-    _BaseCascadeDevice,
+    BaseCascadeDevice,
     EVChargerDevice,
-    CascadeDevice,        # backward-compat alias
     DeviceSnapshot,
     EVDeviceGuard,
     EVRateLimiter,

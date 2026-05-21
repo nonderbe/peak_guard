@@ -12,7 +12,7 @@ from collections import deque
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Callable, Deque, Optional
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Deque, Optional
 
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
@@ -161,6 +161,8 @@ class CascadeContext:
 @dataclass
 class BaseCascadeDevice:
     """Base class for all cascade device entries."""
+    _action_type: ClassVar[str] = ""   # overridden by each concrete subclass
+
     id:          str
     name:        str
     entity_id:   str
@@ -174,6 +176,11 @@ class BaseCascadeDevice:
     @classmethod
     def from_dict(cls, d: dict) -> "BaseCascadeDevice":
         return from_dict(d)
+
+    @classmethod
+    def _from_dict(cls, base: dict, d: dict) -> "BaseCascadeDevice":
+        """Construct this subclass from pre-extracted base fields + raw dict."""
+        return cls(**base)
 
     # ---- polymorphic apply / restore --------------------------------- #
 
@@ -196,6 +203,7 @@ class BaseCascadeDevice:
 @dataclass
 class SwitchOffDevice(BaseCascadeDevice):
     """Peak-limiting switch: turns a device OFF to reduce peak demand."""
+    _action_type: ClassVar[str] = "switch_off"
 
     async def apply(self, excess: float, snapshots: dict, ctx: CascadeContext) -> float:
         state = ctx.hass.states.get(self.entity_id)
@@ -274,6 +282,7 @@ class SwitchOffDevice(BaseCascadeDevice):
 @dataclass
 class SwitchOnDevice(BaseCascadeDevice):
     """Injection-prevention switch: turns a device ON to consume solar surplus."""
+    _action_type: ClassVar[str] = "switch_on"
 
     async def apply(self, excess: float, snapshots: dict, ctx: CascadeContext) -> float:
         state = ctx.hass.states.get(self.entity_id)
@@ -347,9 +356,20 @@ class SwitchOnDevice(BaseCascadeDevice):
 @dataclass
 class ThrottleDevice(BaseCascadeDevice):
     """Legacy throttle: reduces a number entity to shed power."""
+    _action_type: ClassVar[str] = "throttle"
+
     min_value:      Optional[float] = None
     max_value:      Optional[float] = None
     power_per_unit: Optional[float] = None
+
+    @classmethod
+    def _from_dict(cls, base: dict, d: dict) -> "ThrottleDevice":
+        return cls(
+            **base,
+            min_value=d.get("min_value"),
+            max_value=d.get("max_value"),
+            power_per_unit=d.get("power_per_unit"),
+        )
 
     async def apply(self, excess: float, snapshots: dict, ctx: CascadeContext) -> float:
         state = ctx.hass.states.get(self.entity_id)
@@ -414,6 +434,8 @@ class ThrottleDevice(BaseCascadeDevice):
 @dataclass
 class EVChargerDevice(BaseCascadeDevice):
     """EV charger: variable-current injection-prevention and peak-limiting device."""
+    _action_type: ClassVar[str] = "ev_charger"
+
     min_value:       Optional[float] = None
     max_value:       Optional[float] = None
     # EV-specific fields (absorbed from the former EVChargerConfig)
@@ -429,6 +451,26 @@ class EVChargerDevice(BaseCascadeDevice):
     wake_button:       Optional[str]   = None
     status_sensor:     Optional[str]   = None
     location_tracker:  Optional[str]   = None
+
+    @classmethod
+    def _from_dict(cls, base: dict, d: dict) -> "EVChargerDevice":
+        return cls(
+            **base,
+            min_value=d.get("min_value"),
+            max_value=d.get("max_value"),
+            switch_entity=d.get("switch_entity"),
+            current_entity=d.get("current_entity"),
+            soc_entity=d.get("soc_entity"),
+            battery_entity=d.get("battery_entity"),
+            max_soc=d.get("max_soc"),
+            phases=d.get("phases", 1),
+            min_current=d.get("min_current"),
+            start_threshold_w=d.get("start_threshold_w"),
+            cable_entity=d.get("cable_entity"),
+            wake_button=d.get("wake_button"),
+            status_sensor=d.get("status_sensor"),
+            location_tracker=d.get("location_tracker"),
+        )
 
     async def apply(self, excess: float, snapshots: dict, ctx: CascadeContext) -> float:
         result = await ctx.ev_guard.apply_action(
@@ -492,11 +534,16 @@ def _migrate_flat_format(d: dict) -> dict:
     return d
 
 
+# Registry populated after all subclasses are defined.
+_DEVICE_REGISTRY: dict[str, type[BaseCascadeDevice]] = {}
+
+
 def from_dict(d: dict) -> BaseCascadeDevice:
     """Factory: create the right device subclass from a serialised dict.
 
     Accepts both the current format and old flat/nested EV formats (migrates
-    on the fly).
+    on the fly).  To register a new device type, add a subclass with a
+    non-empty _action_type ClassVar — no changes to this function needed.
     """
     d = _migrate_flat_format(d)
     action_type = d["action_type"]
@@ -509,36 +556,18 @@ def from_dict(d: dict) -> BaseCascadeDevice:
         "power_watts": d.get("power_watts", 0),
         "enabled":     d.get("enabled", True),
     }
-    if action_type == "switch_off":
+    cls = _DEVICE_REGISTRY.get(action_type)
+    if cls is None:
+        _LOGGER.warning(
+            "Peak Guard: onbekend action_type '%s' voor '%s' — SwitchOff fallback",
+            action_type, d.get("name", "?"),
+        )
         return SwitchOffDevice(**base)
-    if action_type == "switch_on":
-        return SwitchOnDevice(**base)
-    if action_type == "throttle":
-        return ThrottleDevice(
-            **base,
-            min_value=d.get("min_value"),
-            max_value=d.get("max_value"),
-            power_per_unit=d.get("power_per_unit"),
-        )
-    if action_type == "ev_charger":
-        return EVChargerDevice(
-            **base,
-            min_value=d.get("min_value"),
-            max_value=d.get("max_value"),
-            switch_entity=d.get("switch_entity"),
-            current_entity=d.get("current_entity"),
-            soc_entity=d.get("soc_entity"),
-            battery_entity=d.get("battery_entity"),
-            max_soc=d.get("max_soc"),
-            phases=d.get("phases", 1),
-            min_current=d.get("min_current"),
-            start_threshold_w=d.get("start_threshold_w"),
-            cable_entity=d.get("cable_entity"),
-            wake_button=d.get("wake_button"),
-            status_sensor=d.get("status_sensor"),
-            location_tracker=d.get("location_tracker"),
-        )
-    # Unknown action_type: fall back to a SwitchOffDevice shell
-    _LOGGER.warning("Peak Guard: onbekend action_type '%s' voor '%s' — SwitchOff fallback",
-                    action_type, d.get("name", "?"))
-    return SwitchOffDevice(**base)
+    return cls._from_dict(base, d)
+
+
+# Populate registry after all subclasses are defined.
+_DEVICE_REGISTRY.update({
+    cls._action_type: cls
+    for cls in (SwitchOffDevice, SwitchOnDevice, ThrottleDevice, EVChargerDevice)
+})
