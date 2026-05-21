@@ -27,7 +27,7 @@ The integration lives entirely in `custom_components/peak_guard/`.
 
 2. **Monitoring loop** (`controller.py` → `_monitoring_loop_async`): Runs every 5–60 seconds (configurable). Reads current power and monthly peak from HA sensors, computes quarterly average via `QuarterCalculator`, then drives the **peak cascade** (turn devices off) or **inject cascade** (turn devices on) as needed.
 
-3. **Cascade execution**: Devices in each cascade are stored as `CascadeDevice` dataclasses in priority order. The controller iterates them, calls HA services (`switch.turn_off`, `switch.turn_on`, `number.set_value`), and records events in the appropriate tracker.
+3. **Cascade execution**: Devices in each cascade are stored as `_BaseCascadeDevice` subclass instances in priority order. The controller iterates them, calls `device.apply(excess, snapshots, ctx)` polymorphically, and records events in the appropriate tracker. `CascadeContext` bundles `hass`, trackers, `ev_guard`, and callbacks into a single dependency-injection object threaded through the loop.
 
 4. **Trackers** (`avoided_peak_tracker.py`, and the solar equivalent): Record avoidance/shift events through a 3-phase lifecycle (pending → active → completed), compute kW impact on the quarterly history, and calculate EUR savings using Fluvius 2026 tariffs from `const.py`.
 
@@ -42,21 +42,40 @@ The integration lives entirely in `custom_components/peak_guard/`.
 | Class | File | Role |
 |---|---|---|
 | `PeakGuardController` | `controller.py` | Core orchestrator; owns cascades, monitoring loop, EV state machines |
-| `CascadeDevice` | `controller.py` | Dataclass for a single cascade entry (action type, priority, EV config) |
+| `_BaseCascadeDevice` | `models.py` | Abstract base for all cascade entries; exposes `apply()` / `restore()` |
+| `SwitchOffDevice` | `models.py` | Simple switch-off device (peak cascade) |
+| `SwitchOnDevice` | `models.py` | Simple switch-on device (inject cascade) |
+| `ThrottleDevice` | `models.py` | Throttleable device with min/max/power_per_unit |
+| `EVChargerDevice` | `models.py` | EV charger — all EV fields directly on the class (switch_entity, current_entity, phases, soc_entity, …) |
+| `CascadeContext` | `models.py` | Dependency-injection bag threaded through cascade loop (hass, trackers, ev_guard, callbacks) |
+| `from_dict()` | `models.py` | Factory that deserialises a dict into the correct subclass; migrates old `ev_*`-prefixed formats automatically |
 | `PeakAvoidTracker` | `avoided_peak_tracker.py` | Tracks peak avoidance events and computes kW/EUR impact |
 | `QuarterCalculator` | `quarter_calculator.py` | Derives quarterly average power from cumulative kWh sensor |
 | `QuarterStore` | `quarter_store.py` | Persists rolling 30-day quarter history |
-| `EVRateLimiter` | `controller.py` | Sliding-window rate limiter (max 12 calls / 10 min per EV device) |
-| `EVDeviceGuard` | `controller.py` | Per-device state machine for EV charger (idle → waiting_for_stable → charging) |
+| `EVRateLimiter` | `models.py` | Sliding-window rate limiter (max 12 calls / 10 min per EV device) |
+| `EVDeviceGuard` | `models.py` | Per-device state machine for EV charger (idle → waiting_for_stable → charging → sleeping) |
+
+`CascadeDevice` remains as a backward-compat alias for `_BaseCascadeDevice`.
+
+#### Device serialisation
+
+`dataclasses.asdict(device)` is used for saving; `from_dict(d)` reconstructs the correct subclass on load. The migration function `_migrate_flat_format` inside `models.py` transparently converts two legacy formats:
+- **Old flat format**: `ev_switch_entity`, `ev_phases`, etc. (pre-1.6)
+- **Intermediate nested format**: `{"ev": {"switch_entity": …}}` (1.6.x)
 
 ### EV charger handling
 
-EV chargers are significantly more complex than simple switches:
-- Managed via 3 entities: switch (on/off), number (charge current in A), optional SOC-limit number
-- Rate-limited to 12 service calls per 10 minutes to avoid hammering Tesla/Easee APIs
-- Solar surplus must be stable (±150 W) for 45 seconds before acting (debounce)
-- 1 A hysteresis to prevent thrashing
-- Wake-up support: detects sleeping EV and calls a wake button before attempting to charge
+EV chargers are significantly more complex than simple switches. All logic lives in `deciders/ev_guard.py` (`EVGuard`), called via `EVChargerDevice.apply()` / `.restore()`.
+
+- **Entities**: switch (on/off), number (charge current in A), optional SOC-limit number
+- **Rate limiter**: max 12 service calls per 10 minutes per device (`EVRateLimiter`)
+- **Start-threshold gate**: surplus must reach `start_threshold_w` before debounce even begins; drops below → debounce is reset
+- **Debounce / `_surplus_floor`**: 20 s wallclock timer (`EV_DEBOUNCE_STABLE_S`); the 10th-percentile floor of the surplus history must be positive before the EV is started; state is `WAITING_FOR_STABLE` while waiting
+- **1 A hysteresis** (`EV_HYSTERESIS_AMPS`): prevents thrashing on small surplus changes
+- **Minimum update interval** (`EV_MIN_UPDATE_INTERVAL_S`): rate-limits `set_value` calls even within a single rate-limit window
+- **Min-OFF cooldown** (`EV_MIN_OFF_DURATION_S`): prevents restart too soon after PG turned the EV off
+- **Wake-up support**: detects sleeping EV (via `status_sensor`), calls `wake_button`, waits up to `EV_WAKE_TIMEOUT_S`, then backs off for `EV_WAKE_COOLDOWN_S` on failure
+- **Location guard**: skips all action when `location_tracker` is present and EV is not home
 
 ### Configuration constants (`const.py`)
 
