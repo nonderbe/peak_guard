@@ -1258,11 +1258,47 @@ class EVGuard:
                     return excess
 
                 if device.wake_button and not self.is_connected(device):
+                    # State-machine wake-up: press once, then poll on subsequent
+                    # loop iterations (triggered early by the status-sensor
+                    # state-change listener).  Never blocks the event loop.
                     status_entity = device.status_sensor or "(geen sensor)"
                     status_val    = "onbekend"
                     if device.status_sensor:
                         _st = self.hass.states.get(device.status_sensor)
                         status_val = _st.state if _st else "niet gevonden"
+
+                    if guard.state == EVState.SLEEPING and guard.wake_requested_at is not None:
+                        elapsed = (now - guard.wake_requested_at).total_seconds()
+                        if elapsed <= EV_WAKE_TIMEOUT_S:
+                            guard.skip_reason = (
+                                f"wachten op Tesla wake-up "
+                                f"({elapsed:.0f}s/{EV_WAKE_TIMEOUT_S:.0f}s)"
+                            )
+                            self.last_skip_reason = guard.skip_reason
+                            _LOGGER.debug(
+                                "Peak Guard [SOLAR]: '%s' — wachten op Tesla wake-up "
+                                "(%.0f s verstreken van %.0f s timeout)",
+                                device.name, elapsed, EV_WAKE_TIMEOUT_S,
+                            )
+                            return excess
+                        # Timeout elapsed without the car waking up.
+                        guard.state               = EVState.IDLE
+                        guard.wake_requested_at   = None
+                        guard.wake_cooldown_until = now + timedelta(seconds=EV_WAKE_COOLDOWN_S)
+                        guard.skip_reason = (
+                            f"Tesla niet wakker na wake-up poging "
+                            f"(volgende poging over {EV_WAKE_COOLDOWN_S:.0f}s)"
+                        )
+                        self.last_skip_reason = guard.skip_reason
+                        self._warn(
+                            "Peak Guard [SOLAR]: '%s' — Tesla niet wakker na %.0f s "
+                            "('%s' = '%s') — laden uitgesteld, volgende wake-poging over %.0f s",
+                            device.name, EV_WAKE_TIMEOUT_S, status_entity, status_val,
+                            EV_WAKE_COOLDOWN_S,
+                        )
+                        return excess
+
+                    # First attempt: press wake button and defer to next iteration.
                     _LOGGER.info(
                         "Peak Guard [SOLAR]: '%s' — Tesla in slaapstand "
                         "('%s' = '%s') → wake button '%s' aanroepen",
@@ -1279,42 +1315,21 @@ class EVGuard:
                             "Peak Guard [SOLAR]: '%s' — wake-up aanroep mislukt: %s",
                             device.name, wake_err,
                         )
-                    guard.state           = EVState.SLEEPING
+                    guard.state             = EVState.SLEEPING
                     guard.wake_requested_at = now
-                    wake_ok = False
-                    for _ in range(int(EV_WAKE_TIMEOUT_S)):
-                        await asyncio.sleep(1.0)
-                        if self.is_connected(device):
-                            wake_ok = True
-                            break
-                    if wake_ok:
-                        guard.state             = EVState.IDLE
-                        guard.wake_requested_at = None
-                        guard.wake_cooldown_until = None
-                        if device.status_sensor:
-                            _st2 = self.hass.states.get(device.status_sensor)
-                            status_val = _st2.state if _st2 else "verbonden"
-                        _LOGGER.info(
-                            "Peak Guard [SOLAR]: '%s' — Tesla nu wakker "
-                            "('%s' = '%s') → laden starten met %d A",
-                            device.name, status_entity, status_val, new_a,
-                        )
-                    else:
-                        guard.state             = EVState.IDLE
-                        guard.wake_requested_at = None
-                        guard.wake_cooldown_until = now + timedelta(seconds=EV_WAKE_COOLDOWN_S)
-                        guard.skip_reason = (
-                            f"Tesla niet wakker na wake-up poging "
-                            f"(volgende poging over {EV_WAKE_COOLDOWN_S:.0f}s)"
-                        )
-                        self.last_skip_reason = guard.skip_reason
-                        self._warn(
-                            "Peak Guard [SOLAR]: '%s' — Tesla niet wakker na %.0f s "
-                            "('%s' = '%s') — laden uitgesteld, volgende wake-poging over %.0f s",
-                            device.name, EV_WAKE_TIMEOUT_S, status_entity, status_val,
-                            EV_WAKE_COOLDOWN_S,
-                        )
-                        return excess
+                    guard.skip_reason       = "wake-up verstuurd, wachten op Tesla"
+                    self.last_skip_reason   = guard.skip_reason
+                    return excess
+
+                if guard.state == EVState.SLEEPING:
+                    # Car woke up (is_connected() became True) — reset state.
+                    _LOGGER.info(
+                        "Peak Guard [SOLAR]: '%s' — Tesla nu wakker → laden starten met %d A",
+                        device.name, new_a,
+                    )
+                    guard.state             = EVState.IDLE
+                    guard.wake_requested_at = None
+                    guard.wake_cooldown_until = None
 
                 if not self._rate_check(device.name, "turn_on voor injectiepreventie"):
                     return excess
