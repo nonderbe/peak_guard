@@ -204,7 +204,7 @@ class DecisionLogger:
                 if d.action_type == ACTION_EV_CHARGER:
                     g = self._ev_guard.guards.get(d.id)
                     if g and g.last_sent_amps is not None:
-                        phases = int(d.ev_phases) if d.ev_phases else 1
+                        phases = int(d.ev.phases) if (d.ev and d.ev.phases) else 1
                         v = EV_VOLTS_3PHASE if phases == 3 else EV_VOLTS_1PHASE
                         total_managed_w += g.last_sent_amps * v
                 else:

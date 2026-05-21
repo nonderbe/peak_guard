@@ -118,6 +118,7 @@ sys.modules["custom_components.peak_guard.deciders"] = _dec
 from custom_components.peak_guard.models import (  # noqa: E402
     CascadeDevice,
     DeviceSnapshot,
+    EVChargerConfig,
     EVDeviceGuard,
     EVRateLimiter,
     EVState,
@@ -230,19 +231,15 @@ def ev_device() -> CascadeDevice:
         entity_id="switch.tesla_charge",
         priority=1,
         action_type="ev_charger",
-        ev_switch_entity="switch.tesla_charge",
-        ev_current_entity="number.tesla_charge_current",
-        ev_phases=1,
-        ev_min_current=6.0,
         min_value=6.0,
         max_value=32.0,
-        start_threshold_w=230.0,
-        ev_max_soc=None,   # geen SOC-override in basistests
-        ev_soc_entity=None,
-        ev_cable_entity=None,
-        ev_wake_button=None,
-        ev_status_sensor=None,
-        ev_location_tracker=None,
+        ev=EVChargerConfig(
+            switch_entity="switch.tesla_charge",
+            current_entity="number.tesla_charge_current",
+            phases=1,
+            min_current=6.0,
+            start_threshold_w=230.0,
+        ),
     )
 
 

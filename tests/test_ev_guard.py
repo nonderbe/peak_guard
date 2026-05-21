@@ -23,6 +23,7 @@ import pytest
 
 from custom_components.peak_guard.models import (
     CascadeDevice,
+    EVChargerConfig,
     EVDeviceGuard,
     EVRateLimiter,
     EVState,
@@ -132,10 +133,10 @@ class TestHelpers:
         self.guard_obj = EVGuard(hass=self.hass, config={}, iteration_actions=[])
 
     def _device(self, **kwargs) -> CascadeDevice:
-        return CascadeDevice(
-            id="ev1", name="Tesla", entity_id="switch.ev",
-            priority=1, action_type="ev_charger", **kwargs
-        )
+        base = {"id": "ev1", "name": "Tesla", "entity_id": "switch.ev",
+                "priority": 1, "action_type": "ev_charger"}
+        base.update(kwargs)
+        return CascadeDevice.from_dict(base)
 
     def test_cable_connected_no_entity_assumes_connected(self):
         """Zonder geconfigureerde kabelentity → aannemen dat kabel aangesloten is."""
@@ -271,7 +272,7 @@ class TestApplyActionSolar:
         Kabel ontkoppeld terwijl EV aan het laden was
         → EV uitschakelen, staat = CABLE_DISCONNECTED.
         """
-        self.device.ev_cable_entity = "sensor.cable"
+        self.device.ev.cable_entity = "sensor.cable"
         self.hass.states.set("switch.tesla_charge", "on")
         self.hass.states.set("sensor.cable", "disconnected")
         await self._apply_solar(5000.0)

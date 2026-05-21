@@ -6,7 +6,7 @@ worden gebruikt.  Geen HA-afhankelijkheden; puur Python.
 """
 
 from collections import deque
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Deque, Optional
@@ -193,65 +193,109 @@ class EVRateLimiter:
 # ──────────────────────────────────────────────────────────────────────────── #
 
 @dataclass
+class EVChargerConfig:
+    """EV-lader instellingen — onderdeel van CascadeDevice voor action_type == 'ev_charger'."""
+    switch_entity:     Optional[str]   = None   # schakelaar-entity (valt terug op entity_id)
+    current_entity:    Optional[str]   = None   # laadstroom-number entity
+    soc_entity:        Optional[str]   = None   # SOC-limiet-number entity
+    battery_entity:    Optional[str]   = None   # huidig batterijniveau sensor
+    max_soc:           Optional[int]   = None   # gewenst maximum SOC % bij zonne-overschot
+    phases:            int             = 1      # aantal fasen (1 of 3)
+    min_current:       Optional[float] = None   # hardware-minimum laadstroom (A)
+    start_threshold_w: Optional[float] = None   # solar start-drempel (W)
+    cable_entity:      Optional[str]   = None   # kabelaansluiting-sensor
+    wake_button:       Optional[str]   = None   # button.* om EV wakker te maken
+    status_sensor:     Optional[str]   = None   # verbindingsstatus-sensor
+    location_tracker:  Optional[str]   = None   # device_tracker.* — thuis = home/on
+
+
+@dataclass
 class CascadeDevice:
     """
     Beschrijft een apparaat in een cascade.
 
-    Velden voor EV Charger (action_type == 'ev_charger'):
-      ev_switch_entity  : entity_id van de oplaadschakelaar (switch)
-      ev_current_entity : entity_id van de laadstroom-number entity
-      ev_soc_entity     : entity_id van de SOC-limiet-number entity (optioneel)
-      ev_battery_entity : entity_id van de sensor die het huidig batterijniveau toont (optioneel)
-      ev_max_soc        : gewenst maximumpercentage bij zonne-overschot (0-100)
-      ev_phases         : aantal fasen (1 of 3), default 1
-      ev_min_current    : hardware-minimum laadstroom (A) — de Tesla accepteert NOOIT minder.
-                          Verschilt van min_value (die ook als floor voor peak-cascade dient).
-                          Standaard gelijk aan DEFAULT_EV_MIN_AMPERE (6 A) als niet ingesteld.
-      ev_cable_entity   : sensor die aangeeft of de laadkabel aangesloten is.
-      ev_wake_button    : button-entity om de EV uit slaapstand te halen (bijv. button.tesla_wakker).
-                          Optioneel; als niet ingesteld wordt wake-up overgeslagen.
-      ev_status_sensor  : sensor die verbindingsstatus toont (bijv. binary_sensor.tesla_status).
-                          "connected"/"online"/"on" = verbonden, anders = slapend.
-                          Optioneel; als niet ingesteld wordt wake-up check overgeslagen.
-      ev_location_tracker : device_tracker of sensor die aangeeft of de EV thuis is.
-                          "home" / "on" = thuis; alles anders = niet thuis → laden overgeslagen.
-                          Optioneel; als niet ingesteld wordt locatie niet gecontroleerd.
-      min_value         : minimale laadstroom (A), default 6
-      max_value         : maximale laadstroom (A), default 32
+    EV-laders (action_type == 'ev_charger') hebben hun configuratie in het ev-veld.
+    Alle andere action_types laten ev op None.
 
-      Vermogenformule EV:
-        1-fase: P = A × 230 V  (bv. 32 A → 7 360 W)
-        3-fasen: P = A × 400 V  (bv. 16 A → 6 400 W)
+    Velden voor throttle (legacy): min_value, max_value, power_per_unit.
 
-    Velden voor throttle (legacy, backwards-compat):
-      min_value, max_value, power_per_unit
+    Serialisatie: to_dict() geeft een plat dict (backward compat met opgeslagen JSON
+    en het frontend-paneel). from_dict() herstelt vanuit datzelfde platte formaat.
     """
-    id:                 str
-    name:               str
-    entity_id:          str       # primaire entity (switch voor ev_charger)
-    priority:           int
-    action_type:        str
-    power_watts:        int = 0
-    min_value:          Optional[float] = None
-    max_value:          Optional[float] = None
-    power_per_unit:     Optional[float] = None
-    enabled:            bool = True
-    # EV-specifieke velden
-    ev_switch_entity:   Optional[str] = None
-    ev_current_entity:  Optional[str] = None
-    ev_soc_entity:      Optional[str] = None
-    ev_battery_entity:  Optional[str] = None
-    ev_max_soc:         Optional[int] = None
-    ev_phases:          int = 1
-    ev_min_current:     Optional[float] = None   # hardware-minimum laadstroom (A)
-    start_threshold_w:  Optional[float] = None   # solar start-drempel (W), default 230
-    ev_cable_entity:    Optional[str]   = None   # sensor die kabelaansluiting detecteert
-    ev_wake_button:       Optional[str]   = None   # button.* om EV wakker te maken
-    ev_status_sensor:     Optional[str]   = None   # sensor verbindingsstatus EV
-    ev_location_tracker:  Optional[str]   = None   # device_tracker.* of sensor — thuis = home/on
+    id:             str
+    name:           str
+    entity_id:      str
+    priority:       int
+    action_type:    str
+    power_watts:    int = 0
+    min_value:      Optional[float] = None
+    max_value:      Optional[float] = None
+    power_per_unit: Optional[float] = None
+    enabled:        bool = True
+    ev:             Optional[EVChargerConfig] = None
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        d: dict = {
+            "id":             self.id,
+            "name":           self.name,
+            "entity_id":      self.entity_id,
+            "priority":       self.priority,
+            "action_type":    self.action_type,
+            "power_watts":    self.power_watts,
+            "min_value":      self.min_value,
+            "max_value":      self.max_value,
+            "power_per_unit": self.power_per_unit,
+            "enabled":        self.enabled,
+        }
+        if self.ev is not None:
+            d.update({
+                "ev_switch_entity":    self.ev.switch_entity,
+                "ev_current_entity":   self.ev.current_entity,
+                "ev_soc_entity":       self.ev.soc_entity,
+                "ev_battery_entity":   self.ev.battery_entity,
+                "ev_max_soc":          self.ev.max_soc,
+                "ev_phases":           self.ev.phases,
+                "ev_min_current":      self.ev.min_current,
+                "start_threshold_w":   self.ev.start_threshold_w,
+                "ev_cable_entity":     self.ev.cable_entity,
+                "ev_wake_button":      self.ev.wake_button,
+                "ev_status_sensor":    self.ev.status_sensor,
+                "ev_location_tracker": self.ev.location_tracker,
+            })
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "CascadeDevice":
+        """Herstel vanuit een plat dict (opgeslagen formaat of API-payload)."""
+        ev: Optional[EVChargerConfig] = None
+        if d.get("action_type") == "ev_charger":
+            ev = EVChargerConfig(
+                switch_entity     = d.get("ev_switch_entity"),
+                current_entity    = d.get("ev_current_entity"),
+                soc_entity        = d.get("ev_soc_entity"),
+                battery_entity    = d.get("ev_battery_entity"),
+                max_soc           = d.get("ev_max_soc"),
+                phases            = d.get("ev_phases", 1),
+                min_current       = d.get("ev_min_current"),
+                start_threshold_w = d.get("start_threshold_w"),
+                cable_entity      = d.get("ev_cable_entity"),
+                wake_button       = d.get("ev_wake_button"),
+                status_sensor     = d.get("ev_status_sensor"),
+                location_tracker  = d.get("ev_location_tracker"),
+            )
+        return cls(
+            id            = d["id"],
+            name          = d["name"],
+            entity_id     = d["entity_id"],
+            priority      = d["priority"],
+            action_type   = d["action_type"],
+            power_watts   = d.get("power_watts", 0),
+            min_value     = d.get("min_value"),
+            max_value     = d.get("max_value"),
+            power_per_unit = d.get("power_per_unit"),
+            enabled       = d.get("enabled", True),
+            ev            = ev,
+        )
 
 
 @dataclass

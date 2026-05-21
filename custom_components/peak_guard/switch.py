@@ -110,9 +110,9 @@ class PeakGuardDeviceSwitch(SwitchEntity):
         self._controller = controller
         self._device     = device
 
-        # Voor EV: gebruik ev_switch_entity als primaire entity
+        # Voor EV: gebruik ev.switch_entity als primaire entity
         self._target_entity = (
-            device.ev_switch_entity or device.entity_id
+            (device.ev.switch_entity if device.ev else None) or device.entity_id
             if device.action_type == ACTION_EV_CHARGER
             else device.entity_id
         )
@@ -151,7 +151,7 @@ class PeakGuardDeviceSwitch(SwitchEntity):
             "onderliggende_entity": self._target_entity,
         }
         if self._device.action_type == ACTION_EV_CHARGER:
-            attrs["laadstroom_entity"] = self._device.ev_current_entity
+            attrs["laadstroom_entity"] = self._device.ev.current_entity if self._device.ev else None
         return attrs
 
     # ------------------------------------------------------------------ #

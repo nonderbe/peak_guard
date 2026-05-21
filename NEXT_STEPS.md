@@ -15,7 +15,7 @@ Started: 2026-05-21. Working through the prioritized list from the architecture 
 |---|-------|--------|-------|
 | 1 | Split `apply_action` (750-line method) into `_apply_peak` + `_apply_solar` | ✅ | `ev_guard.py` |
 | 2 | Fix cascade aliasing (controller ↔ deciders share mutable list with fragile manual resync) | ✅ | `async_load` + `update_cascade` now use `.clear()` + `.extend()`, no pointer resync |
-| 3 | `CascadeDevice` god-dataclass (17 fields, EV-specific ones optional) | ⏳ | HIGH EFFORT — sealed hierarchy. Defer to separate session. |
+| 3 | `CascadeDevice` god-dataclass (17 fields, EV-specific ones optional) | ✅ | `EVChargerConfig` nested dataclass; `to_dict()`/`from_dict()` keep flat JSON format for backward compat |
 | 4 | `_sensor_value` duplicated in `controller.py` and `base.py` | ✅ | Extracted to `read_sensor()` in `base.py` |
 | 5 | `_track_action` duplicated between `base.py` and `ev_guard.py` | ✅ | Extracted to `track_action()` in `base.py` |
 | 6 | `SharedCapacityState` half-baked construction (6 `set_*` calls post-ctor) | ✅ | All 6 deps now passed to constructor; `set_*` methods removed |
@@ -32,7 +32,7 @@ Started: 2026-05-21. Working through the prioritized list from the architecture 
 ## How to resume
 
 1. Read this file first.
-2. Only item 3 remains (`CascadeDevice` sealed hierarchy — HIGH EFFORT, defer to a dedicated session).
+2. All refactoring items are complete.
 3. The session limit policy (from CLAUDE.md) applies: commit all work before stopping.
 
 ## Key files map

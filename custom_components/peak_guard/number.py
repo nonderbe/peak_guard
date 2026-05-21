@@ -58,7 +58,7 @@ async def async_setup_entry(
         for device in all_devices:
             if device.action_type != ACTION_EV_CHARGER:
                 continue
-            if not device.ev_current_entity:
+            if not (device.ev and device.ev.current_entity):
                 continue  # geen stroomsensor → kan stroom niet instellen
             if device.id in known_ids or device.id in seen_in_batch:
                 continue
@@ -107,7 +107,7 @@ class PeakGuardEVCurrentNumber(NumberEntity):
         self._hass          = hass
         self._controller    = controller
         self._device        = device
-        self._current_entity = device.ev_current_entity  # type: ignore[assignment]
+        self._current_entity = device.ev.current_entity if device.ev else None  # type: ignore[assignment]
 
         slug = device.id.replace("-", "_").lower()
         self._attr_unique_id = f"{DOMAIN}_ev_current_{slug}"
@@ -115,8 +115,9 @@ class PeakGuardEVCurrentNumber(NumberEntity):
         self._attr_device_info = DEVICE_INFO_CASCADE
 
         # Bereik uit device-configuratie
+        _ev_min = device.ev.min_current if device.ev else None
         self._attr_native_min_value = float(
-            device.ev_min_current if device.ev_min_current is not None
+            _ev_min if _ev_min is not None
             else (device.min_value if device.min_value is not None else DEFAULT_EV_MIN_AMPERE)
         )
         self._attr_native_max_value = float(
@@ -148,13 +149,14 @@ class PeakGuardEVCurrentNumber(NumberEntity):
 
     @property
     def extra_state_attributes(self) -> dict:
-        phases = self._device.ev_phases or 1
+        phases = (self._device.ev.phases if self._device.ev else None) or 1
         voltage = 400.0 if phases == 3 else 230.0
         current_a = self.native_value
+        _ev_switch = (self._device.ev.switch_entity if self._device.ev else None) or self._device.entity_id
         return {
             "cascade_device_id":    self._device.id,
             "ev_current_entity":    self._current_entity,
-            "ev_switch_entity":     self._device.ev_switch_entity or self._device.entity_id,
+            "ev_switch_entity":     _ev_switch,
             "fasen":                phases,
             "spanning_v":           voltage,
             "huidig_vermogen_w":    round(current_a * voltage, 0) if current_a else None,
