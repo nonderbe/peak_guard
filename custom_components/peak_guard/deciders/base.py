@@ -23,7 +23,7 @@ from ..const import (
 )
 from ..models import (
     CascadeContext,
-    _BaseCascadeDevice,
+    BaseCascadeDevice,
     DeviceSnapshot,
 )
 
@@ -114,7 +114,7 @@ class BaseDecider:
 
     def _get_restore_candidates(
         self,
-        cascade: List[_BaseCascadeDevice],
+        cascade: List[BaseCascadeDevice],
         snapshots: Dict[str, DeviceSnapshot],
         reverse: bool = True,
     ) -> List[tuple]:
@@ -131,7 +131,7 @@ class BaseDecider:
 
     async def _run_cascade(
         self,
-        cascade: List[_BaseCascadeDevice],
+        cascade: List[BaseCascadeDevice],
         excess: float,
         snapshots: Dict[str, DeviceSnapshot],
         cascade_type: str = "peak",
@@ -197,7 +197,7 @@ class BaseDecider:
 
     async def _restore_device(
         self,
-        device: _BaseCascadeDevice,
+        device: BaseCascadeDevice,
         snapshot: DeviceSnapshot,
         cascade_type: str = "peak",
     ) -> bool:

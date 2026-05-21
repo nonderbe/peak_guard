@@ -21,13 +21,9 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 
+from .utils import quarter_start as _quarter_start
+
 _LOGGER = logging.getLogger(__name__)
-
-
-def _quarter_start(dt: datetime) -> datetime:
-    """Geeft het begin van het 15-minuten kwartierblok van dt (UTC)."""
-    minute_block = (dt.minute // 15) * 15
-    return dt.replace(minute=minute_block, second=0, microsecond=0)
 
 
 class QuarterCalculator:

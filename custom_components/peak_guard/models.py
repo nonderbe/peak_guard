@@ -14,10 +14,12 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Callable, Deque, Optional
 
+from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 
 if TYPE_CHECKING:
-    pass
+    from .avoided_peak_tracker import PeakAvoidTracker, SolarShiftTracker
+    from .deciders.ev_guard import EVGuard
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -142,11 +144,11 @@ class DeviceSnapshot:
 
 @dataclass
 class CascadeContext:
-    hass: Any
+    hass: HomeAssistant
     cascade_type: str
-    peak_tracker: Any
-    solar_tracker: Any
-    ev_guard: Any
+    peak_tracker: "PeakAvoidTracker"
+    solar_tracker: "SolarShiftTracker"
+    ev_guard: "EVGuard"
     track_action: Callable
     warn: Callable
     last_skip_reason: str = ""
@@ -157,7 +159,7 @@ class CascadeContext:
 # ──────────────────────────────────────────────────────────────────────────── #
 
 @dataclass
-class _BaseCascadeDevice:
+class BaseCascadeDevice:
     """Base class for all cascade device entries."""
     id:          str
     name:        str
@@ -170,7 +172,7 @@ class _BaseCascadeDevice:
     # ---- factory ----------------------------------------------------- #
 
     @classmethod
-    def from_dict(cls, d: dict) -> "_BaseCascadeDevice":
+    def from_dict(cls, d: dict) -> "BaseCascadeDevice":
         return from_dict(d)
 
     # ---- polymorphic apply / restore --------------------------------- #
@@ -192,7 +194,7 @@ class _BaseCascadeDevice:
 
 
 @dataclass
-class SwitchOffDevice(_BaseCascadeDevice):
+class SwitchOffDevice(BaseCascadeDevice):
     """Peak-limiting switch: turns a device OFF to reduce peak demand."""
 
     async def apply(self, excess: float, snapshots: dict, ctx: CascadeContext) -> float:
@@ -270,7 +272,7 @@ class SwitchOffDevice(_BaseCascadeDevice):
 
 
 @dataclass
-class SwitchOnDevice(_BaseCascadeDevice):
+class SwitchOnDevice(BaseCascadeDevice):
     """Injection-prevention switch: turns a device ON to consume solar surplus."""
 
     async def apply(self, excess: float, snapshots: dict, ctx: CascadeContext) -> float:
@@ -343,7 +345,7 @@ class SwitchOnDevice(_BaseCascadeDevice):
 
 
 @dataclass
-class ThrottleDevice(_BaseCascadeDevice):
+class ThrottleDevice(BaseCascadeDevice):
     """Legacy throttle: reduces a number entity to shed power."""
     min_value:      Optional[float] = None
     max_value:      Optional[float] = None
@@ -410,7 +412,7 @@ class ThrottleDevice(_BaseCascadeDevice):
 
 
 @dataclass
-class EVChargerDevice(_BaseCascadeDevice):
+class EVChargerDevice(BaseCascadeDevice):
     """EV charger: variable-current injection-prevention and peak-limiting device."""
     min_value:       Optional[float] = None
     max_value:       Optional[float] = None
@@ -490,7 +492,7 @@ def _migrate_flat_format(d: dict) -> dict:
     return d
 
 
-def from_dict(d: dict) -> _BaseCascadeDevice:
+def from_dict(d: dict) -> BaseCascadeDevice:
     """Factory: create the right device subclass from a serialised dict.
 
     Accepts both the current format and old flat/nested EV formats (migrates
@@ -540,12 +542,3 @@ def from_dict(d: dict) -> _BaseCascadeDevice:
     _LOGGER.warning("Peak Guard: onbekend action_type '%s' voor '%s' — SwitchOff fallback",
                     action_type, d.get("name", "?"))
     return SwitchOffDevice(**base)
-
-
-# ──────────────────────────────────────────────────────────────────────────── #
-#  Backward-compat aliases (keeps old import sites working during transition)  #
-# ──────────────────────────────────────────────────────────────────────────── #
-
-# CascadeDevice used as a type alias for _BaseCascadeDevice so that
-# existing 'from .models import CascadeDevice' imports still resolve.
-CascadeDevice = _BaseCascadeDevice

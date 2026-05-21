@@ -33,7 +33,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN, ACTION_EV_CHARGER
 from .controller import PeakGuardController
-from .models import _BaseCascadeDevice, EVChargerDevice
+from .models import BaseCascadeDevice, EVChargerDevice
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -105,7 +105,7 @@ class PeakGuardDeviceSwitch(SwitchEntity):
         self,
         hass: HomeAssistant,
         controller: PeakGuardController,
-        device: _BaseCascadeDevice,
+        device: BaseCascadeDevice,
     ) -> None:
         self._hass       = hass
         self._controller = controller

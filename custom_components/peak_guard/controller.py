@@ -13,8 +13,7 @@ from .decision_logger import DecisionLogger
 from .deciders import EVGuard, InjectionDecider, PeakDecider
 from .deciders.base import read_sensor
 from .models import (
-    _BaseCascadeDevice,
-    CascadeDevice,
+    BaseCascadeDevice,
     DeviceSnapshot,
     EVChargerDevice,
     from_dict as cascade_from_dict,
@@ -41,14 +40,6 @@ _LOGGER = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────────────────────────────────── #
-#  Data classes                                                                 #
-# ──────────────────────────────────────────────────────────────────────────── #
-
-# CascadeDevice en DeviceSnapshot worden geïmporteerd uit models.py
-# en zijn hierdoor ook beschikbaar via 'from .controller import CascadeDevice'.
-
-
-# ──────────────────────────────────────────────────────────────────────────── #
 #  Controller                                                                  #
 # ──────────────────────────────────────────────────────────────────────────── #
 
@@ -57,8 +48,8 @@ class PeakGuardController:
     def __init__(self, hass: HomeAssistant, config: dict):
         self.hass = hass
         self.config = config
-        self.peak_cascade:   List[_BaseCascadeDevice] = []
-        self.inject_cascade: List[_BaseCascadeDevice] = []
+        self.peak_cascade:   List[BaseCascadeDevice] = []
+        self.inject_cascade: List[BaseCascadeDevice] = []
         self._monitoring = False
         self._task: Optional[asyncio.Task] = None
         self._store = Store(hass, STORAGE_VERSION, STORAGE_KEY)
@@ -253,7 +244,7 @@ class PeakGuardController:
             try:
                 cb()
             except Exception:
-                pass
+                _LOGGER.exception("Peak Guard: entity listener raised an exception")
 
     def register_entity_listener(self, cb) -> None:
         """Registreer een callback die wordt aangeroepen na elke cascade-update.
@@ -361,7 +352,7 @@ class PeakGuardController:
             try:
                 unsub()
             except Exception:
-                pass
+                _LOGGER.exception("Peak Guard: fout bij verwijderen EV listener")
         self._state_unsubs.clear()
 
     # ------------------------------------------------------------------ #

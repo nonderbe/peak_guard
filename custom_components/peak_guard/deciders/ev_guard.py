@@ -26,7 +26,6 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 
 from ..const import (
-    DEFAULT_EV_CABLE_ENTITY,
     DEFAULT_EV_MAX_AMPERE,
     DEFAULT_EV_MIN_AMPERE,
 )
@@ -1038,7 +1037,7 @@ class EVGuard:
         )
 
         # GATE: cable detection
-        cable_entity = device.cable_entity or DEFAULT_EV_CABLE_ENTITY
+        cable_entity = device.cable_entity
         if not self.cable_connected(device):
             if sw_on:
                 _cable_st = self.hass.states.get(cable_entity)

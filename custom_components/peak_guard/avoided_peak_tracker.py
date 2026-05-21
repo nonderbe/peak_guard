@@ -27,17 +27,14 @@ from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional
 
+from .utils import quarter_start as _quarter_start
+
 _LOGGER = logging.getLogger(__name__)
 
 _QUARTER_MIN = 15
 _QUARTER_H   = _QUARTER_MIN / 60.0   # 0.25 h
 
 MAX_EVENTS = 100   # maximale loglijst per tracker
-
-
-def _quarter_start(dt: datetime) -> datetime:
-    """Geeft het begin van het kwartierblok van dt (UTC)."""
-    return dt.replace(minute=(dt.minute // 15) * 15, second=0, microsecond=0)
 
 
 # ──────────────────────────────────────────────────────────────────── #

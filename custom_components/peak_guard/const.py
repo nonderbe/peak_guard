@@ -56,7 +56,7 @@ DEFAULT_EV_MAX_SOC = 100   # % - maximaal batterijpercentage bij zonne-overschot
 # Standaard entity-id voor de kabeldetectiesensor van de EV-lader.
 # De sensor moet "on" / "true" / "connected" zijn als de kabel aangesloten is.
 # Laden kan pas starten als deze sensor een truthy-state rapporteert.
-DEFAULT_EV_CABLE_ENTITY = "sensor.tesla_opladen"
+DEFAULT_EV_CABLE_ENTITY = None
 
 # EV Solar-cascade drempelwaarden
 # Start-drempel: minimale injectie (W) vooraleer de EV-lader mag starten.

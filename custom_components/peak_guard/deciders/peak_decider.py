@@ -17,7 +17,7 @@ from ..const import (
     CONF_PEAK_SENSOR,
     DEFAULT_BUFFER_WATTS,
 )
-from ..models import CascadeDevice, DeviceSnapshot
+from ..models import BaseCascadeDevice, DeviceSnapshot
 from .base import BaseDecider
 
 if TYPE_CHECKING:
@@ -46,7 +46,7 @@ class PeakDecider(BaseDecider):
         ev_guard: "EVGuard",
         iteration_actions: list,
         save_fn: Callable,
-        cascade: List[CascadeDevice],
+        cascade: List[BaseCascadeDevice],
         snapshots: Dict[str, DeviceSnapshot],
     ) -> None:
         super().__init__(

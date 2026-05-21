@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Callable, Dict, List
 from homeassistant.core import HomeAssistant
 
 from ..const import ACTION_EV_CHARGER
-from ..models import CascadeDevice, DeviceSnapshot
+from ..models import BaseCascadeDevice, DeviceSnapshot
 from .base import BaseDecider
 
 if TYPE_CHECKING:
@@ -43,7 +43,7 @@ class InjectionDecider(BaseDecider):
         ev_guard: "EVGuard",
         iteration_actions: list,
         save_fn: Callable,
-        cascade: List[CascadeDevice],
+        cascade: List[BaseCascadeDevice],
         snapshots: Dict[str, DeviceSnapshot],
     ) -> None:
         super().__init__(

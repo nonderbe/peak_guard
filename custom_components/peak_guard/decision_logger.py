@@ -25,7 +25,7 @@ from .const import (
 )
 from .deciders.base import read_sensor
 from .models import (
-    _BaseCascadeDevice,
+    BaseCascadeDevice,
     EVChargerDevice,
     DeviceSnapshot,
     EV_DEBOUNCE_STABLE_S,
@@ -51,8 +51,8 @@ class DecisionLogger:
         self,
         hass: HomeAssistant,
         config: dict,
-        peak_cascade: List[_BaseCascadeDevice],
-        inject_cascade: List[_BaseCascadeDevice],
+        peak_cascade: List[BaseCascadeDevice],
+        inject_cascade: List[BaseCascadeDevice],
         peak_snapshots: Dict[str, DeviceSnapshot],
         inject_snapshots: Dict[str, DeviceSnapshot],
         ev_guard: "EVGuard",
@@ -246,7 +246,7 @@ class DecisionLogger:
     def _append_device_lines(
         self,
         lines: list,
-        d: _BaseCascadeDevice,
+        d: BaseCascadeDevice,
         pre_states: dict,
         snapshots: Dict[str, DeviceSnapshot],
         cascade: str,
