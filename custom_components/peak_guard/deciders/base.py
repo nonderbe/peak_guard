@@ -85,11 +85,7 @@ class BaseDecider:
     # ------------------------------------------------------------------ #
 
     def _warn(self, msg: str, *args) -> None:
-        _LOGGER.warning(msg, *args)
-        try:
-            self.ev_guard.add_warning(msg % args if args else msg)
-        except TypeError:
-            self.ev_guard.add_warning(str(msg))
+        self.ev_guard._warn(msg, *args)
 
     def _sensor_value(self, entity_id: Optional[str]) -> Optional[float]:
         return read_sensor(self.hass, entity_id)

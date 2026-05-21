@@ -29,7 +29,7 @@ Updated: 2026-05-21. Previous refactoring items all done. New round from deeper 
 |---|-------|--------|----------|
 | P0-1 | `DEFAULT_EV_CABLE_ENTITY` hardcoded to `"sensor.tesla_opladen"` → `None` | ✅ | `const.py:59` |
 | P0-2 | `CascadeContext` fields typed `Any` → proper types | ✅ | `models.py:144` |
-| P0-3 | `_apply_solar` god-method + 15-second `asyncio.sleep` loop blocks HA event loop | ⏳ | `ev_guard.py:1002-1483`; sleep loop at ~1254 |
+| P0-3 | `_apply_solar` god-method + 15-second `asyncio.sleep` loop blocks HA event loop | ⏳ | `ev_guard.py`; sleep loop in wake-up section |
 
 ### P1 — Should Fix Soon
 
@@ -40,16 +40,16 @@ Updated: 2026-05-21. Previous refactoring items all done. New round from deeper 
 | P1-3 | `_quarter_start` defined twice → extract to `utils.py` | ✅ | `avoided_peak_tracker.py:38`, `quarter_calculator.py:27` |
 | P1-4 | `_BaseCascadeDevice` naming contradiction → rename to `BaseCascadeDevice`, drop `CascadeDevice` alias | ✅ | `models.py` + all imports |
 | P1-5 | `datetime.now(timezone.utc)` called 30+ times per loop → thread `now` through signatures | ⏳ | `ev_guard.py`, trackers, deciders |
-| P1-6 | `from_dict` manual string-dispatch → class registry on subclasses | ⏳ | `models.py:493` |
-| P1-7 | Stale-sensor workaround duplicated in two places | ⏳ | `ev_guard.py:787` and `ev_guard.py:651` |
+| P1-6 | `from_dict` manual string-dispatch → class registry on subclasses | ✅ | `models.py` |
+| P1-7 | Stale-sensor workaround duplicated in two places | ✅ | `ev_guard.py` — extracted to `_effective_current_amps()` |
 
 ### P2 — Worth Addressing
 
 | # | Issue | Status | Location |
 |---|-------|--------|----------|
 | P2-1 | Test coverage thin for financial calculations | ⏳ | `tests/` |
-| P2-2 | `_monitor_loop` 80+ lines mixing concerns | ⏳ | `controller.py:404` |
-| P2-3 | `to_dict()` has inline datetime arithmetic in dict comprehension | ⏳ | `controller.py:177` |
+| P2-2 | `_monitor_loop` 80+ lines mixing concerns | ✅ | `controller.py` — extracted `_resolve_interval()`, `_read_consumption()`, `_dispatch()` |
+| P2-3 | `to_dict()` has inline datetime arithmetic in dict comprehension | ✅ | `ev_guard.py` — moved to `status_dict()` |
 | P2-4 | `_warn` duplicated between `BaseDecider` and `EVGuard` | ⏳ | `base.py`, `ev_guard.py` |
 
 ---
