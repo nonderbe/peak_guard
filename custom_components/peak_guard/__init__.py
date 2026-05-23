@@ -2,6 +2,7 @@
 
 import logging
 import os
+from datetime import datetime, timezone
 
 from homeassistant.components.http import HomeAssistantView, StaticPathConfig
 from homeassistant.components.panel_custom import async_register_panel
@@ -11,6 +12,7 @@ from homeassistant.core import HomeAssistant
 
 from .const import DOMAIN, PANEL_URL, PANEL_TITLE, PANEL_ICON
 from .controller import PeakGuardController
+from .ev_api_logger import EVApiLogger
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -72,6 +74,29 @@ class PeakGuardForceCheckView(HomeAssistantView):
         return self.json({"status": "ok", "message": "force check getriggerd"})
 
 
+class PeakGuardEvLogView(HomeAssistantView):
+    """REST endpoint om de dagelijkse Tesla API JSONL-log te raadplegen."""
+
+    url = "/api/peak_guard/ev_log"
+    name = "peak_guard:ev_log"
+    requires_auth = True
+
+    async def get(self, request):
+        hass = request.app["hass"]
+        logger = hass.data.get(DOMAIN, {}).get("ev_api_logger")
+        if not logger:
+            return self.json({
+                "entries": [],
+                "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            })
+        date_str = request.query.get("date")
+        entries = await logger.read_entries(date_str)
+        return self.json({
+            "entries": entries,
+            "date": date_str or datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        })
+
+
 class PeakGuardSimulateView(HomeAssistantView):
     """REST endpoint voor simulatiemodus: injecteer een kunstmatige verbruikswaarde."""
 
@@ -128,10 +153,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN]["controller"] = controller
 
+    # Tesla API JSONL logger
+    ev_api_logger = EVApiLogger(hass)
+    controller._ev_guard_decider.set_logger(ev_api_logger)
+    hass.data[DOMAIN]["ev_api_logger"] = ev_api_logger
+
     # REST API
     hass.http.register_view(PeakGuardCascadeView())
     hass.http.register_view(PeakGuardForceCheckView())
     hass.http.register_view(PeakGuardSimulateView())
+    hass.http.register_view(PeakGuardEvLogView())
 
     # Frontend panel (eenmalig)
     if not hass.data.get(_PANEL_REGISTERED_KEY):
@@ -195,6 +226,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if controller:
         await controller.stop_monitoring()
 
+    hass.data.get(DOMAIN, {}).pop("ev_api_logger", None)
     hass.data.pop(_PANEL_REGISTERED_KEY, None)
     hass.services.async_remove(DOMAIN, "get_dashboard_yaml")
     frontend.async_remove_panel(hass, PANEL_URL)

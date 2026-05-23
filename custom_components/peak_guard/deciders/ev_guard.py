@@ -20,6 +20,7 @@ import logging
 import math
 from collections import deque
 from datetime import datetime, timedelta, timezone
+from time import monotonic
 from typing import TYPE_CHECKING, Dict, Optional
 
 from homeassistant.core import HomeAssistant
@@ -76,9 +77,13 @@ class EVGuard:
         self._iteration_actions = iteration_actions   # gedeelde mutable lijst
         self._guards: Dict[str, EVDeviceGuard] = {}
         self._rate_limiter = EVRateLimiter()
-        self._recent_warnings: deque = deque(maxlen=20)
+        self._recent_warnings: deque = deque(maxlen=100)
         # Wordt gezet door apply_action; BaseDecider leest dit na de aanroep.
         self.last_skip_reason: str = ""
+        # JSONL-logger — geïnjecteerd vanuit __init__.py na initialisatie.
+        self._api_logger = None
+        # Huidige call-context voor de JSONL-logger (gezet door publieke methoden).
+        self._log_ctx: dict = {}
 
     # ------------------------------------------------------------------ #
     #  Properties voor controller.to_dict()                               #
@@ -219,6 +224,50 @@ class EVGuard:
     @property
     def recent_warnings(self) -> list:
         return list(self._recent_warnings)
+
+    # ------------------------------------------------------------------ #
+    #  JSONL API-logger                                                    #
+    # ------------------------------------------------------------------ #
+
+    def set_logger(self, logger) -> None:
+        """Koppel de EVApiLogger (aangeroepen vanuit __init__.py na setup)."""
+        self._api_logger = logger
+
+    async def _svc(
+        self,
+        domain: str,
+        service: str,
+        data: dict,
+        *,
+        blocking: bool = True,
+    ) -> None:
+        """Wrapper rond hass.services.async_call die elke call naar JSONL logt."""
+        start = monotonic()
+        error_str: Optional[str] = None
+        try:
+            await self.hass.services.async_call(
+                domain, service, data, blocking=blocking
+            )
+        except Exception as err:
+            error_str = str(err)
+            raise
+        finally:
+            if self._api_logger is not None:
+                ctx = self._log_ctx
+                try:
+                    await self._api_logger.log(
+                        device=ctx.get("device", ""),
+                        service=f"{domain}.{service}",
+                        entity=data.get("entity_id", ""),
+                        value=data.get("value"),
+                        cascade=ctx.get("cascade", ""),
+                        surplus_w=ctx.get("surplus_w", 0.0),
+                        success=error_str is None,
+                        error=error_str,
+                        duration_ms=(monotonic() - start) * 1000,
+                    )
+                except Exception:
+                    pass  # logging mag EV-logica nooit onderbreken
 
     # ------------------------------------------------------------------ #
     #  Kabeldetectie                                                       #
@@ -464,10 +513,9 @@ class EVGuard:
             )
 
         try:
-            await self.hass.services.async_call(
+            await self._svc(
                 "number", "set_value",
                 {"entity_id": soc_entity, "value": target_soc},
-                blocking=True,
             )
         except Exception as err:
             _LOGGER.error(
@@ -497,6 +545,7 @@ class EVGuard:
           Verwijder SOC-override, herstel laadstroom, zet schakelaar uit,
           voltooi solar duurmeting.
         """
+        self._log_ctx = {"device": device.name, "cascade": cascade_type, "surplus_w": 0.0}
         try:
             sw_entity  = device.switch_entity or device.entity_id
             cur_entity = device.current_entity
@@ -511,9 +560,7 @@ class EVGuard:
             # ---- PIEKBEPERKING: schakelaar was aan, nu uitgeschakeld ---- #
             if snapshot.original_state == "on":
                 if sw_state.state != "on":
-                    await self.hass.services.async_call(
-                        "switch", "turn_on", {"entity_id": sw_entity}, blocking=True
-                    )
+                    await self._svc("switch", "turn_on", {"entity_id": sw_entity})
                     _LOGGER.info(
                         "Peak Guard EV peak: '%s' terug ingeschakeld "
                         "(reden: herstel na piekbeperking)",
@@ -533,10 +580,9 @@ class EVGuard:
                         except (ValueError, TypeError):
                             cur_val = None
                         if cur_val is None or round(cur_val, 0) != round(orig_a, 0):
-                            await self.hass.services.async_call(
+                            await self._svc(
                                 "number", "set_value",
                                 {"entity_id": cur_entity, "value": round(orig_a, 1)},
-                                blocking=True,
                             )
                             _LOGGER.info(
                                 "Peak Guard EV peak: '%s' laadstroom hersteld naar %.1f A "
@@ -573,10 +619,9 @@ class EVGuard:
                             if snapshot.original_current is not None
                             else (device.min_value or DEFAULT_EV_MIN_AMPERE)
                         )
-                        await self.hass.services.async_call(
+                        await self._svc(
                             "number", "set_value",
                             {"entity_id": cur_entity, "value": round(restore_a, 1)},
-                            blocking=True,
                         )
                         _LOGGER.info(
                             "Peak Guard EV solar: '%s' laadstroom hersteld naar %.1f A "
@@ -584,9 +629,7 @@ class EVGuard:
                             device.name, restore_a,
                         )
 
-                    await self.hass.services.async_call(
-                        "switch", "turn_off", {"entity_id": sw_entity}, blocking=True
-                    )
+                    await self._svc("switch", "turn_off", {"entity_id": sw_entity})
                     _LOGGER.info(
                         "Peak Guard EV solar: '%s' schakelaar uitgeschakeld "
                         "(reden: herstel na injectiepreventie)",
@@ -671,6 +714,7 @@ class EVGuard:
             False — stroom staat al op hw-minimum of kan niet zinvol worden
                     verlaagd; aanroeper moet EV volledig stoppen.
         """
+        self._log_ctx = {"device": device.name, "cascade": "solar", "surplus_w": -consumption}
         cur_entity = device.current_entity
         if not cur_entity:
             return False
@@ -721,10 +765,9 @@ class EVGuard:
             return True  # rate-limiter vol: probeer volgende cyclus, stop EV niet
 
         try:
-            await self.hass.services.async_call(
+            await self._svc(
                 "number", "set_value",
                 {"entity_id": cur_entity, "value": float(new_a)},
-                blocking=True,
             )
         except HomeAssistantError as err:
             self._warn(
@@ -761,6 +804,7 @@ class EVGuard:
     ) -> float:
         """Dispatch to _apply_peak or _apply_solar after shared setup."""
         self.last_skip_reason = ""
+        self._log_ctx = {"device": device.name, "cascade": cascade_type, "surplus_w": excess}
 
         min_a   = float(device.min_value if device.min_value is not None else DEFAULT_EV_MIN_AMPERE)
         max_a   = float(device.max_value if device.max_value is not None else DEFAULT_EV_MAX_AMPERE)
@@ -890,9 +934,7 @@ class EVGuard:
             _last_err: Optional[HomeAssistantError] = None
             for _attempt in range(EV_CMD_MAX_RETRIES + 1):
                 try:
-                    await self.hass.services.async_call(
-                        "switch", "turn_off", {"entity_id": sw_entity}, blocking=True
-                    )
+                    await self._svc("switch", "turn_off", {"entity_id": sw_entity})
                     turn_off_ok = True
                     break
                 except HomeAssistantError as ha_err:
@@ -920,10 +962,9 @@ class EVGuard:
             if cur_entity and current_a is not None:
                 if self._rate_check(device.name, "set_value min_a na turn_off"):
                     try:
-                        await self.hass.services.async_call(
+                        await self._svc(
                             "number", "set_value",
                             {"entity_id": cur_entity, "value": min_a},
-                            blocking=True,
                         )
                         self._record_call()
                         self._track_action(cur_entity, "number.set_value", min_a)
@@ -998,10 +1039,9 @@ class EVGuard:
             return excess - actual_reduction_w
 
         try:
-            await self.hass.services.async_call(
+            await self._svc(
                 "number", "set_value",
                 {"entity_id": cur_entity, "value": float(new_a)},
-                blocking=True,
             )
         except HomeAssistantError as err:
             self._warn(
@@ -1081,9 +1121,7 @@ class EVGuard:
                 )
                 if self._rate_check(device.name, "turn_off kabel ontkoppeld"):
                     try:
-                        await self.hass.services.async_call(
-                            "switch", "turn_off", {"entity_id": sw_entity}, blocking=True
-                        )
+                        await self._svc("switch", "turn_off", {"entity_id": sw_entity})
                         self._record_call()
                         self._track_action(sw_entity, "switch.turn_off")
                     except HomeAssistantError as err:
@@ -1305,7 +1343,7 @@ class EVGuard:
                         device.name, status_entity, status_val, device.wake_button,
                     )
                     try:
-                        await self.hass.services.async_call(
+                        await self._svc(
                             "button", "press",
                             {"entity_id": device.wake_button},
                             blocking=False,
@@ -1339,10 +1377,9 @@ class EVGuard:
                 _snap_now = snapshots.get(snap_key)
                 if device.soc_entity and _snap_now is not None and _snap_now.original_soc is None:
                     try:
-                        await self.hass.services.async_call(
+                        await self._svc(
                             "homeassistant", "update_entity",
                             {"entity_id": device.soc_entity},
-                            blocking=True,
                         )
                     except Exception:
                         pass
@@ -1372,9 +1409,7 @@ class EVGuard:
                 _last_err: Optional[HomeAssistantError] = None
                 for _attempt in range(EV_CMD_MAX_RETRIES + 1):
                     try:
-                        await self.hass.services.async_call(
-                            "switch", "turn_on", {"entity_id": sw_entity}, blocking=True
-                        )
+                        await self._svc("switch", "turn_on", {"entity_id": sw_entity})
                         turn_on_ok = True
                         break
                     except HomeAssistantError as ha_err:
@@ -1411,10 +1446,9 @@ class EVGuard:
                 if cur_entity:
                     if self._rate_check(device.name, f"set_value {new_a} A bij turn_on"):
                         try:
-                            await self.hass.services.async_call(
+                            await self._svc(
                                 "number", "set_value",
                                 {"entity_id": cur_entity, "value": float(new_a)},
-                                blocking=True,
                             )
                             self._record_call()
                             self._track_action(cur_entity, "number.set_value", float(new_a))
@@ -1499,10 +1533,9 @@ class EVGuard:
             return excess - actual_consumption_w
 
         try:
-            await self.hass.services.async_call(
+            await self._svc(
                 "number", "set_value",
                 {"entity_id": cur_entity, "value": float(new_a)},
-                blocking=True,
             )
         except HomeAssistantError as err:
             self._warn(

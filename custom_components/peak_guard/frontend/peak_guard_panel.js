@@ -26,6 +26,10 @@ class PeakGuardPanel extends HTMLElement {
     this._countdownInterval = null;  // setInterval handle
     this._nextCheckAt = null;        // Date wanneer de volgende check verwacht wordt
     this._dataFetchedAt = null;      // Tijdstip waarop de laatste API-response ontvangen werd
+
+    // Logboek tab: Tesla API call log (geladen on-demand via /api/peak_guard/ev_log)
+    this._evLogData    = null;
+    this._evLogLoading = false;
   }
 
   // ------------------------------------------------------------------ //
@@ -363,8 +367,6 @@ class PeakGuardPanel extends HTMLElement {
 
         ${this._renderStatusCards()}
 
-        ${this._renderWarnings()}
-
         <nav class="tabs">
           <button class="tab ${this._activeTab === "peak" ? "active" : ""}" data-tab="peak">
             ⚡ Piekstroom vermijden
@@ -375,11 +377,16 @@ class PeakGuardPanel extends HTMLElement {
           <button class="tab ${this._activeTab === "savings" ? "active" : ""}" data-tab="savings">
             💰 Besparingen & Overzicht
           </button>
+          <button class="tab ${this._activeTab === "logboek" ? "active" : ""}" data-tab="logboek">
+            📋 Logboek
+          </button>
         </nav>
 
         ${this._activeTab === "savings"
           ? this._renderSavingsPanel()
-          : this._renderCascadePanel(this._activeTab)}
+          : this._activeTab === "logboek"
+            ? this._renderLogboekPanel()
+            : this._renderCascadePanel(this._activeTab)}
       </div>
     `;
 
@@ -1844,9 +1851,26 @@ class PeakGuardPanel extends HTMLElement {
         this._activeTab = t.dataset.tab;
         this._render();
         if (t.dataset.tab === "savings") {
-          // Kleine timeout zodat de DOM al gerenderd is voor chart-init
           setTimeout(() => this._initSavingsCharts(), 80);
         }
+        if (t.dataset.tab === "logboek") {
+          if (!this._evLogData && !this._evLogLoading) {
+            this._fetchEvLog().then(() => {
+              this._render();
+              setTimeout(() => this._drawEvLogChart(), 80);
+            });
+          } else if (this._evLogData) {
+            setTimeout(() => this._drawEvLogChart(), 80);
+          }
+        }
+      });
+    });
+
+    // Verversen-knop in Logboek tab
+    this.shadowRoot.querySelector("#btn-refresh-evlog")?.addEventListener("click", () => {
+      this._fetchEvLog().then(() => {
+        this._render();
+        setTimeout(() => this._drawEvLogChart(), 80);
       });
     });
 
@@ -1871,6 +1895,10 @@ class PeakGuardPanel extends HTMLElement {
     // Savings tab: init charts on first render
     if (this._activeTab === "savings") {
       setTimeout(() => this._initSavingsCharts(), 80);
+    }
+    // Logboek tab: redraw ev-log chart on re-render (e.g. 15-second refresh)
+    if (this._activeTab === "logboek" && this._evLogData) {
+      setTimeout(() => this._drawEvLogChart(), 80);
     }
 
     this.shadowRoot.querySelectorAll("[data-action='add']").forEach((btn) => {
@@ -2183,6 +2211,45 @@ class PeakGuardPanel extends HTMLElement {
         }
         .tab:hover { color: var(--primary-color, #03a9f4); }
         .tab.active { color: var(--primary-color, #03a9f4); border-bottom-color: var(--primary-color, #03a9f4); }
+
+        /* ── Logboek tab ─────────────────────────────────────────── */
+        .log-stat-row {
+          display: flex; align-items: center; gap: 20px;
+          padding: 12px 0 16px; flex-wrap: wrap;
+        }
+        .log-stat { display: flex; flex-direction: column; align-items: center; min-width: 56px; }
+        .log-stat-val { font-size: 1.4em; font-weight: 700; line-height: 1.2; }
+        .log-stat-lbl { font-size: .72em; color: var(--secondary-text-color, #757575); text-align: center; }
+        .log-ok  { color: #2e7d32; }
+        .log-err { color: #c62828; }
+        .log-section-title {
+          font-size: .78em; font-weight: 700; text-transform: uppercase;
+          letter-spacing: .06em; color: var(--secondary-text-color, #757575);
+          margin: 18px 0 8px; padding-bottom: 4px;
+          border-bottom: 1px solid var(--divider-color, #e0e0e0);
+        }
+        .log-chart-container { position: relative; height: 140px; margin-bottom: 8px; }
+        #evlog-chart { display: block; width: 100%; height: 100%; }
+        .log-table-wrap { overflow-x: auto; margin-top: 4px; }
+        .log-table { width: 100%; border-collapse: collapse; font-size: .84em; }
+        .log-table th {
+          text-align: left; font-size: .73em; font-weight: 700;
+          text-transform: uppercase; letter-spacing: .05em;
+          color: var(--secondary-text-color, #757575);
+          padding: 0 8px 6px 0; border-bottom: 2px solid var(--divider-color, #e0e0e0);
+        }
+        .log-table td {
+          padding: 6px 8px 6px 0;
+          border-bottom: 1px solid var(--divider-color, #f0f0f0);
+          vertical-align: middle;
+        }
+        .log-table tr.log-row-err { background: rgba(198,40,40,.04); }
+        .log-td-time { white-space: nowrap; color: var(--secondary-text-color, #757575); font-size: .88em; }
+        .log-td-ms   { color: var(--secondary-text-color, #aaa); font-size: .85em; }
+        .log-ok-badge  { color: #2e7d32; font-weight: 700; }
+        .log-err-badge { color: #c62828; font-weight: 700; cursor: help; border-bottom: 1px dashed #c62828; }
+        .log-empty   { text-align: center; padding: 24px; color: var(--secondary-text-color, #757575); font-size: .9em; }
+        .log-loading { text-align: center; padding: 12px; color: var(--secondary-text-color, #757575); }
 
         .panel {
           background: var(--card-background-color, #fff);
@@ -3059,6 +3126,244 @@ class PeakGuardPanel extends HTMLElement {
     }
 
     return hist.filter(h => h.valueA > 0 || h.valueB > 0);
+  }
+
+  // ------------------------------------------------------------------ //
+  //  Logboek tab — data ophalen                                          //
+  // ------------------------------------------------------------------ //
+
+  async _fetchEvLog(date) {
+    this._evLogLoading = true;
+    try {
+      const url = date ? `/api/peak_guard/ev_log?date=${encodeURIComponent(date)}` : "/api/peak_guard/ev_log";
+      const resp = await this._hass.fetchWithAuth(url);
+      this._evLogData = resp.ok ? await resp.json() : { entries: [], date: null };
+    } catch (e) {
+      this._evLogData = { entries: [], date: null };
+      console.error("[PeakGuard] ev_log ophalen mislukt:", e);
+    } finally {
+      this._evLogLoading = false;
+    }
+  }
+
+  // ------------------------------------------------------------------ //
+  //  Logboek tab — renderen                                              //
+  // ------------------------------------------------------------------ //
+
+  _renderLogboekPanel() {
+    const entries  = this._evLogData?.entries || [];
+    const date     = this._evLogData?.date    || "";
+    const warnings = this._data?.status?.warnings || [];
+
+    const total    = entries.length;
+    const errCount = entries.filter(e => !e.success).length;
+    const okCount  = total - errCount;
+    const avgMs    = total > 0
+      ? Math.round(entries.reduce((s, e) => s + (e.duration_ms || 0), 0) / total)
+      : 0;
+
+    const statsHtml = this._evLogData !== null ? `
+      <div class="log-stat-row">
+        <div class="log-stat">
+          <span class="log-stat-val">${total}</span>
+          <span class="log-stat-lbl">calls vandaag</span>
+        </div>
+        <div class="log-stat">
+          <span class="log-stat-val log-ok">${okCount}</span>
+          <span class="log-stat-lbl">geslaagd</span>
+        </div>
+        <div class="log-stat">
+          <span class="log-stat-val ${errCount > 0 ? "log-err" : ""}">${errCount}</span>
+          <span class="log-stat-lbl">mislukt</span>
+        </div>
+        <div class="log-stat">
+          <span class="log-stat-val">${avgMs}</span>
+          <span class="log-stat-lbl">ms gemiddeld</span>
+        </div>
+        <button class="btn btn-secondary" id="btn-refresh-evlog" style="margin-left:auto;">
+          🔄 Verversen
+        </button>
+      </div>
+      <div class="log-chart-container">
+        <canvas id="evlog-chart" height="140"></canvas>
+        <div id="evlog-chart-empty" class="chart-no-data" style="display:none;">
+          <span>Nog geen API-calls vandaag</span>
+        </div>
+      </div>
+    ` : `
+      <div style="text-align:center;margin:24px 0 8px;">
+        <button class="btn btn-secondary" id="btn-refresh-evlog">📋 Log laden</button>
+      </div>
+    `;
+
+    const warningsHtml = warnings.length > 0 ? `
+      <div class="log-section-title">⚠ Waarschuwingen (${warnings.length})</div>
+      <div class="warning-list" style="margin-bottom:16px;">
+        ${[...warnings].reverse().map(w => {
+          const ts = new Date(w.ts);
+          const timeStr = ts.toLocaleTimeString("nl-BE", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+          return `<div class="warning-item">
+            <span class="warning-ts">${timeStr}</span>
+            <span class="warning-msg">${(w.message || "").replace(/</g, "&lt;").replace(/>/g, "&gt;")}</span>
+          </div>`;
+        }).join("")}
+      </div>
+    ` : "";
+
+    const tableHtml = this._evLogData && entries.length > 0 ? `
+      <div class="log-section-title">API-calls — ${date} (nieuwste eerst)</div>
+      <div class="log-table-wrap">
+        <table class="log-table">
+          <thead>
+            <tr>
+              <th>Tijd</th>
+              <th>Apparaat</th>
+              <th>Commando</th>
+              <th>Waarde</th>
+              <th>ms</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${[...entries].reverse().map(e => this._renderLogRow(e)).join("")}
+          </tbody>
+        </table>
+      </div>
+    ` : (this._evLogData && entries.length === 0 ? `
+      <div class="log-empty">Geen API-calls geregistreerd voor ${date}.</div>
+    ` : "");
+
+    return `
+      <div class="panel">
+        <div class="panel-header">
+          <div class="panel-title">📋 Activiteitenlog</div>
+          <div class="panel-desc">Tesla API communicatie${date ? " · " + date : ""}</div>
+        </div>
+        ${this._evLogLoading ? '<div class="log-loading">Laden…</div>' : ""}
+        ${statsHtml}
+        ${warningsHtml}
+        ${tableHtml}
+      </div>
+    `;
+  }
+
+  _renderLogRow(entry) {
+    const ts      = new Date(entry.ts);
+    const timeStr = ts.toLocaleTimeString("nl-BE", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    const valStr  = (entry.value !== null && entry.value !== undefined) ? entry.value : "—";
+    const msStr   = (entry.duration_ms != null) ? entry.duration_ms : "—";
+    const errTitle = entry.error ? ` title="${entry.error.replace(/"/g, "&quot;")}"` : "";
+    const statusHtml = entry.success
+      ? '<span class="log-ok-badge">✓</span>'
+      : `<span class="log-err-badge"${errTitle}>✗</span>`;
+    return `<tr class="${entry.success ? "" : "log-row-err"}">
+      <td class="log-td-time">${timeStr}</td>
+      <td>${entry.device || "—"}</td>
+      <td><code>${entry.service || "—"}</code></td>
+      <td>${valStr}</td>
+      <td class="log-td-ms">${msStr}</td>
+      <td>${statusHtml}</td>
+    </tr>`;
+  }
+
+  // ------------------------------------------------------------------ //
+  //  Logboek tab — calls-per-uur chart                                  //
+  // ------------------------------------------------------------------ //
+
+  _drawEvLogChart() {
+    const canvas  = this.shadowRoot.querySelector("#evlog-chart");
+    const noData  = this.shadowRoot.querySelector("#evlog-chart-empty");
+    if (!canvas) return;
+
+    const entries = this._evLogData?.entries || [];
+    if (!entries.length) {
+      canvas.style.display = "none";
+      if (noData) noData.style.display = "flex";
+      return;
+    }
+    canvas.style.display = "block";
+    if (noData) noData.style.display = "none";
+
+    // Calls per uur
+    const hourData = Array.from({ length: 24 }, () => ({ ok: 0, err: 0 }));
+    entries.forEach(e => {
+      const h = new Date(e.ts).getHours();
+      if (h >= 0 && h < 24) {
+        if (e.success) hourData[h].ok++;
+        else           hourData[h].err++;
+      }
+    });
+
+    const maxCount = Math.max(1, ...hourData.map(h => h.ok + h.err));
+    const ctx  = canvas.getContext("2d");
+    const W    = canvas.offsetWidth || 600;
+    const H    = canvas.offsetHeight || 140;
+    canvas.width  = W;
+    canvas.height = H;
+
+    const PAD = { top: 20, right: 10, bottom: 28, left: 28 };
+    const chartW = W - PAD.left - PAD.right;
+    const chartH = H - PAD.top  - PAD.bottom;
+    const textColor = getComputedStyle(this).getPropertyValue("--primary-text-color").trim() || "#212121";
+    const gridColor = "rgba(128,128,128,0.12)";
+
+    ctx.clearRect(0, 0, W, H);
+
+    // Rasterlijnen + linker y-as
+    ctx.strokeStyle = gridColor;
+    ctx.lineWidth   = 1;
+    for (let i = 0; i <= 4; i++) {
+      const y = PAD.top + (i / 4) * chartH;
+      ctx.beginPath(); ctx.moveTo(PAD.left, y); ctx.lineTo(W - PAD.right, y); ctx.stroke();
+      const val = Math.round((1 - i / 4) * maxCount);
+      ctx.fillStyle = textColor; ctx.font = "10px sans-serif"; ctx.textAlign = "right";
+      ctx.fillText(val, PAD.left - 4, y + 3);
+    }
+
+    const gap        = chartW / 24;
+    const barW       = Math.max(2, gap * 0.65);
+    const chartBottom = PAD.top + chartH;
+
+    hourData.forEach((h, hour) => {
+      const total = h.ok + h.err;
+      if (!total) return;
+      const x = PAD.left + hour * gap + (gap - barW) / 2;
+
+      // Rode balk voor totaal (incl. fouten)
+      if (h.err > 0) {
+        const fullH = (total / maxCount) * chartH;
+        ctx.fillStyle = "#ef5350";
+        ctx.beginPath();
+        ctx.roundRect
+          ? ctx.roundRect(x, chartBottom - fullH, barW, fullH, [2, 2, 0, 0])
+          : ctx.rect(x, chartBottom - fullH, barW, fullH);
+        ctx.fill();
+      }
+      // Groene balk voor geslaagde calls (over de rode heen)
+      if (h.ok > 0) {
+        const okH = (h.ok / maxCount) * chartH;
+        ctx.fillStyle = "#43a047";
+        ctx.beginPath();
+        ctx.roundRect
+          ? ctx.roundRect(x, chartBottom - okH, barW, okH, [2, 2, 0, 0])
+          : ctx.rect(x, chartBottom - okH, barW, okH);
+        ctx.fill();
+      }
+      // X-as label elke 3 uur
+      if (hour % 3 === 0) {
+        ctx.fillStyle  = textColor; ctx.font = "10px sans-serif"; ctx.textAlign = "center";
+        ctx.fillText(`${hour}u`, x + barW / 2, H - PAD.bottom + 12);
+      }
+    });
+
+    // Legenda
+    const legY = H - 4;
+    ctx.fillStyle = "#43a047"; ctx.fillRect(PAD.left, legY - 8, 9, 9);
+    ctx.fillStyle = textColor; ctx.font = "10px sans-serif"; ctx.textAlign = "left";
+    ctx.fillText("geslaagd", PAD.left + 13, legY);
+    ctx.fillStyle = "#ef5350"; ctx.fillRect(PAD.left + 80, legY - 8, 9, 9);
+    ctx.fillStyle = textColor;
+    ctx.fillText("mislukt", PAD.left + 94, legY);
   }
 
 
