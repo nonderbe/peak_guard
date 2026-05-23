@@ -741,8 +741,15 @@ class EVGuard:
         new_a = max(int(hw_min_a), min(int(max_a), int(current_a) - reduction_a))
 
         if new_a >= int(current_a):
-            # Al op hw-minimum of reductie niet mogelijk → aanroeper stopt EV.
-            return False
+            # Already at hw-minimum; cannot reduce further.
+            # Keep the EV running as long as stopping it would cause injection again.
+            # Rule: stop only when solar contributes nothing to the EV draw, i.e. when
+            # consumption >= ev_draw_w — at that point even switching off the EV would
+            # not create injection (the house alone already consumes at least ev_draw_w).
+            ev_draw_w = current_a * voltage
+            if consumption < ev_draw_w:
+                return True   # solar still covers part of EV draw: keep charging at hw-min
+            return False      # solar gone entirely: allow restore to stop the EV
 
         guard = self.get_guard(device.id)
         now   = datetime.now(timezone.utc)

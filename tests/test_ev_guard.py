@@ -439,12 +439,24 @@ class TestThrottleDownSolar:
         assert set_calls
         assert set_calls[0]["data"]["value"] == 13.0
 
-    async def test_at_hw_min_returns_false(self):
+    async def test_at_hw_min_solar_still_contributing_returns_true(self):
         """
-        Al op hardware-minimum (6 A) → kan niet verder verlagen → Returns False.
+        Op hardware-minimum (6 A = 1380 W), maar solar dekt nog een deel van het
+        EV-verbruik (consumption 500 W < ev_draw_w 1380 W).
+        → Returns True (EV blijft laden op hw-min), geen set_value aanroep.
         """
         self.hass.states.set("number.tesla_charge_current", "6")
         result = await self.ev_guard.throttle_down_solar(self.device, consumption=500.0)
+        assert result is True
+        assert not self.hass.services.has_call("set_value")
+
+    async def test_at_hw_min_solar_gone_returns_false(self):
+        """
+        Op hardware-minimum (6 A = 1380 W) én consumption >= ev_draw_w (1500 W ≥ 1380 W):
+        solar levert niets meer → Returns False (aanroeper mag EV stoppen).
+        """
+        self.hass.states.set("number.tesla_charge_current", "6")
+        result = await self.ev_guard.throttle_down_solar(self.device, consumption=1500.0)
         assert result is False
         assert not self.hass.services.has_call("set_value")
 

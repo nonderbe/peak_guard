@@ -122,7 +122,10 @@ class InjectionDecider(BaseDecider):
 
         # EV-lader: verlaag eerst de laadstroom vóór een volledige stop.
         # Zo blijft de wagen laden bij een tijdelijk dalend solar-overschot.
-        if device.action_type == ACTION_EV_CHARGER and consumption > 0:
+        # consumption >= 0 (not > 0): ook bij exact nul-verbruik moet throttle_down_solar
+        # beslissen of de EV mag blijven lopen — anders stopt de EV onnodig wanneer
+        # EV-verbruik en zonne-opbrengst elkaar precies opheffen.
+        if device.action_type == ACTION_EV_CHARGER and consumption >= 0:
             throttled = await self.ev_guard.throttle_down_solar(device, consumption)
             if throttled:
                 return  # stroom verlaagd — EV blijft laden, geen verdere actie
