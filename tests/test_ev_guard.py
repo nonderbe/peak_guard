@@ -176,6 +176,20 @@ class TestHelpers:
         self.hass.states.set("device_tracker.tesla", "not_home")
         assert self.guard_obj.is_home(dev) is False
 
+    def test_is_home_returns_true_for_unknown_tracker(self):
+        """
+        device_tracker-state 'unknown' → NIET blokkeren.
+        'unknown' ≠ 'not_home': kabeldetectie is de primaire aanwezigheidscheck.
+        Regressiontest voor bug waarbij Tesla-integratie 'unknown' meldt terwijl
+        de auto thuis staat en laadt.
+        """
+        dev = self._device(ev_location_tracker="device_tracker.tesla")
+        for state in ("unknown", "unavailable", ""):
+            self.hass.states.set("device_tracker.tesla", state)
+            assert self.guard_obj.is_home(dev) is True, (
+                f"State '{state}' mag injectiepreventie NIET blokkeren"
+            )
+
 
 # ═══════════════════════════════════════════════════════════════════════════ #
 #  4. apply_action — piekbeperking                                             #
@@ -473,3 +487,163 @@ class TestThrottleDownSolar:
         assert not self.hass.services.has_call("set_value"), (
             "Geen set_value tijdens update-interval"
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════ #
+#  7. Tesla-entiteiten 'unknown' — regressiontests voor de bugfix            #
+# ═══════════════════════════════════════════════════════════════════════════ #
+
+class TestTeslaUnknownEntities:
+    """
+    Regressiontests voor de situatie waarin Tesla-schakelaar en locatie-tracker
+    permanent 'unknown' rapporteren terwijl de auto thuis staat en laadt.
+
+    Bug: is_home() blokkeerde op 'unknown', waardoor injectiepreventie nooit
+    actief werd. Bijkomend: snapshot registreerde 'unknown' als originele staat,
+    waardoor restore() nooit opruimde.
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup(self, hass, peak_tracker, solar_tracker):
+        self.hass = hass
+        self.pt = peak_tracker
+        self.st = solar_tracker
+        self.ev_guard = EVGuard(hass=hass, config={}, iteration_actions=[])
+
+        # Configureer een apparaat met locatie-tracker én status-sensor,
+        # zoals een echte Tesla-integratie.
+        self.device = EVChargerDevice(
+            id="ev_tesla",
+            name="Tesla",
+            entity_id="switch.tesla_charge",
+            priority=1,
+            action_type="ev_charger",
+            min_value=5.0,
+            max_value=8.0,
+            switch_entity="switch.tesla_charge",
+            current_entity="number.tesla_charge_current",
+            phases=1,
+            min_current=5.0,
+            start_threshold_w=1150.0,
+            location_tracker="device_tracker.tesla",
+            status_sensor="binary_sensor.tesla_status",
+        )
+
+    async def _apply_solar(self, excess: float, snapshots: dict | None = None):
+        if snapshots is None:
+            snapshots = {}
+        return await self.ev_guard.apply_action(
+            self.device, excess, snapshots, "solar", self.pt, self.st
+        )
+
+    async def test_unknown_location_does_not_block_injection_prevention(self):
+        """
+        Locatie-tracker 'unknown', kabel aan, surplus boven drempel, debounce al klaar
+        → injectiepreventie mag NIET geblokkeerd worden door locatie 'unknown'.
+        """
+        self.hass.states.set("switch.tesla_charge", "off")
+        self.hass.states.set("number.tesla_charge_current", "5")
+        self.hass.states.set("device_tracker.tesla", "unknown")
+        self.hass.states.set("binary_sensor.tesla_status", "off")
+
+        guard = self.ev_guard.get_guard(self.device.id)
+        guard.debounce_start_at = datetime.now(timezone.utc) - timedelta(seconds=25)
+        make_surplus_history(guard, seconds_span=25.0, value_w=1500.0)
+
+        await self._apply_solar(1500.0)
+
+        assert self.hass.services.has_call("turn_on"), (
+            "EV moet gestart worden ondanks locatie-tracker 'unknown'"
+        )
+
+    async def test_status_sensor_on_treats_switch_unknown_as_charging(self):
+        """
+        Schakelaar 'unknown' maar status-sensor 'on' (auto laadt al)
+        → geen onnodige turn_on, maar stroom wél aanpassen.
+        Snapshot moet 'on' registreren zodat restore de auto niet uitschakelt.
+        """
+        self.hass.states.set("switch.tesla_charge", "unknown")
+        self.hass.states.set("number.tesla_charge_current", "5")
+        self.hass.states.set("binary_sensor.tesla_status", "on")
+        self.hass.states.set("device_tracker.tesla", "unknown")
+
+        snaps: dict = {}
+        guard = self.ev_guard.get_guard(self.device.id)
+        guard.state = EVState.CHARGING
+        guard.last_switch_state = True
+        guard.last_sent_amps = 5.0
+        guard.last_current_update = datetime.now(timezone.utc) - timedelta(seconds=30)
+
+        await self._apply_solar(1500.0, snapshots=snaps)
+
+        assert not self.hass.services.has_call("turn_on"), (
+            "Geen turn_on als status-sensor aangeeft dat de auto al laadt"
+        )
+        assert self.hass.services.has_call("set_value"), (
+            "Laadstroom moet wél worden aangepast"
+        )
+        # Snapshot moet 'on' vastleggen zodat restore de EV niet uitschakelt.
+        snap = snaps.get("switch.tesla_charge")
+        assert snap is not None
+        assert snap.original_state == "on", (
+            "Snapshot moet 'on' registreren wanneer status-sensor aangeeft dat auto laadt"
+        )
+
+    async def test_restore_unknown_original_state_turns_off_and_cleans_up(self):
+        """
+        Restore met original_state='unknown' (schakelaar was unknown bij snapshot)
+        → EV uitschakelen, SOC-limiet herstellen, solar tracking afsluiten.
+        Regressiontest: eerder keerde restore() False terug voor 'unknown',
+        waardoor het snapshot nooit opgeruimd werd.
+        """
+        from custom_components.peak_guard.models import DeviceSnapshot
+
+        snap = DeviceSnapshot(
+            entity_id="switch.tesla_charge",
+            original_state="unknown",
+            original_current=None,
+            original_soc=None,
+        )
+        self.hass.states.set("switch.tesla_charge", "on")
+        self.hass.states.set("number.tesla_charge_current", "8")
+
+        result = await self.ev_guard.restore(
+            self.device, snap, self.pt, self.st, cascade_type="solar"
+        )
+
+        assert result is True, "restore() moet True teruggeven voor unknown original_state"
+        assert self.hass.services.has_call("turn_off"), (
+            "EV moet worden uitgeschakeld bij restore van unknown-snapshot"
+        )
+        assert len(self.st.completed) == 1, (
+            "Solar tracking moet worden afgesloten"
+        )
+
+    async def test_restore_on_original_state_solar_keeps_ev_running(self):
+        """
+        Restore met original_state='on' in solar cascade (auto was al aan het laden)
+        → EV NIET uitschakelen, SOC-limiet wél herstellen, solar tracking afsluiten.
+        """
+        from custom_components.peak_guard.models import DeviceSnapshot
+
+        snap = DeviceSnapshot(
+            entity_id="switch.tesla_charge",
+            original_state="on",
+            original_current=None,
+            original_soc=None,
+        )
+        self.hass.states.set("switch.tesla_charge", "on")
+
+        guard = self.ev_guard.get_guard(self.device.id)
+        guard.soc_override_active = True
+
+        result = await self.ev_guard.restore(
+            self.device, snap, self.pt, self.st, cascade_type="solar"
+        )
+
+        assert result is True
+        assert not self.hass.services.has_call("turn_off"), (
+            "EV mag NIET worden uitgeschakeld als het al aan was vóór PG ingreep"
+        )
+        assert len(self.st.completed) == 1, "Solar tracking moet worden afgesloten"
+        assert guard.soc_override_active is False, "SOC-override moet worden teruggezet"

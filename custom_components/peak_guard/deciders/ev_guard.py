@@ -396,15 +396,16 @@ class EVGuard:
 
         s = state.state.lower().strip()
         if s in ("unavailable", "unknown", ""):
-            # Locatie onbekend terwijl een tracker wél geconfigureerd is:
-            # conservatief blokkeren om onnodige wake-up API-calls te vermijden
-            # wanneer de auto buitenshuis is en de Tesla-integratie offline gaat.
+            # 'unknown' ≠ 'not_home': de locatie is onbekend, niet aantoonbaar afwezig.
+            # Als de kabel aangesloten is (eerder gecontroleerd) is de auto fysiek
+            # aanwezig. Blokkeren op 'unknown' verhindert injectiepreventie wanneer
+            # de Tesla-integratie tijdelijk offline is terwijl de auto thuis staat.
             _LOGGER.debug(
                 "Peak Guard EV: locatie-tracker '%s' rapporteert '%s' voor '%s' — "
-                "laden geblokkeerd (conservatief: locatie onzeker)",
+                "niet geblokkeerd (unknown ≠ not_home; kabeldetectie is primaire aanwezigheidscheck)",
                 tracker_entity, s, device.name,
             )
-            return False
+            return True
 
         return s in ("home", "on", "true", "1")
 
@@ -590,24 +591,43 @@ class EVGuard:
                                 device.name, orig_a, max_a,
                             )
 
-                # peak_tracker alleen aanroepen in piekbeperkings-context.
-                # In solar-context met original_state="on" was het apparaat al aan
-                # vóór PG ingreep (gebruiker schakelde handmatig in) — geen piek-event.
                 if cascade_type == "peak":
                     peak_tracker.start_measurement_on_turnon(
                         device_id=device.id,
                         device_name=device.name,
                         ts=datetime.now(timezone.utc),
                     )
-                guard = self.get_guard(device.id)
-                guard.state = EVState.CHARGING
-                guard.last_switch_state = True
-                guard.turned_on_at = datetime.now(timezone.utc)
-                self._reset_debounce(guard)
+                    guard = self.get_guard(device.id)
+                    guard.state = EVState.CHARGING
+                    guard.last_switch_state = True
+                    guard.turned_on_at = datetime.now(timezone.utc)
+                    self._reset_debounce(guard)
+                elif cascade_type == "solar":
+                    # Auto was al aan het laden voor PG ingreep (status-sensor fallback of
+                    # schakelaar stond expliciet 'on'). SOC-override herstellen en solar
+                    # tracking afsluiten, maar de auto NIET uitschakelen.
+                    await self._set_soc_override(
+                        device, override=False, original_soc=snapshot.original_soc
+                    )
+                    ev_event = solar_tracker.complete_solar_calculation(
+                        device_id=device.id,
+                        now=datetime.now(timezone.utc),
+                    )
+                    if ev_event:
+                        _LOGGER.info(
+                            "Peak Guard EV solar: event afgerond voor '%s' — "
+                            "duur=%.1f min, verschoven=%.4f kWh, besparing=€%.4f",
+                            device.name, ev_event.measured_duration_min,
+                            ev_event.shifted_kwh, ev_event.savings_euro,
+                        )
+                    guard = self.get_guard(device.id)
+                    guard.state = EVState.IDLE
+                    guard.soc_override_active = False
+                    self._reset_debounce(guard)
                 return True
 
-            # ---- INJECTIEPREVENTIE: schakelaar was uit, nu aangezet ---- #
-            if snapshot.original_state == "off":
+            # ---- INJECTIEPREVENTIE: schakelaar was uit (of unknown), nu aangezet ---- #
+            if snapshot.original_state in ("off", "unknown"):
                 if sw_state.state != "off":
                     await self._set_soc_override(
                         device, override=False, original_soc=snapshot.original_soc
@@ -828,6 +848,21 @@ class EVGuard:
 
         sw_on = sw_state.state == "on"
 
+        # Fallback: als de Tesla-schakelaar 'unknown'/'unavailable' rapporteert maar de
+        # status-sensor aangeeft dat de wagen aan het laden is, behandel als 'aan'.
+        # Dit voorkomt dat een onnodige turn_on gestuurd wordt aan een al ladende wagen
+        # én dat het snapshot 'unknown' vastlegt als originele staat terwijl de auto actief was.
+        if not sw_on and sw_state.state in ("unknown", "unavailable") and device.status_sensor:
+            _st_fallback = self.hass.states.get(device.status_sensor)
+            if _st_fallback is not None and _st_fallback.state not in ("unknown", "unavailable", ""):
+                if _st_fallback.state in ("on", "charging", "connected", "complete"):
+                    _LOGGER.debug(
+                        "Peak Guard EV: schakelaar '%s' = '%s' maar status-sensor '%s' = '%s' — "
+                        "behandeld als AAN (auto laadt al)",
+                        sw_entity, sw_state.state, device.status_sensor, _st_fallback.state,
+                    )
+                    sw_on = True
+
         current_a: Optional[float] = None
         cur_state = None
         if cur_entity:
@@ -849,9 +884,12 @@ class EVGuard:
 
         snap_key = device.entity_id
         if snap_key not in snapshots:
+            # Gebruik de effectieve staat: als de status-sensor aangeeft dat de auto
+            # laadt terwijl de schakelaar 'unknown' meldt, sla 'on' op zodat restore
+            # weet dat de auto al actief was en niet uitgeschakeld moet worden.
             snapshots[snap_key] = DeviceSnapshot(
                 entity_id=snap_key,
-                original_state=sw_state.state,
+                original_state="on" if sw_on else sw_state.state,
                 original_current=current_a,
                 original_soc=current_soc,
             )
