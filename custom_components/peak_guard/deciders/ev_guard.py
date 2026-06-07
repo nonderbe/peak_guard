@@ -374,12 +374,23 @@ class EVGuard:
     #  Locatie helper                                                      #
     # ------------------------------------------------------------------ #
 
-    def is_home(self, device: EVChargerDevice) -> bool:
+    def is_home(
+        self,
+        device: EVChargerDevice,
+        guard: "Optional[EVDeviceGuard]" = None,
+    ) -> bool:
         """
         Geeft True als de EV thuis is, of als er geen locatie-tracker is.
 
         Ondersteunt device_tracker (home/not_home) en binary_sensor (on/off).
-        Bij ontbrekende, unavailable of onbekende sensor: True (geen blokkering).
+
+        Wanneer de tracker 'unknown'/'unavailable' rapporteert:
+        - Als de guard een eerder bekende locatiestand heeft → gebruik die.
+        - Als de locatie nooit werd waargenomen → return True (aanname: thuis;
+          kabeldetectie is de primaire aanwezigheidscheck).
+        Dit voorkomt dat 'unknown' bij een auto thuis het laden blokkeert,
+        maar houdt de blokkering in stand als de auto op vakantie was en
+        de API inslaapt (last_known_home=False).
         """
         tracker_entity = device.location_tracker
         if not tracker_entity:
@@ -395,19 +406,31 @@ class EVGuard:
             return True
 
         s = state.state.lower().strip()
-        if s in ("unavailable", "unknown", ""):
-            # 'unknown' ≠ 'not_home': de locatie is onbekend, niet aantoonbaar afwezig.
-            # Als de kabel aangesloten is (eerder gecontroleerd) is de auto fysiek
-            # aanwezig. Blokkeren op 'unknown' verhindert injectiepreventie wanneer
-            # de Tesla-integratie tijdelijk offline is terwijl de auto thuis staat.
+
+        if s not in ("unavailable", "unknown", ""):
+            # Bekende staat: onthoud voor toekomstige 'unknown' cycli.
+            result = s in ("home", "on", "true", "1")
+            if guard is not None:
+                guard.last_known_home = result
+            return result
+
+        # Locatie is onbekend (auto slaapt of integratie tijdelijk offline).
+        if guard is not None and guard.last_known_home is not None:
             _LOGGER.debug(
                 "Peak Guard EV: locatie-tracker '%s' rapporteert '%s' voor '%s' — "
-                "niet geblokkeerd (unknown ≠ not_home; kabeldetectie is primaire aanwezigheidscheck)",
+                "terugval op laatste bekende staat: %s",
                 tracker_entity, s, device.name,
+                "thuis" if guard.last_known_home else "niet thuis",
             )
-            return True
+            return guard.last_known_home
 
-        return s in ("home", "on", "true", "1")
+        # Nooit een bekende locatie gezien (bv. tracker werkt nooit): aanname thuis.
+        _LOGGER.debug(
+            "Peak Guard EV: locatie-tracker '%s' rapporteert '%s' voor '%s' — "
+            "nooit bekende locatie gezien; aanname thuis (kabeldetectie is primaire check)",
+            tracker_entity, s, device.name,
+        )
+        return True
 
     # ------------------------------------------------------------------ #
     #  Dynamische ondergrens-detectie                                      #
@@ -1241,7 +1264,7 @@ class EVGuard:
                 return excess
 
         # GATE: EV must be home
-        if not self.is_home(device):
+        if not self.is_home(device, guard):
             if guard.state != EVState.IDLE:
                 loc_st = self.hass.states.get(device.location_tracker) if device.location_tracker else None
                 _LOGGER.info(

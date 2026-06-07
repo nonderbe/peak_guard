@@ -178,17 +178,65 @@ class TestHelpers:
 
     def test_is_home_returns_true_for_unknown_tracker(self):
         """
-        device_tracker-state 'unknown' → NIET blokkeren.
-        'unknown' ≠ 'not_home': kabeldetectie is de primaire aanwezigheidscheck.
+        device_tracker nooit bekende staat (altijd 'unknown') → NIET blokkeren.
         Regressiontest voor bug waarbij Tesla-integratie 'unknown' meldt terwijl
-        de auto thuis staat en laadt.
+        de auto thuis staat en laadt — zonder guard, dus last_known_home=None.
         """
         dev = self._device(ev_location_tracker="device_tracker.tesla")
         for state in ("unknown", "unavailable", ""):
             self.hass.states.set("device_tracker.tesla", state)
             assert self.guard_obj.is_home(dev) is True, (
-                f"State '{state}' mag injectiepreventie NIET blokkeren"
+                f"State '{state}' mag NIET blokkeren als locatie nooit bekend was"
             )
+
+    def test_is_home_tracks_last_known_location_in_guard(self):
+        """is_home() met bekende staat slaat last_known_home op in de guard."""
+        dev = self._device(ev_location_tracker="device_tracker.tesla")
+        guard = self.guard_obj.get_guard(dev.id)
+
+        self.hass.states.set("device_tracker.tesla", "home")
+        assert self.guard_obj.is_home(dev, guard) is True
+        assert guard.last_known_home is True
+
+        self.hass.states.set("device_tracker.tesla", "not_home")
+        assert self.guard_obj.is_home(dev, guard) is False
+        assert guard.last_known_home is False
+
+    def test_is_home_unknown_falls_back_to_last_known_not_home(self):
+        """
+        Vakantie-scenario: auto was 'not_home', API slaapt → locatie wordt 'unknown'.
+        is_home() moet terugvallen op last_known_home=False (niet thuis).
+        Voorkomt dat PG de auto op vakantie probeert te sturen.
+        """
+        dev = self._device(ev_location_tracker="device_tracker.tesla")
+        guard = self.guard_obj.get_guard(dev.id)
+
+        self.hass.states.set("device_tracker.tesla", "not_home")
+        self.guard_obj.is_home(dev, guard)
+        assert guard.last_known_home is False
+
+        # API slaapt: locatie wordt 'unknown'
+        self.hass.states.set("device_tracker.tesla", "unknown")
+        assert self.guard_obj.is_home(dev, guard) is False, (
+            "Auto was 'not_home' vóór 'unknown' → vakantie → NIET thuis"
+        )
+
+    def test_is_home_unknown_falls_back_to_last_known_home(self):
+        """
+        Auto thuis slapend: locatie was 'home', API slaapt → 'unknown'.
+        is_home() moet terugvallen op last_known_home=True (wel thuis).
+        """
+        dev = self._device(ev_location_tracker="device_tracker.tesla")
+        guard = self.guard_obj.get_guard(dev.id)
+
+        self.hass.states.set("device_tracker.tesla", "home")
+        self.guard_obj.is_home(dev, guard)
+        assert guard.last_known_home is True
+
+        self.hass.states.set("device_tracker.tesla", "unknown")
+        assert self.guard_obj.is_home(dev, guard) is True, (
+            "Auto was 'home' vóór 'unknown' → thuis slapend → WEL thuis"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════ #

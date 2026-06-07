@@ -85,6 +85,7 @@ class EVDeviceGuard:
     skip_reason: str = ""
     soc_override_active: bool = False
     wake_cooldown_until: Optional[datetime] = None
+    last_known_home: Optional[bool] = None  # True/False zodra locatie ooit gekend was; None = nooit gezien
 
 
 # ──────────────────────────────────────────────────────────────────────────── #
