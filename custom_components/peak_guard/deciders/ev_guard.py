@@ -1296,6 +1296,13 @@ class EVGuard:
             guard.turned_off_at   = None
             guard.turned_off_by_pg = False
             self._reset_debounce(guard)
+            nominal_w = (current_a * voltage) if current_a is not None else (hw_min_a * voltage)
+            solar_tracker.start_solar_measurement(
+                device_id=device.id,
+                device_name=device.name,
+                nominal_kw=nominal_w / 1000.0,
+                ts=now,
+            )
 
         if not sw_on:
             # EV off → turn on at hardware minimum
