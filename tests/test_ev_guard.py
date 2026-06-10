@@ -467,6 +467,8 @@ class TestApplyActionSolar:
         """
         EV handmatig aangezet terwijl PG niet de schakelaar had bediend
         → staat = CHARGING, turned_off_by_pg = False.
+        Regressie v1.8.4: start_solar_measurement moet worden aangeroepen zodat
+        complete_solar_calculation later een event aanmaakt.
         """
         self.hass.states.set("switch.tesla_charge", "on")
         self.hass.states.set("number.tesla_charge_current", "16")
@@ -476,6 +478,10 @@ class TestApplyActionSolar:
         await self._apply_solar(5000.0)
         assert guard.state == EVState.CHARGING
         assert guard.turned_off_by_pg is False
+        assert self.st.started, (
+            "start_solar_measurement moet worden aangeroepen bij handmatige start "
+            "(anders maakt complete_solar_calculation geen event aan — bug v1.8.4)"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════ #

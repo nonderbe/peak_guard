@@ -155,7 +155,7 @@ Peak Guard registreert de volgende sensoren (alle onder het `peak_guard`-domein)
 | `sensor.peak_guard_peak_savings_euro_this_month` | Besparing capaciteitstarief deze maand (EUR) |
 | `sensor.peak_guard_peak_savings_euro_this_year` | Cumulatieve besparing dit jaar (EUR, persistent) |
 | `sensor.peak_guard_hypothetical_monthly_peak_kw` | Maandpiek zonder Peak Guard (kW) |
-| `sensor.peak_guard_peak_avoided_events` | Log van laatste 50 piek-events (attribuut) |
+| `sensor.peak_guard_peak_avoided_events` | Log van laatste 100 piek-events (attribuut) |
 
 ### Injectiepreventie
 
@@ -164,7 +164,7 @@ Peak Guard registreert de volgende sensoren (alle onder het `peak_guard`-domein)
 | `sensor.peak_guard_solar_verschoven_kwh_this_month` | Verschoven energie deze maand (kWh) |
 | `sensor.peak_guard_solar_savings_euro_this_month` | Besparing injectiepreventie deze maand (EUR) |
 | `sensor.peak_guard_solar_savings_euro_this_year` | Cumulatieve besparing dit jaar (EUR, persistent) |
-| `sensor.peak_guard_solar_avoided_events` | Log van laatste 50 solar-events (attribuut) |
+| `sensor.peak_guard_solar_avoided_events` | Log van laatste 100 solar-events (attribuut) |
 
 ---
 
@@ -185,14 +185,25 @@ custom_components/peak_guard/
 ├── config_flow.py           # Configuratiewizard
 ├── const.py                 # Constanten en standaardwaarden
 ├── controller.py            # Cascade-logica en monitoring
+├── models.py                # Dataclasses: cascade devices, snapshots, EV state machine
 ├── avoided_peak_tracker.py  # PeakAvoidTracker + SolarShiftTracker
-├── sensor.py                # Alle 16 sensor-entiteiten
+├── sensor.py                # 16+ sensor-entiteiten + SharedCapacityState
+├── switch.py                # Dynamische switch-entiteiten per cascade-apparaat
+├── number.py                # Dynamische number-entiteiten per cascade-apparaat
 ├── dashboard_yaml.py        # Compacte card-YAML als Python-constante
+├── decision_logger.py       # Optionele debug-beslissingslog
+├── ev_api_logger.py         # Tesla API call JSONL log (Logboek tab)
+├── utils.py                 # Gedeelde helpers (quarter_start e.a.)
 ├── services.yaml            # Service-definitie voor get_dashboard_yaml
 ├── quarter_calculator.py    # 15-min kwartierpiek berekening
 ├── quarter_store.py         # Persistente opslag kwartierpiek-data
 ├── manifest.json
 ├── strings.json
+├── deciders/
+│   ├── base.py              # BaseDecider: gedeelde cascade helpers
+│   ├── peak_decider.py      # Piekbeperking beslissingen
+│   ├── injection_decider.py # Injectiepreventie beslissingen
+│   └── ev_guard.py          # EV-lader state machine (EVGuard)
 └── frontend/
     └── peak_guard_panel.js  # Cascade-beheer UI (zijbalk)
 ```

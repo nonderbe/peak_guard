@@ -11,11 +11,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Validation / CI
 
-There are no local test or lint commands. Validation runs on GitHub Actions via:
+Local tests run with:
+```
+python3 -m pytest tests/ -v
+```
+
+The test suite uses stub modules in `tests/conftest.py` to avoid a live HA install. Two test files:
+- `tests/test_ev_guard.py` — 38 tests covering the EV state machine, rate limiter, debounce, and Tesla-specific paths
+- `tests/test_tracker.py` — 16 tests covering the financial calculations in `PeakAvoidTracker` and `SolarShiftTracker`
+
+GitHub Actions also runs on every push/PR to `main`:
 - **HACS validation** — checks integration structure, manifest, and metadata
 - **hassfest validation** — checks HA integration conformance
-
-Both run automatically on push/PR to `main`. There is no local equivalent beyond running them via Docker or reviewing HA hassfest rules manually.
 
 ## Architecture
 
@@ -76,6 +83,7 @@ EV chargers are significantly more complex than simple switches. All logic lives
 - **Min-OFF cooldown** (`EV_MIN_OFF_DURATION_S`): prevents restart too soon after PG turned the EV off
 - **Wake-up support**: detects sleeping EV (via `status_sensor`), calls `wake_button`, waits up to `EV_WAKE_TIMEOUT_S`, then backs off for `EV_WAKE_COOLDOWN_S` on failure
 - **Location guard**: skips all action when `location_tracker` is present and EV is not home
+- **Manual-start detection**: if `switch_entity` reports `unknown`/`unavailable` but `status_sensor` confirms charging, the EV is treated as already on. This "handmatige start" path sets `guard.state = CHARGING` **and** calls `solar_tracker.start_solar_measurement` so the session is tracked even though Peak Guard didn't initiate it. Relevant for Tesla, whose switch entity is permanently `unknown`.
 
 ### Configuration constants (`const.py`)
 
