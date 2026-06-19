@@ -550,13 +550,14 @@ def from_dict(d: dict) -> BaseCascadeDevice:
     d = _migrate_flat_format(d)
     action_type = d["action_type"]
     base = {
-        "id":          d["id"],
-        "name":        d["name"],
-        "entity_id":   d["entity_id"],
-        "priority":    d["priority"],
-        "action_type": action_type,
-        "power_watts": d.get("power_watts", 0),
-        "enabled":     d.get("enabled", True),
+        "id":              d["id"],
+        "name":            d["name"],
+        "entity_id":       d["entity_id"],
+        "priority":        d["priority"],
+        "action_type":     action_type,
+        "power_watts":     d.get("power_watts", 0),
+        "enabled":         d.get("enabled", True),
+        "manual_override": d.get("manual_override", False),
     }
     cls = _DEVICE_REGISTRY.get(action_type)
     if cls is None:
