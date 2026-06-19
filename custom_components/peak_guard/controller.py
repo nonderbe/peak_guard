@@ -384,7 +384,7 @@ class PeakGuardController:
             return self._simulation_consumption
         return self._sensor_value(self.config.get(CONF_CONSUMPTION_SENSOR))
 
-    async def _dispatch(self, consumption: float) -> None:
+    async def _dispatch(self, consumption: float, now: datetime) -> None:
         """Run peak/inject cascade and restore logic for one loop tick."""
         _LOGGER.debug(
             "Peak Guard loop: verbruik=%.0f W — %s",
@@ -393,23 +393,23 @@ class PeakGuardController:
             else "import (piek-cascade actief)" if consumption > 0
             else "nul",
         )
-        await self._check_power_drop(consumption)
+        await self._check_power_drop(consumption, now)
         if consumption > 0:
-            await self._peak_decider.check(consumption)
-            await self._peak_decider.check_restore(consumption)
-            await self._injection_decider.check_restore(consumption)
+            await self._peak_decider.check(consumption, now)
+            await self._peak_decider.check_restore(consumption, now)
+            await self._injection_decider.check_restore(consumption, now)
         elif consumption < 0:
             _LOGGER.debug(
                 "Peak Guard: zonne-overschot gedetecteerd — sensor=%.0f W "
                 "(export %.0f W) — solar cascade wordt gecontroleerd",
                 consumption, abs(consumption),
             )
-            await self._injection_decider.check(consumption)
-            await self._peak_decider.check_restore(consumption)
-            await self._injection_decider.check_restore(consumption)
+            await self._injection_decider.check(consumption, now)
+            await self._peak_decider.check_restore(consumption, now)
+            await self._injection_decider.check_restore(consumption, now)
         else:
-            await self._peak_decider.check_restore(0.0)
-            await self._injection_decider.check_restore(0.0)
+            await self._peak_decider.check_restore(0.0, now)
+            await self._injection_decider.check_restore(0.0, now)
 
     async def _monitor_loop(self):
         interval = self._resolve_interval()
@@ -427,7 +427,8 @@ class PeakGuardController:
             # te wachten mist de loop dat signaal niet.
             self._wakeup.clear()
             try:
-                self._last_loop_at = datetime.now(timezone.utc).isoformat()
+                now = datetime.now(timezone.utc)
+                self._last_loop_at = now.isoformat()
                 self._iteration_actions.clear()
 
                 consumption = self._read_consumption()
@@ -441,7 +442,7 @@ class PeakGuardController:
                             _s = self.hass.states.get(_d.entity_id)
                             _pre_states[_d.entity_id] = _s.state if _s else "?"
 
-                    await self._dispatch(consumption)
+                    await self._dispatch(consumption, now)
 
                     if _debug_logging:
                         await self._decision_logger.log(consumption, _pre_states)
@@ -476,7 +477,7 @@ class PeakGuardController:
     #  Power-drop detectie — Hook 3                                        #
     # ------------------------------------------------------------------ #
 
-    async def _check_power_drop(self, consumption: float) -> None:
+    async def _check_power_drop(self, consumption: float, now: datetime) -> None:
         if self._prev_consumption is None:
             return
 
@@ -487,7 +488,6 @@ class PeakGuardController:
         drop = self._prev_consumption - consumption
         all_peak_devices = {d.id: d for d in self.peak_cascade}
 
-        now = datetime.now(timezone.utc)
         for device_id in list(active_ids):
             device = all_peak_devices.get(device_id)
             if device is None:

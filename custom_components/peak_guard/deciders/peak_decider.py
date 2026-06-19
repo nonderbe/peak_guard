@@ -8,7 +8,8 @@ Herstelt apparaten zodra er weer voldoende headroom is.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Callable, Dict, List
+from datetime import datetime
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional
 
 from homeassistant.core import HomeAssistant
 
@@ -65,7 +66,7 @@ class PeakDecider(BaseDecider):
     #  Publieke interface                                                  #
     # ------------------------------------------------------------------ #
 
-    async def check(self, consumption: float) -> None:
+    async def check(self, consumption: float, now: Optional[datetime] = None) -> None:
         """
         Controleer of het verbruik de maandpiek + buffer overschrijdt.
         Zo ja, start de piek-cascade.
@@ -97,9 +98,9 @@ class PeakDecider(BaseDecider):
                 _LOGGER.warning(
                     "Peak Guard: geen actieve apparaten in piek-cascade — niets te doen!"
                 )
-            await self._run_cascade(self._cascade, excess, self._snapshots, "peak")
+            await self._run_cascade(self._cascade, excess, self._snapshots, "peak", now)
 
-    async def check_restore(self, consumption: float) -> None:
+    async def check_restore(self, consumption: float, now: Optional[datetime] = None) -> None:
         """
         Controleer of eerder uitgeschakelde apparaten veilig hersteld kunnen
         worden zonder de piekgrens opnieuw te overschrijden.
@@ -142,7 +143,7 @@ class PeakDecider(BaseDecider):
                 # (meer vermogen) dat zeker ook — stop hier.
                 break
 
-            restored = await self._restore_device(device, snapshot, cascade_type="peak")
+            restored = await self._restore_device(device, snapshot, cascade_type="peak", now=now)
             if restored:
                 del self._snapshots[device.entity_id]
                 remaining_headroom -= nominal_w

@@ -8,7 +8,8 @@ Herstelt apparaten zodra het overschot verdwenen is.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Callable, Dict, List
+from datetime import datetime
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional
 
 from homeassistant.core import HomeAssistant
 
@@ -62,7 +63,7 @@ class InjectionDecider(BaseDecider):
     #  Publieke interface                                                  #
     # ------------------------------------------------------------------ #
 
-    async def check(self, consumption: float) -> None:
+    async def check(self, consumption: float, now: Optional[datetime] = None) -> None:
         """
         Controleer of het netto-verbruik negatief is (injectie op het net).
         Zo ja, start de inject-cascade om het overschot lokaal te verbruiken.
@@ -88,14 +89,14 @@ class InjectionDecider(BaseDecider):
                     "%.0f W wordt teruggeleverd aan het net zonder actie!",
                     injection,
                 )
-            await self._run_cascade(self._cascade, injection, self._snapshots, "solar")
+            await self._run_cascade(self._cascade, injection, self._snapshots, "solar", now)
         else:
             _LOGGER.debug(
                 "Peak Guard: geen injectie (%.0f W) — geen actie vereist",
                 injection,
             )
 
-    async def check_restore(self, consumption: float) -> None:
+    async def check_restore(self, consumption: float, now: Optional[datetime] = None) -> None:
         """
         Controleer of eerder ingeschakelde verbruikers teruggezet kunnen
         worden (overschot verdwenen — netto-verbruik ≥ 0).
@@ -126,11 +127,11 @@ class InjectionDecider(BaseDecider):
         # beslissen of de EV mag blijven lopen — anders stopt de EV onnodig wanneer
         # EV-verbruik en zonne-opbrengst elkaar precies opheffen.
         if device.action_type == ACTION_EV_CHARGER and consumption >= 0:
-            throttled = await self.ev_guard.throttle_down_solar(device, consumption)
+            throttled = await self.ev_guard.throttle_down_solar(device, consumption, now=now)
             if throttled:
                 return  # stroom verlaagd — EV blijft laden, geen verdere actie
 
-        restored = await self._restore_device(device, snapshot, cascade_type="solar")
+        restored = await self._restore_device(device, snapshot, cascade_type="solar", now=now)
         if restored:
             del self._snapshots[device.entity_id]
             _LOGGER.info("Peak Guard: '%s' hersteld", device.name)

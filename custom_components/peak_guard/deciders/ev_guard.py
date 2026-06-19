@@ -558,6 +558,7 @@ class EVGuard:
         peak_tracker: "PeakAvoidTracker",
         solar_tracker: "SolarShiftTracker",
         cascade_type: str = "peak",
+        now: Optional[datetime] = None,
     ) -> bool:
         """
         Herstel EV Charger na een Peak Guard ingreep.
@@ -569,6 +570,8 @@ class EVGuard:
           Verwijder SOC-override, herstel laadstroom, zet schakelaar uit,
           voltooi solar duurmeting.
         """
+        if now is None:
+            now = datetime.now(timezone.utc)
         self._log_ctx = {"device": device.name, "cascade": cascade_type, "surplus_w": 0.0}
         try:
             sw_entity  = device.switch_entity or device.entity_id
@@ -618,12 +621,12 @@ class EVGuard:
                     peak_tracker.start_measurement_on_turnon(
                         device_id=device.id,
                         device_name=device.name,
-                        ts=datetime.now(timezone.utc),
+                        ts=now,
                     )
                     guard = self.get_guard(device.id)
                     guard.state = EVState.CHARGING
                     guard.last_switch_state = True
-                    guard.turned_on_at = datetime.now(timezone.utc)
+                    guard.turned_on_at = now
                     self._reset_debounce(guard)
                 elif cascade_type == "solar":
                     # Auto was al aan het laden voor PG ingreep (status-sensor fallback of
@@ -634,7 +637,7 @@ class EVGuard:
                     )
                     ev_event = solar_tracker.complete_solar_calculation(
                         device_id=device.id,
-                        now=datetime.now(timezone.utc),
+                        now=now,
                     )
                     if ev_event:
                         _LOGGER.info(
@@ -682,7 +685,7 @@ class EVGuard:
 
                     ev_event = solar_tracker.complete_solar_calculation(
                         device_id=device.id,
-                        now=datetime.now(timezone.utc),
+                        now=now,
                     )
                     if ev_event:
                         _LOGGER.info(
@@ -695,7 +698,7 @@ class EVGuard:
                     guard = self.get_guard(device.id)
                     guard.state = EVState.IDLE
                     guard.last_switch_state = None
-                    guard.turned_off_at = datetime.now(timezone.utc)
+                    guard.turned_off_at = now
                     guard.turned_off_by_pg = True
                     guard.soc_override_active = False
                     self._reset_debounce(guard)
@@ -713,7 +716,7 @@ class EVGuard:
                     )
                     solar_tracker.complete_solar_calculation(
                         device_id=device.id,
-                        now=datetime.now(timezone.utc),
+                        now=now,
                     )
                     guard = self.get_guard(device.id)
                     guard.state = EVState.IDLE
@@ -746,6 +749,7 @@ class EVGuard:
         self,
         device: EVChargerDevice,
         consumption: float,
+        now: Optional[datetime] = None,
     ) -> bool:
         """
         Verlaag de EV-laadstroom met het minimum dat nodig is om de grid-import
@@ -803,7 +807,8 @@ class EVGuard:
             return False      # solar gone entirely: allow restore to stop the EV
 
         guard = self.get_guard(device.id)
-        now   = datetime.now(timezone.utc)
+        if now is None:
+            now = datetime.now(timezone.utc)
 
         current_a = self._effective_current_amps(device, guard, cur_state, now, current_a)
 
@@ -859,6 +864,7 @@ class EVGuard:
         cascade_type: str,
         peak_tracker: "PeakAvoidTracker",
         solar_tracker: "SolarShiftTracker",
+        now: Optional[datetime] = None,
     ) -> float:
         """Dispatch to _apply_peak or _apply_solar after shared setup."""
         self.last_skip_reason = ""
@@ -925,7 +931,8 @@ class EVGuard:
                 original_soc=current_soc,
             )
 
-        now   = datetime.now(timezone.utc)
+        if now is None:
+            now = datetime.now(timezone.utc)
         guard = self.get_guard(device.id)
         guard.skip_reason = ""
 

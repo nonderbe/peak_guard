@@ -152,6 +152,7 @@ class CascadeContext:
     ev_guard: "EVGuard"
     track_action: Callable
     warn: Callable
+    now: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     last_skip_reason: str = ""
 
 
@@ -237,7 +238,7 @@ class SwitchOffDevice(BaseCascadeDevice):
             )
             ctx.peak_tracker.record_pending_avoid(
                 device_id=self.id, device_name=self.name,
-                nominal_kw=self.power_watts / 1000.0, ts=datetime.now(timezone.utc),
+                nominal_kw=self.power_watts / 1000.0, ts=ctx.now,
             )
             return excess - self.power_watts
         _LOGGER.info(
@@ -260,10 +261,10 @@ class SwitchOffDevice(BaseCascadeDevice):
                     self.name, snapshot.original_state,
                 )
                 ctx.peak_tracker.start_measurement_on_turnon(
-                    device_id=self.id, device_name=self.name, ts=datetime.now(timezone.utc))
+                    device_id=self.id, device_name=self.name, ts=ctx.now)
             elif snapshot.original_state == "on" and state.state == "on":
                 event = ctx.peak_tracker.complete_peak_calculation(
-                    device_id=self.id, now=datetime.now(timezone.utc))
+                    device_id=self.id, now=ctx.now)
                 if event:
                     _LOGGER.info(
                         "Peak Guard: piek-event afgerond voor '%s' — "
@@ -316,7 +317,7 @@ class SwitchOnDevice(BaseCascadeDevice):
             )
             ctx.solar_tracker.start_solar_measurement(
                 device_id=self.id, device_name=self.name,
-                nominal_kw=self.power_watts / 1000.0, ts=datetime.now(timezone.utc),
+                nominal_kw=self.power_watts / 1000.0, ts=ctx.now,
             )
             return excess - self.power_watts
         _LOGGER.info(
@@ -337,7 +338,7 @@ class SwitchOnDevice(BaseCascadeDevice):
                 _LOGGER.info(
                     "Peak Guard: '%s' terug uitgeschakeld na injectiepreventie", self.name)
                 event = ctx.solar_tracker.complete_solar_calculation(
-                    device_id=self.id, now=datetime.now(timezone.utc))
+                    device_id=self.id, now=ctx.now)
                 if event:
                     _LOGGER.info(
                         "Peak Guard: solar-event afgerond voor '%s' — "
@@ -482,6 +483,7 @@ class EVChargerDevice(BaseCascadeDevice):
             cascade_type=ctx.cascade_type,
             peak_tracker=ctx.peak_tracker,
             solar_tracker=ctx.solar_tracker,
+            now=ctx.now,
         )
         ctx.last_skip_reason = ctx.ev_guard.last_skip_reason
         return result
@@ -493,6 +495,7 @@ class EVChargerDevice(BaseCascadeDevice):
             peak_tracker=ctx.peak_tracker,
             solar_tracker=ctx.solar_tracker,
             cascade_type=ctx.cascade_type,
+            now=ctx.now,
         )
 
 

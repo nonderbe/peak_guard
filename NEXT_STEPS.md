@@ -39,7 +39,7 @@ Updated: 2026-06-10.
 | P1-2 | `except Exception: pass` silences failures | ✅ | `controller.py:253`, `_teardown_ev_listeners` |
 | P1-3 | `_quarter_start` defined twice → extract to `utils.py` | ✅ | `avoided_peak_tracker.py:38`, `quarter_calculator.py:27` |
 | P1-4 | `_BaseCascadeDevice` naming contradiction → rename to `BaseCascadeDevice`, drop `CascadeDevice` alias | ✅ | `models.py` + all imports |
-| P1-5 | `datetime.now(timezone.utc)` called 30+ times per loop → thread `now` through signatures | ⏳ | `ev_guard.py`, trackers, deciders |
+| P1-5 | `datetime.now(timezone.utc)` called 30+ times per loop → thread `now` through signatures | ✅ | `ev_guard.py`, trackers, deciders |
 | P1-6 | `from_dict` manual string-dispatch → class registry on subclasses | ✅ | `models.py` |
 | P1-7 | Stale-sensor workaround duplicated in two places | ✅ | `ev_guard.py` — extracted to `_effective_current_amps()` |
 
@@ -50,7 +50,7 @@ Updated: 2026-06-10.
 | P2-1 | Test coverage thin for financial calculations | ✅ | `tests/test_tracker.py` — 16 tests for PeakAvoidTracker + SolarShiftTracker |
 | P2-2 | `_monitor_loop` 80+ lines mixing concerns | ✅ | `controller.py` — extracted `_resolve_interval()`, `_read_consumption()`, `_dispatch()` |
 | P2-3 | `to_dict()` has inline datetime arithmetic in dict comprehension | ✅ | `ev_guard.py` — moved to `status_dict()` |
-| P2-4 | `_warn` duplicated between `BaseDecider` and `EVGuard` | ⏳ | `base.py`, `ev_guard.py` |
+| P2-4 | `_warn` duplicated between `BaseDecider` and `EVGuard` | ✅ | `base.py`, `ev_guard.py` |
 
 ---
 

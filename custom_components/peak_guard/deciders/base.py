@@ -84,16 +84,13 @@ class BaseDecider:
     #  Hulpfuncties                                                        #
     # ------------------------------------------------------------------ #
 
-    def _warn(self, msg: str, *args) -> None:
-        self.ev_guard._warn(msg, *args)
-
     def _sensor_value(self, entity_id: Optional[str]) -> Optional[float]:
         return read_sensor(self.hass, entity_id)
 
     def _track_action(self, entity_id: str, action: str, value=None) -> None:
         track_action(self.config, self._iteration_actions, entity_id, action, value)
 
-    def _make_ctx(self, cascade_type: str) -> CascadeContext:
+    def _make_ctx(self, cascade_type: str, now: datetime) -> CascadeContext:
         return CascadeContext(
             hass=self.hass,
             cascade_type=cascade_type,
@@ -101,7 +98,8 @@ class BaseDecider:
             solar_tracker=self.solar_tracker,
             ev_guard=self.ev_guard,
             track_action=self._track_action,
-            warn=self._warn,
+            warn=self.ev_guard._warn,
+            now=now,
         )
 
     # ------------------------------------------------------------------ #
@@ -138,7 +136,10 @@ class BaseDecider:
         excess: float,
         snapshots: Dict[str, DeviceSnapshot],
         cascade_type: str = "peak",
+        now: Optional[datetime] = None,
     ) -> None:
+        if now is None:
+            now = datetime.now(timezone.utc)
         sorted_devices = sorted(
             [d for d in cascade if d.enabled and not d.manual_override],
             key=lambda x: x.priority,
@@ -151,7 +152,7 @@ class BaseDecider:
             ", ".join(f"'{d.name}'[{d.action_type}]" for d in sorted_devices) or "–",
         )
 
-        ctx = self._make_ctx(cascade_type)
+        ctx = self._make_ctx(cascade_type, now)
         remaining = excess
 
         for device in sorted_devices:
@@ -184,7 +185,7 @@ class BaseDecider:
                 )
 
         if remaining > 0:
-            self._warn(
+            self.ev_guard._warn(
                 "Peak Guard [%s cascade]: klaar — nog %.0f W overschot onverwerkt "
                 "(alle apparaten doorlopen)",
                 label, remaining,
@@ -204,6 +205,9 @@ class BaseDecider:
         device: BaseCascadeDevice,
         snapshot: DeviceSnapshot,
         cascade_type: str = "peak",
+        now: Optional[datetime] = None,
     ) -> bool:
-        ctx = self._make_ctx(cascade_type)
+        if now is None:
+            now = datetime.now(timezone.utc)
+        ctx = self._make_ctx(cascade_type, now)
         return await device.restore(snapshot, ctx)
