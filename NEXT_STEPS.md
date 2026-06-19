@@ -124,7 +124,8 @@ Then in Peak Guard UI, change the Tesla `location_tracker` field from
 
 | Version | Fix |
 |---------|-----|
-| v1.8.4 | EV solar events missing from "Recente gebeurtenissen" — `start_solar_measurement` was never called on the "manual start" path (switch `unknown`, status_sensor confirms charging) |
+| v1.8.6 | Solar events missing after first session — `last_switch_state` was never reset in solar `restore()` paths, so the manual-start gate failed from session 2 onwards. Fixed by setting `guard.last_switch_state = None` in all three solar restore paths. |
+| v1.8.4 | EV solar events missing (first session) — `start_solar_measurement` was never called on the "manual start" path (switch `unknown`, status_sensor confirms charging). |
 | v1.8.3 | `is_home()` uses `last_known_home` fallback to handle holiday / unknown tracker state |
 | v1.8.2 | Solar injection prevention blocked when Tesla switch/tracker entities report `unknown` |
 | v1.8.1 | Keep EV charging at hw-min when solar still covers part of draw |

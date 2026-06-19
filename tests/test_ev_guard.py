@@ -701,3 +701,51 @@ class TestTeslaUnknownEntities:
         )
         assert len(self.st.completed) == 1, "Solar tracking moet worden afgesloten"
         assert guard.soc_override_active is False, "SOC-override moet worden teruggezet"
+
+    async def test_second_session_manual_start_tracked_after_restore(self):
+        """
+        Regressie v1.8.6: na een eerste solar sessie (restore) staat last_switch_state
+        nog op True. Wanneer de EV daarna opnieuw laadt (handmatige start), triggert de
+        handmatige-start gate niet meer → start_solar_measurement wordt overgeslagen →
+        complete_solar_calculation maakt geen event aan.
+
+        Fix: restore() zet last_switch_state = None in alle solar-paden zodat sessie 2
+        schoon begint.
+        """
+        from custom_components.peak_guard.models import DeviceSnapshot
+
+        # --- Sessie 1: restore sluit de solar tracking af --- #
+        snap = DeviceSnapshot(
+            entity_id="switch.tesla_charge",
+            original_state="off",
+            original_current=None,
+            original_soc=None,
+        )
+        self.hass.states.set("switch.tesla_charge", "on")
+        guard = self.ev_guard.get_guard(self.device.id)
+        guard.last_switch_state = True   # PG had EV ingeschakeld in sessie 1
+        guard.state = EVState.CHARGING
+
+        await self.ev_guard.restore(
+            self.device, snap, self.pt, self.st, cascade_type="solar"
+        )
+
+        # Na restore moet last_switch_state gereset zijn zodat sessie 2 schoon begint.
+        assert guard.last_switch_state is None, (
+            "restore() moet last_switch_state = None zetten zodat sessie 2 "
+            "de handmatige-start gate correct triggert"
+        )
+
+        # --- Sessie 2: EV laadt al (handmatige start), PG nog niet ingeschakeld --- #
+        self.hass.services.calls.clear()
+        self.st.started.clear()
+        self.hass.states.set("switch.tesla_charge", "on")
+        self.hass.states.set("binary_sensor.tesla_status", "on")
+        guard.state = EVState.IDLE
+
+        await self._apply_solar(5000.0)
+
+        assert self.st.started, (
+            "start_solar_measurement moet worden aangeroepen bij handmatige start "
+            "in sessie 2 — anders maakt complete_solar_calculation geen event aan"
+        )

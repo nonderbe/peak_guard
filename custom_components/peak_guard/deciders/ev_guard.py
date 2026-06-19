@@ -645,6 +645,7 @@ class EVGuard:
                         )
                     guard = self.get_guard(device.id)
                     guard.state = EVState.IDLE
+                    guard.last_switch_state = None
                     guard.soc_override_active = False
                     self._reset_debounce(guard)
                 return True
@@ -693,6 +694,7 @@ class EVGuard:
 
                     guard = self.get_guard(device.id)
                     guard.state = EVState.IDLE
+                    guard.last_switch_state = None
                     guard.turned_off_at = datetime.now(timezone.utc)
                     guard.turned_off_by_pg = True
                     guard.soc_override_active = False
@@ -715,6 +717,7 @@ class EVGuard:
                     )
                     guard = self.get_guard(device.id)
                     guard.state = EVState.IDLE
+                    guard.last_switch_state = None
                     guard.soc_override_active = False
                     self._reset_debounce(guard)
                 return True
