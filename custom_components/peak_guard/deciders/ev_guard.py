@@ -782,19 +782,24 @@ class EVGuard:
         )
         max_a = float(device.max_value if device.max_value is not None else DEFAULT_EV_MAX_AMPERE)
 
-        # Hoeveel ampère moeten we reduceren om de grid-import weg te werken?
-        reduction_a = math.ceil(consumption / voltage)
+        # Hoeveel ampère moeten we reduceren?
+        # apply_action gebruikt ceil() bij het verhogen → EV mag tot 1 A meer trekken
+        # dan het surplus dekt (bij 230 V is dat max ±230 W netimport).
+        # throttle_down spiegelt dat: reduceer pas als het netverbruik méér dan 1 A
+        # boven de balans uitkomt, zodat beide kanten dezelfde marge hanteren en de
+        # EV niet oscilleert tussen twee waarden die elk 20 s duren.
+        reduction_a = max(0, math.ceil((consumption - voltage) / voltage))
         new_a = max(int(hw_min_a), min(int(max_a), int(current_a) - reduction_a))
 
         if new_a >= int(current_a):
-            # Already at hw-minimum; cannot reduce further.
+            # No meaningful reduction possible (solar still covers most of EV draw).
             # Keep the EV running as long as stopping it would cause injection again.
             # Rule: stop only when solar contributes nothing to the EV draw, i.e. when
             # consumption >= ev_draw_w — at that point even switching off the EV would
             # not create injection (the house alone already consumes at least ev_draw_w).
             ev_draw_w = current_a * voltage
             if consumption < ev_draw_w:
-                return True   # solar still covers part of EV draw: keep charging at hw-min
+                return True   # solar still covers part of EV draw: keep charging
             return False      # solar gone entirely: allow restore to stop the EV
 
         guard = self.get_guard(device.id)

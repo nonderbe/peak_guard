@@ -497,7 +497,8 @@ class TestThrottleDownSolar:
 
     async def test_reduces_current_for_grid_import(self):
         """
-        Netimport 500 W → reductie ceil(500/230) = 3 A → 16 − 3 = 13 A.
+        Netimport 500 W → reductie max(0, ceil((500−230)/230)) = 2 A → 16 − 2 = 14 A.
+        De drempel van 1 A (230 W) zorgt dat kleine imports de EV niet laten oscilleren.
         Returns True (EV blijft laden).
         """
         self.hass.states.set("number.tesla_charge_current", "16")
@@ -505,7 +506,21 @@ class TestThrottleDownSolar:
         assert result is True
         set_calls = self.hass.services.calls_for("set_value")
         assert set_calls
-        assert set_calls[0]["data"]["value"] == 13.0
+        assert set_calls[0]["data"]["value"] == 14.0
+
+    async def test_small_import_below_one_amp_causes_no_reduction(self):
+        """
+        Netimport 40 W (< 230 W = 1 A drempel) → reductie = 0 → geen set_value.
+        EV blijft op huidige stroom; returns True (geen stop).
+        Regressie: vroeger reduceerde ceil(40/230)=1 A, waardoor EV oscilleerde
+        tussen twee ampèrewaarden om de 20 s.
+        """
+        self.hass.states.set("number.tesla_charge_current", "8")
+        result = await self.ev_guard.throttle_down_solar(self.device, consumption=40.0)
+        assert result is True
+        assert not self.hass.services.has_call("set_value"), (
+            "Geen set_value bij netimport < 1 A drempel"
+        )
 
     async def test_at_hw_min_solar_still_contributing_returns_true(self):
         """
