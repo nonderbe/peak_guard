@@ -164,13 +164,14 @@ class BaseCascadeDevice:
     """Base class for all cascade device entries."""
     _action_type: ClassVar[str] = ""   # overridden by each concrete subclass
 
-    id:          str
-    name:        str
-    entity_id:   str
-    priority:    int
-    action_type: str
-    power_watts: int  = 0
-    enabled:     bool = True
+    id:              str
+    name:            str
+    entity_id:       str
+    priority:        int
+    action_type:     str
+    power_watts:     int  = 0
+    enabled:         bool = True
+    manual_override: bool = False
 
     # ---- factory ----------------------------------------------------- #
 

@@ -606,6 +606,7 @@ class PeakGuardPanel extends HTMLElement {
             ${powerChip}
             ${socChips}
             ${!device.enabled ? `<span class="chip disabled" title="Dit apparaat is uitgeschakeld en wordt door Peak Guard genegeerd.">Uitgeschakeld</span>` : ""}
+          ${device.manual_override ? `<span class="chip chip-manual" title="${type === "peak" ? "Dit apparaat wordt niet beschermd tegen pieken door Peak Guard." : "Dit apparaat wordt niet beheerd door injectiepreventie."}">Manueel</span>` : ""}
           </div>
           ${device.action_type === "ev_charger"
             ? `<div id="ev-live-${type}-${index}" class="ev-live-status"></div>
@@ -620,7 +621,24 @@ class PeakGuardPanel extends HTMLElement {
                  <button class="btn-inline-warning" data-action="configure-location" data-index="${index}" data-type="${type}">Configureren</button>
                </div>`
             : ""}
-          ${this._renderDeviceControls(device, index, type)}
+          <div class="manual-override-row">
+            <span class="manual-override-label">Bediening</span>
+            <button class="manual-pill ${device.manual_override ? "manual" : "auto"}"
+              data-action="toggle-manual"
+              data-index="${index}" data-type="${type}"
+              title="${device.manual_override
+                ? (type === "peak" ? "Schakel terug naar automatisch — Peak Guard beheert dit apparaat weer." : "Schakel terug naar automatisch — Peak Guard beheert dit apparaat weer.")
+                : (type === "peak" ? "Schakel naar manueel — Peak Guard schakelt dit apparaat niet meer uit bij pieken." : "Schakel naar manueel — Peak Guard start dit apparaat niet meer bij zonne-overschot.")}">
+              ${device.manual_override ? "Manueel" : "Automatisch"}
+            </button>
+            ${device.manual_override && type === "peak"
+              ? `<span class="manual-override-warning">⚠ Niet beschermd tegen pieken</span>`
+              : ""}
+            ${device.manual_override && type === "inject"
+              ? `<span class="manual-override-warning">⚠ Niet beheerd bij zonne-overschot</span>`
+              : ""}
+          </div>
+          ${device.manual_override ? this._renderDeviceControls(device, index, type) : ""}
         </div>
         <div class="device-actions">
           <button class="btn-icon" data-action="info"
@@ -1944,6 +1962,18 @@ class PeakGuardPanel extends HTMLElement {
       });
     });
 
+    // Manueel/automatisch toggle
+    this.shadowRoot.querySelectorAll("[data-action='toggle-manual']").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const { index: idxStr, type } = btn.dataset;
+        const idx = parseInt(idxStr);
+        const devices = [...(this._data?.[type] || [])];
+        if (!devices[idx]) return;
+        devices[idx] = { ...devices[idx], manual_override: !devices[idx].manual_override };
+        await this._saveDevices(type, devices);
+      });
+    });
+
     this.shadowRoot
       .querySelectorAll("[data-action='info'], [data-action='edit'], [data-action='delete'], [data-action='up'], [data-action='down'], [data-action='configure-location']")
       .forEach((btn) => {
@@ -2313,7 +2343,36 @@ class PeakGuardPanel extends HTMLElement {
         .chip.chip-soc-lim    { background: #5c6bc0; }   /* paars-blauw: huidige limiet */
         .chip.chip-soc-bat    { background: #43a047; }   /* groen: huidig batterijniveau */
         .chip.chip-soc-target { background: #f57c00; }   /* oranje: doel bij zon */
+        .chip.chip-manual     { background: #e65100; }   /* oranje-rood: manuele bediening */
         .device-actions { display: flex; gap: 4px; align-items: center; }
+
+        /* Manuele bediening toggle */
+        .manual-override-row {
+          display: flex; align-items: center; gap: 8px;
+          margin-top: 10px; flex-wrap: wrap;
+        }
+        .manual-override-label {
+          font-size: .78em; color: var(--secondary-text-color, #9e9e9e);
+          white-space: nowrap;
+        }
+        .manual-pill {
+          padding: 3px 12px; border-radius: 20px; border: none;
+          font-size: .78em; font-weight: 600; cursor: pointer;
+          transition: background .15s, color .15s;
+        }
+        .manual-pill.auto {
+          background: var(--secondary-background-color, #eeeeee);
+          color: var(--secondary-text-color, #757575);
+        }
+        .manual-pill.auto:hover { background: #e0e0e0; }
+        .manual-pill.manual {
+          background: #fff3e0; color: #e65100;
+          border: 1px solid #ffcc80;
+        }
+        .manual-pill.manual:hover { background: #ffe0b2; }
+        .manual-override-warning {
+          font-size: .75em; color: #e65100; font-weight: 500;
+        }
 
         /* Inline device controls */
         .device-controls {

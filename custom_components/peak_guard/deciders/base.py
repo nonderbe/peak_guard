@@ -117,7 +117,14 @@ class BaseDecider:
         candidates = []
         for device in cascade:
             if device.entity_id in snapshots:
-                candidates.append((device, snapshots[device.entity_id]))
+                if device.manual_override:
+                    del snapshots[device.entity_id]
+                    _LOGGER.info(
+                        "Peak Guard: snapshot voor '%s' verwijderd — manuele bediening actief",
+                        device.name,
+                    )
+                else:
+                    candidates.append((device, snapshots[device.entity_id]))
         candidates.sort(key=lambda x: x[0].priority, reverse=reverse)
         return candidates
 
@@ -133,7 +140,8 @@ class BaseDecider:
         cascade_type: str = "peak",
     ) -> None:
         sorted_devices = sorted(
-            [d for d in cascade if d.enabled], key=lambda x: x.priority
+            [d for d in cascade if d.enabled and not d.manual_override],
+            key=lambda x: x.priority,
         )
         label = "PIEK" if cascade_type == "peak" else "SOLAR"
         _LOGGER.info(
