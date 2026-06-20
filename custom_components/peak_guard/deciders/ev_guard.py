@@ -29,6 +29,7 @@ from homeassistant.exceptions import HomeAssistantError
 from ..const import (
     DEFAULT_EV_MAX_AMPERE,
     DEFAULT_EV_MIN_AMPERE,
+    DEFAULT_EV_SOLAR_START_THRESHOLD_W,
 )
 from .base import track_action
 from ..models import (
@@ -1339,7 +1340,16 @@ class EVGuard:
                     )
                     return excess
 
-            start_thr_w = float(device.start_threshold_w) if device.start_threshold_w is not None else hw_min_w
+            # Niet-geconfigureerd → val terug op DEFAULT_EV_SOLAR_START_THRESHOLD_W (0 W):
+            # de solar-cascade wil injectie vermijden, dus elke injectie (excess > 0,
+            # gegarandeerd door de surplus-gate hierboven) moet het laden in gang zetten.
+            # NIET terugvallen op hw_min_w: dat zou pas starten bij ≥ min-laadvermogen
+            # (bv. 1150 W bij 5 A 1-fase) en injectie eronder ongemoeid laten.
+            start_thr_w = (
+                float(device.start_threshold_w)
+                if device.start_threshold_w is not None
+                else DEFAULT_EV_SOLAR_START_THRESHOLD_W
+            )
             if excess < start_thr_w:
                 self._reset_debounce(guard)
                 guard.skip_reason = f"surplus {excess:.0f} W < start-drempel {start_thr_w:.0f} W"

@@ -61,8 +61,12 @@ DEFAULT_EV_CABLE_ENTITY = None
 # EV Solar-cascade drempelwaarden
 # Start-drempel: minimale injectie (W) vooraleer de EV-lader mag starten.
 # Dit is LOSGEKOPPELD van het hardware-minimum (min_value/min_current_ev).
-# 230 W ≈ 1 A @ 230 V — laagste zinvolle drempel voor Tesla hardware.
-DEFAULT_EV_SOLAR_START_THRESHOLD_W: float = 230.0
+# Doel van de solar-cascade is injectie vermijden: zodra er ÉÉN watt naar het
+# net wordt geïnjecteerd moet de EV starten, ook al trekt hij daarna stroom van
+# het net (de auto draait op zijn hardware-minimum, bv. 5 A). Daarom is de
+# default 0 W. De debounce (EV_DEBOUNCE_STABLE_S) zorgt nog steeds dat een
+# kortstondige injectie-piek de EV niet doet thrashen.
+DEFAULT_EV_SOLAR_START_THRESHOLD_W: float = 0.0
 
 # Stop-drempel: de EV stopt alleen als surplus ná uitschakelen ≤ 0 W zou zijn.
 # Hysteresis: voorkomt constant aan/uit schakelen bij borderline surplus.

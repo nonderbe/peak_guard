@@ -330,6 +330,26 @@ class TestApplyActionSolar:
         assert result == 100.0
         assert not self.hass.services.calls
 
+    async def test_any_injection_triggers_debounce_when_threshold_unconfigured(self):
+        """
+        start_threshold_w niet geconfigureerd (None) → val terug op
+        DEFAULT_EV_SOLAR_START_THRESHOLD_W (0 W). Elke injectie (ook 5 W) mag
+        de start-drempel-gate NIET stil overslaan, maar moet de debounce starten
+        (WAITING_FOR_STABLE). Doel: solar-cascade vermijdt injectie.
+        """
+        self.device.start_threshold_w = None
+        self.hass.states.set("switch.tesla_charge", "off")
+        result = await self._apply_solar(5.0)
+        guard = self.ev_guard.get_guard(self.device.id)
+        assert result == 5.0, "Surplus blijft onaangeroerd tijdens debounce"
+        assert guard.state == EVState.WAITING_FOR_STABLE, (
+            "5 W injectie moet de debounce in gang zetten, niet de start-drempel-gate raken"
+        )
+        assert "start-drempel" not in guard.skip_reason, (
+            "Met default-drempel 0 W mag een injectie van 5 W niet op de start-drempel stranden"
+        )
+        assert guard.debounce_start_at is not None
+
     async def test_cable_disconnected_mid_charge_turns_off_ev(self):
         """
         Kabel ontkoppeld terwijl EV aan het laden was
