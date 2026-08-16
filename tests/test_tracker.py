@@ -206,3 +206,89 @@ class TestPeakAvoidTracker:
         self._full_cycle(t)
         assert len(t.events) == 1
         assert t.events[0].device_name == "Oven"
+
+
+# ═══════════════════════════════════════════════════════════════════════════ #
+#  Per-device savings attribution (get_device_monthly_savings)                #
+# ═══════════════════════════════════════════════════════════════════════════ #
+
+class TestDeviceMonthlySavings:
+    """
+    Covers PeakAvoidTracker.get_device_monthly_savings(): isolates, per
+    device, the highest hypothetical monthly peak it avoided vs. the actual
+    monthly peak — the basis for the monthly_device_savings_store history.
+
+    Note: hypothetical_monthly_peak_kw is a single value shared across all
+    devices in the cascade (it's the max over every quarter's extra_dict,
+    which any device can contribute to) and is monotonically non-decreasing
+    within a month. So a device's recorded max only reflects the combined
+    hypo *as of that device's own last completed event* — if a different
+    device later pushes the combined hypo higher, only that later device's
+    entry picks up the new value. This mirrors the exact behaviour verified
+    against production data (boiler's later event absorbed the month's peak
+    hypo; Tesla's earlier, smaller one kept its own lower snapshot).
+    """
+
+    def _tracker(self, tarief: float = TARIEF) -> PeakAvoidTracker:
+        t = PeakAvoidTracker()
+        t.set_tarief(tarief)
+        return t
+
+    def _cycle(self, tracker: PeakAvoidTracker, device_id: str, device_name: str,
+               nominal_kw: float, avoid_ts: datetime, duration_min: float = 15.0):
+        stop_ts = avoid_ts + timedelta(minutes=duration_min)
+        tracker.record_pending_avoid(device_id, device_name, nominal_kw, ts=avoid_ts)
+        tracker.start_measurement_on_turnon(device_id, device_name, ts=avoid_ts)
+        return tracker.complete_peak_calculation(device_id, now=stop_ts)
+
+    def test_no_events_returns_empty_list(self):
+        t = self._tracker()
+        assert t.get_device_monthly_savings() == []
+
+    def test_single_device_matches_overall_month_totals(self):
+        """One device's isolated savings equal the tracker's overall monthly totals."""
+        t = self._tracker(tarief=TARIEF)
+        self._cycle(t, "boiler", "Boiler", nominal_kw=4.0, avoid_ts=Q)
+        result = t.get_device_monthly_savings()
+        assert len(result) == 1
+        assert result[0]["device_id"] == "boiler"
+        assert result[0]["avoided_kw"] == pytest.approx(t.avoided_kw_this_month)
+        assert result[0]["savings_euro"] == pytest.approx(t.savings_euro_this_month)
+
+    def test_two_devices_in_separate_quarters_are_isolated(self):
+        """
+        Tesla avoids 2 kW in one quarter, then Boiler avoids 5 kW in a later,
+        distinct quarter. Each device's own snapshot reflects the hypo at the
+        moment its event completed, so both keep their own genuine value.
+        """
+        t = self._tracker(tarief=TARIEF)
+        self._cycle(t, "tesla", "Tesla", nominal_kw=2.0, avoid_ts=Q)
+        self._cycle(t, "boiler", "Boiler", nominal_kw=5.0, avoid_ts=Q + timedelta(minutes=15))
+
+        by_device = {d["device_id"]: d for d in t.get_device_monthly_savings()}
+        assert by_device["tesla"]["hypothetical_peak_kw"] == pytest.approx(2.0)
+        assert by_device["tesla"]["avoided_kw"] == pytest.approx(2.0)
+        assert by_device["boiler"]["hypothetical_peak_kw"] == pytest.approx(5.0)
+        assert by_device["boiler"]["avoided_kw"] == pytest.approx(5.0)
+        # savings = avoided_kw × tarief / 12
+        assert by_device["boiler"]["savings_euro"] == pytest.approx(5.0 * TARIEF / 12)
+
+    def test_later_higher_event_raises_the_devices_own_snapshot(self):
+        """
+        A device that completes a second, bigger event later in the month
+        picks up the new, higher combined hypo for itself.
+        """
+        t = self._tracker(tarief=TARIEF)
+        self._cycle(t, "boiler", "Boiler", nominal_kw=3.0, avoid_ts=Q)
+        self._cycle(t, "boiler", "Boiler", nominal_kw=6.0, avoid_ts=Q + timedelta(minutes=15))
+
+        by_device = {d["device_id"]: d for d in t.get_device_monthly_savings()}
+        assert by_device["boiler"]["hypothetical_peak_kw"] == pytest.approx(6.0)
+
+    def test_reset_month_clears_device_savings(self):
+        t = self._tracker()
+        self._cycle(t, "boiler", "Boiler", nominal_kw=4.0, avoid_ts=Q)
+        t.reset_month()
+        assert t.get_device_monthly_savings() == []
+        assert t.device_max_hypo_this_month == {}
+        assert t.device_names_this_month == {}

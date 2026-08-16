@@ -97,6 +97,9 @@ STORAGE_VERSION_SAVINGS = 1
 STORAGE_KEY_SOLAR_SAVINGS = f"{DOMAIN}.solar_savings"
 STORAGE_VERSION_SOLAR_SAVINGS = 1
 
+STORAGE_KEY_DEVICE_SAVINGS = f"{DOMAIN}.monthly_device_savings"
+STORAGE_VERSION_DEVICE_SAVINGS = 1
+
 # ------------------------------------------------------------------ #
 #  Cascade actietypes                                                  #
 # ------------------------------------------------------------------ #

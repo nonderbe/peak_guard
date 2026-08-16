@@ -125,6 +125,14 @@ class PeakAvoidTracker:
         # Wordt gepersisteerd zodat de hoogste waarde na een herstart beschikbaar blijft.
         self.hypothetical_peaks_this_month: List[float] = []
 
+        # Per-apparaat hoogste hypothetische maandpiek deze maand — laat toe
+        # de besparing te isoleren per apparaat (bv. "wat heeft de boiler
+        # alleen bijgedragen aan de capaciteitstarief-besparing"), met
+        # dezelfde methodologie als de globale maandbesparing: enkel het
+        # hoogste moment telt, niet de som van alle events.
+        self.device_max_hypo_this_month: Dict[str, float] = {}
+        self.device_names_this_month:    Dict[str, str] = {}
+
         # Context (bijgewerkt door SharedCapacityState)
         self._actual_quarters:     Dict[datetime, float] = {}
         self._actual_monthly_peak: float = 0.0
@@ -179,6 +187,8 @@ class PeakAvoidTracker:
         self.savings_euro_this_month = 0.0
         self.hypothetical_monthly_peak_kw = None
         self.hypothetical_peaks_this_month.clear()
+        self.device_max_hypo_this_month.clear()
+        self.device_names_this_month.clear()
         _LOGGER.info("PeakAvoidTracker: maanddata gereset")
 
     def reset_year(self) -> None:
@@ -253,6 +263,12 @@ class PeakAvoidTracker:
         self._recalc_month_savings()
 
         hypo    = self.hypothetical_monthly_peak_kw or 0.0
+
+        # Houd per apparaat de hoogste hypothetische maandpiek bij die het
+        # ooit heeft vermeden — de basis voor per-apparaat besparingsattributie.
+        if hypo > self.device_max_hypo_this_month.get(device_id, 0.0):
+            self.device_max_hypo_this_month[device_id] = hypo
+        self.device_names_this_month[device_id] = meas.device_name
         # Marginale bijdrage van dit event aan de maandbesparing
         event_avoided = round(max(0.0, self.avoided_kw_this_month - avoided_before), 4)
         event_savings = round(max(0.0, self.savings_euro_this_month - savings_before), 4)
@@ -297,6 +313,34 @@ class PeakAvoidTracker:
         """Geeft het opgeslagen nominaal vermogen (kW) voor een actieve meting, of None."""
         meas = self._active.get(device_id)
         return meas.nominal_kw if meas else None
+
+    def get_device_monthly_savings(self) -> List[Dict[str, object]]:
+        """
+        Isoleert de besparing per apparaat voor de lopende maand.
+
+        Voor elk apparaat dat dit maand minstens één piek-vermijdend event
+        voltooide: vergelijk de hoogste hypothetische piek die dát apparaat
+        alleen heeft vermeden met de werkelijke maandpiek — dezelfde
+        (hypo − actual) × tarief/12-methodologie als de globale maandbesparing,
+        maar per apparaat toegepast in plaats van gesommeerd over events.
+
+        Retourneert een lijst dicts, één per apparaat:
+        device_id, device_name, hypothetical_peak_kw, actual_monthly_peak_kw,
+        avoided_kw, savings_euro.
+        """
+        result: List[Dict[str, object]] = []
+        for device_id, hypo in self.device_max_hypo_this_month.items():
+            avoided_kw = round(max(0.0, hypo - self._actual_monthly_peak), 4)
+            savings_euro = round(avoided_kw * self._tarief / 12.0, 4)
+            result.append({
+                "device_id": device_id,
+                "device_name": self.device_names_this_month.get(device_id, device_id),
+                "hypothetical_peak_kw": round(hypo, 4),
+                "actual_monthly_peak_kw": round(self._actual_monthly_peak, 4),
+                "avoided_kw": avoided_kw,
+                "savings_euro": savings_euro,
+            })
+        return result
 
     # ── interne helpers ───────────────────────────────────────────── #
 

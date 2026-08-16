@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 from homeassistant.components.sensor import (
     SensorEntity,
@@ -53,6 +53,7 @@ from .const import (
 from homeassistant.helpers.storage import Store
 from .quarter_calculator import QuarterCalculator
 from .quarter_store import QuarterStore
+from .monthly_device_savings_store import MonthlyDeviceSavingsStore
 from .avoided_peak_tracker import PeakAvoidTracker, PeakEvent, SolarShiftTracker, SolarEvent
 
 _LOGGER = logging.getLogger(__name__)
@@ -157,6 +158,10 @@ async def async_setup_entry(
                 len(peak_tracker.hypothetical_peaks_this_month),
             )
 
+    # Laad persistente maandhistoriek van piekbesparing per apparaat
+    device_savings_store = MonthlyDeviceSavingsStore(hass)
+    await device_savings_store.async_load()
+
     # Laad persistente events en maandstatistieken — solar
     solar_state_store = Store(hass, _STORAGE_VERSION_STATE, _STORAGE_KEY_SOLAR_STATE)
     solar_state = await solar_state_store.async_load()
@@ -201,6 +206,7 @@ async def async_setup_entry(
         solar_savings_store=solar_savings_store,
         peak_state_store=peak_state_store,
         solar_state_store=solar_state_store,
+        device_savings_store=device_savings_store,
     )
 
     entities = [
@@ -264,6 +270,7 @@ class SharedCapacityState:
         solar_savings_store,
         peak_state_store,
         solar_state_store,
+        device_savings_store,
     ) -> None:
         self.hass = hass
         self.energy_sensor_id = energy_sensor_id
@@ -290,12 +297,16 @@ class SharedCapacityState:
         self._solar_savings_store = solar_savings_store
         self._peak_state_store    = peak_state_store
         self._solar_state_store   = solar_state_store
+        self._device_savings_store = device_savings_store
         self._last_persisted_peak_savings:       float = 0.0
         self._last_persisted_solar_savings:      float = 0.0
         self._last_peak_events_count:            int   = -1
         self._last_solar_events_count:           int   = -1
         self._last_persisted_peak_month_savings: float = -1.0
         self._last_persisted_solar_month_savings:float = -1.0
+        # Laatst gepersisteerde hypo per device_id — voorkomt overbodige writes
+        # naar device_savings_store wanneer er niets veranderd is.
+        self._last_persisted_device_hypo: Dict[str, float] = {}
 
     async def async_start(self, entities: list) -> None:
         """Registreer listeners en start de minuut-timer."""
@@ -361,6 +372,23 @@ class SharedCapacityState:
         self._current_year = current_year
 
         if self._current_month is not None and current_month != self._current_month:
+            # Bevries de per-apparaat besparing van de afgelopen maand vóórdat
+            # de tracker gereset wordt — anders gaat device_max_hypo_this_month
+            # onherroepelijk verloren (zie reset_month()).
+            if self._peak_tracker and self._device_savings_store:
+                for d in self._peak_tracker.get_device_monthly_savings():
+                    await self._device_savings_store.async_upsert(
+                        year=self._current_year, month=self._current_month,
+                        device_id=d["device_id"], device_name=d["device_name"],
+                        hypothetical_peak_kw=d["hypothetical_peak_kw"],
+                        actual_monthly_peak_kw=d["actual_monthly_peak_kw"],
+                        avoided_kw=d["avoided_kw"], savings_euro=d["savings_euro"],
+                        finalized=True,
+                    )
+                _LOGGER.info(
+                    "Peak Guard: maandbesparing per apparaat bevroren voor %04d-%02d",
+                    self._current_year, self._current_month,
+                )
             if self._peak_tracker:
                 self._peak_tracker.reset_month()
             if self._solar_tracker:
@@ -370,6 +398,7 @@ class SharedCapacityState:
             self._last_solar_events_count           = -1
             self._last_persisted_peak_month_savings = -1.0
             self._last_persisted_solar_month_savings= -1.0
+            self._last_persisted_device_hypo        = {}
             _LOGGER.info("Peak Guard: nieuwe maand — trackers gereset")
         self._current_month = current_month
 
@@ -441,6 +470,25 @@ class SharedCapacityState:
                 })
                 self._last_peak_events_count            = n
                 self._last_persisted_peak_month_savings = msv
+
+        # Persist lopende (niet-afgesloten) maandbesparing per apparaat bij wijziging.
+        # Vergelijk op (hypo, avoided_kw) — niet enkel hypo — want een stijgende
+        # werkelijke maandpiek kan de besparing doen dalen zonder dat de
+        # hypothetische piek zelf verandert.
+        if self._peak_tracker and self._device_savings_store:
+            for d in self._peak_tracker.get_device_monthly_savings():
+                device_id = d["device_id"]
+                fingerprint = (d["hypothetical_peak_kw"], d["avoided_kw"])
+                if self._last_persisted_device_hypo.get(device_id) != fingerprint:
+                    await self._device_savings_store.async_upsert(
+                        year=now.year, month=now.month,
+                        device_id=device_id, device_name=d["device_name"],
+                        hypothetical_peak_kw=d["hypothetical_peak_kw"],
+                        actual_monthly_peak_kw=d["actual_monthly_peak_kw"],
+                        avoided_kw=d["avoided_kw"], savings_euro=d["savings_euro"],
+                        finalized=False,
+                    )
+                    self._last_persisted_device_hypo[device_id] = fingerprint
 
         # Persist solar-events en maandstatistieken bij wijziging
         if self._solar_tracker and self._solar_state_store:
