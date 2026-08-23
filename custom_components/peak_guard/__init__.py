@@ -13,6 +13,7 @@ from homeassistant.core import HomeAssistant
 from .const import DOMAIN, PANEL_URL, PANEL_TITLE, PANEL_ICON
 from .controller import PeakGuardController
 from .ev_api_logger import EVApiLogger
+from .ev_call_budget import EVDailyCallBudget
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -158,6 +159,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     controller._ev_guard_decider.set_logger(ev_api_logger)
     hass.data[DOMAIN]["ev_api_logger"] = ev_api_logger
 
+    # Dagelijks EV-API-budget (vangnet tegen accountquotum-uitputting)
+    ev_call_budget = EVDailyCallBudget(hass)
+    await ev_call_budget.async_load()
+    controller._ev_guard_decider.set_daily_budget(ev_call_budget)
+    hass.data[DOMAIN]["ev_call_budget"] = ev_call_budget
+
     # REST API
     hass.http.register_view(PeakGuardCascadeView())
     hass.http.register_view(PeakGuardForceCheckView())
@@ -227,6 +234,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await controller.stop_monitoring()
 
     hass.data.get(DOMAIN, {}).pop("ev_api_logger", None)
+    hass.data.get(DOMAIN, {}).pop("ev_call_budget", None)
     hass.data.pop(_PANEL_REGISTERED_KEY, None)
     hass.services.async_remove(DOMAIN, "get_dashboard_yaml")
     frontend.async_remove_panel(hass, PANEL_URL)

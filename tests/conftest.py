@@ -16,6 +16,7 @@ Strategie:
 """
 from __future__ import annotations
 
+import asyncio
 import sys
 from datetime import datetime, timedelta, timezone
 from types import ModuleType
@@ -183,6 +184,10 @@ class MockHass:
         self.states = MockStateRegistry()
         self.services = MockServiceRegistry(raise_on=raise_on)
 
+    def async_create_task(self, coro):
+        """Minimale stand-in voor HomeAssistant.async_create_task."""
+        return asyncio.ensure_future(coro)
+
 
 class MockPeakTracker:
     def __init__(self) -> None:
@@ -207,6 +212,28 @@ class MockSolarTracker:
     def complete_solar_calculation(self, device_id, now):
         self.completed.append(device_id)
         return None
+
+
+class FakeBudgetStore:
+    """Lichte async-vriendelijke stand-in voor HA's Store, voor EVDailyCallBudget-tests."""
+
+    def __init__(self) -> None:
+        self.saved: list[dict] = []
+
+    async def async_load(self):
+        return None
+
+    async def async_save(self, data: dict) -> None:
+        self.saved.append(dict(data))
+
+
+def make_ev_budget(hass, max_calls: int):
+    """Bouw een EVDailyCallBudget met een FakeBudgetStore (geen echte HA Store nodig)."""
+    from custom_components.peak_guard.ev_call_budget import EVDailyCallBudget
+
+    budget = EVDailyCallBudget(hass, max_calls=max_calls)
+    budget._store = FakeBudgetStore()
+    return budget
 
 
 # ──────────────────────────────────────────────────────────────────────────── #

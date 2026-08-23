@@ -35,11 +35,13 @@ from custom_components.peak_guard.models import (
     from_dict as cascade_from_dict,
 )
 from custom_components.peak_guard.deciders.ev_guard import EVGuard
+from custom_components.peak_guard.ev_call_budget import EVDailyCallBudget
 from tests.conftest import (
     HomeAssistantError,
     MockHass,
     MockPeakTracker,
     MockSolarTracker,
+    make_ev_budget,
     make_surplus_history,
 )
 
@@ -70,6 +72,42 @@ class TestEVRateLimiter:
         # Oude call zit buiten het venster → limiet is vrij
         assert rl.is_allowed()
         assert rl.calls_in_window == 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════ #
+#  1b. EVDailyCallBudget                                                    #
+# ═══════════════════════════════════════════════════════════════════════════ #
+
+class TestEVDailyCallBudget:
+    def test_allows_when_under_cap(self):
+        budget = make_ev_budget(MockHass(), max_calls=3)
+        assert budget.is_allowed()
+        budget.record()
+        budget.record()
+        assert budget.is_allowed()
+        assert budget.calls_today == 2
+        assert budget.remaining == 1
+
+    def test_blocks_at_cap(self):
+        budget = make_ev_budget(MockHass(), max_calls=2)
+        budget.record()
+        budget.record()
+        assert not budget.is_allowed()
+        assert budget.remaining == 0
+
+    def test_new_day_resets_counter(self):
+        """
+        Dagwissel reset de teller — bewust dagelijks i.p.v. maandelijks, zodat
+        een storing op één dag zich niet doorheen de rest van de maand
+        voortsleept: de volgende dag is er weer een vol dagbudget.
+        """
+        budget = make_ev_budget(MockHass(), max_calls=2)
+        budget.record()
+        budget.record()
+        assert not budget.is_allowed()
+        budget._day = "2000-01-01"  # simuleer een voorbije dag
+        assert budget.is_allowed(), "Nieuwe dag moet de teller resetten"
+        assert budget.calls_today == 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════ #
@@ -525,6 +563,72 @@ class TestApplyActionSolar:
             "start_solar_measurement moet worden aangeroepen bij handmatige start "
             "(anders maakt complete_solar_calculation geen event aan — bug v1.8.4)"
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════ #
+#  5b. Dagelijks EV-API-budget — integratie met EVGuard                       #
+# ═══════════════════════════════════════════════════════════════════════════ #
+
+class TestDailyBudgetIntegration:
+    @pytest.fixture(autouse=True)
+    def setup(self, hass, ev_device, peak_tracker, solar_tracker):
+        self.hass = hass
+        self.device = ev_device
+        self.pt = peak_tracker
+        self.st = solar_tracker
+        self.ev_guard = EVGuard(hass=hass, config={}, iteration_actions=[])
+
+    async def _apply_solar(self, excess: float, snapshots: dict | None = None):
+        return await self.ev_guard.apply_action(
+            self.device, excess, snapshots or {}, "solar", self.pt, self.st
+        )
+
+    async def test_svc_blocks_real_call_when_budget_exhausted(self):
+        """
+        _svc() zelf moet blokkeren zodra het dagbudget op is, ongeacht of de
+        aanroeper _rate_check() gebruikte — dit is het vangnet voor call sites
+        zoals de wake-button die geen _rate_check() doorlopen.
+        """
+        budget = make_ev_budget(self.hass, max_calls=1)
+        budget.record()  # budget al volledig verbruikt
+        self.ev_guard.set_daily_budget(budget)
+        self.ev_guard._log_ctx = {"device": "Tesla", "cascade": "solar", "surplus_w": 0.0}
+
+        with pytest.raises(HomeAssistantError):
+            await self.ev_guard._svc("button", "press", {"entity_id": "button.wake"})
+
+        assert not self.hass.services.calls, (
+            "Geen enkele echte service-call mag vertrekken als het dagbudget op is"
+        )
+
+    async def test_exhausted_daily_budget_blocks_apply_action(self):
+        """Uitgeput dagbudget → apply_action() start de EV niet, zelfs met vrije rate-limiter."""
+        budget = make_ev_budget(self.hass, max_calls=1)
+        budget.record()
+        self.ev_guard.set_daily_budget(budget)
+
+        guard = self.ev_guard.get_guard(self.device.id)
+        guard.debounce_start_at = datetime.now(timezone.utc) - timedelta(seconds=25)
+        make_surplus_history(guard, seconds_span=25.0, value_w=5000.0)
+        await self._apply_solar(5000.0)
+
+        assert not self.hass.services.calls, (
+            "apply_action mag geen service aanroepen als het dagbudget op is"
+        )
+
+    @patch("custom_components.peak_guard.deciders.ev_guard.asyncio.sleep", new_callable=AsyncMock)
+    async def test_successful_call_increments_daily_budget(self, _mock_sleep):
+        """Een geslaagde turn_on telt mee in het dagbudget."""
+        budget = make_ev_budget(self.hass, max_calls=10)
+        self.ev_guard.set_daily_budget(budget)
+
+        guard = self.ev_guard.get_guard(self.device.id)
+        guard.debounce_start_at = datetime.now(timezone.utc) - timedelta(seconds=25)
+        make_surplus_history(guard, seconds_span=25.0, value_w=5000.0)
+        await self._apply_solar(5000.0)
+
+        assert self.hass.services.has_call("turn_on")
+        assert budget.calls_today >= 1
 
 
 # ═══════════════════════════════════════════════════════════════════════════ #

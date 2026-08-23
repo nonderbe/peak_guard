@@ -72,6 +72,24 @@ DEFAULT_EV_SOLAR_START_THRESHOLD_W: float = 0.0
 # Hysteresis: voorkomt constant aan/uit schakelen bij borderline surplus.
 DEFAULT_EV_SOLAR_STOP_THRESHOLD_W: float = 0.0
 
+# Dagelijks hard plafond op echte EV-API-calls (bv. Tesla Fleet API), als
+# lange-horizon vangnet bovenop EVRateLimiter (12 calls / 10 min). Die 10-min
+# sliding window beschermt tegen thrashing binnen één cyclus, maar een
+# structureel falend apparaat kan daar dag na dag tegenaan blijven botsen en
+# zo het externe quotum van de API-provider opsouperen.
+#
+# Bewust een DAGELIJKS budget i.p.v. maandelijks: bereken het simpelweg als
+# het maandquotum gedeeld door 30. Een storing op één dag put dan hooguit
+# die ene dag uit — de volgende dag is het volledige dagbudget weer
+# beschikbaar voor normaal gebruik, in plaats van dat de storing de rest
+# van de maand blijft doorwerken op een cumulatief maandbudget.
+#
+# Houdt geen rekening met de achtergrond-polling van de Tesla-integratie
+# zelf (die onafhankelijk van Peak Guard hetzelfde accountquotum verbruikt)
+# — pas aan op basis van het werkelijke maandquotum en de waargenomen
+# achtergrondbelasting.
+EV_API_DAILY_BUDGET: int = 10_000 // 30  # = 333
+
 # ------------------------------------------------------------------ #
 #  Panel / frontend                                                    #
 # ------------------------------------------------------------------ #
@@ -99,6 +117,9 @@ STORAGE_VERSION_SOLAR_SAVINGS = 1
 
 STORAGE_KEY_DEVICE_SAVINGS = f"{DOMAIN}.monthly_device_savings"
 STORAGE_VERSION_DEVICE_SAVINGS = 1
+
+STORAGE_KEY_EV_CALL_BUDGET = f"{DOMAIN}.ev_call_budget"
+STORAGE_VERSION_EV_CALL_BUDGET = 1
 
 # ------------------------------------------------------------------ #
 #  Cascade actietypes                                                  #

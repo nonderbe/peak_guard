@@ -85,6 +85,9 @@ class EVGuard:
         self._api_logger = None
         # Huidige call-context voor de JSONL-logger (gezet door publieke methoden).
         self._log_ctx: dict = {}
+        # Dagelijks API-budget — geïnjecteerd vanuit __init__.py na initialisatie.
+        # None = geen dagplafond gehandhaafd (bv. in tests).
+        self._daily_budget = None
 
     # ------------------------------------------------------------------ #
     #  Properties voor controller.to_dict()                               #
@@ -97,6 +100,10 @@ class EVGuard:
     @property
     def rate_limiter(self) -> EVRateLimiter:
         return self._rate_limiter
+
+    def set_daily_budget(self, budget) -> None:
+        """Koppel het dagelijkse EV-API-budget (aangeroepen vanuit __init__.py)."""
+        self._daily_budget = budget
 
     def status_dict(self) -> dict:
         """Return serialisable guard status for the REST API / to_dict()."""
@@ -128,6 +135,14 @@ class EVGuard:
                 "window_s":        EV_RATE_LIMIT_WINDOW_S,
                 "max_calls":       EV_RATE_LIMIT_MAX_CALLS,
             },
+            "ev_daily_budget": (
+                {
+                    "calls_today": self._daily_budget.calls_today,
+                    "max_calls":   self._daily_budget.max_calls,
+                    "remaining":   self._daily_budget.remaining,
+                }
+                if self._daily_budget is not None else None
+            ),
             "warnings": list(self._recent_warnings),
         }
 
@@ -151,20 +166,34 @@ class EVGuard:
     def _rate_check(self, device_name: str, reason: str) -> bool:
         """
         Geeft True als een EV service call is toegestaan.
-        Logt een warning en geeft False als de rate-limiter vol is.
+        Logt een warning en geeft False als de korte-termijn rate-limiter of
+        het dagelijkse API-budget vol is. Dit is een vroege, goedkope
+        pre-check die nodeloze retry-lussen vermijdt; _svc() zelf handhaaft
+        het dagbudget hoe dan ook nog eens hard, als vangnet voor
+        call sites die deze pre-check niet aanroepen (bv. de wake-button).
         """
-        if self._rate_limiter.is_allowed():
-            return True
-        self._warn(
-            "Peak Guard EV '%s': service call OVERGESLAGEN wegens globale rate-limiter "
-            "(%d/%d calls in %.0f s). Reden: %s",
-            device_name,
-            self._rate_limiter.calls_in_window,
-            EV_RATE_LIMIT_MAX_CALLS,
-            EV_RATE_LIMIT_WINDOW_S,
-            reason,
-        )
-        return False
+        if not self._rate_limiter.is_allowed():
+            self._warn(
+                "Peak Guard EV '%s': service call OVERGESLAGEN wegens globale rate-limiter "
+                "(%d/%d calls in %.0f s). Reden: %s",
+                device_name,
+                self._rate_limiter.calls_in_window,
+                EV_RATE_LIMIT_MAX_CALLS,
+                EV_RATE_LIMIT_WINDOW_S,
+                reason,
+            )
+            return False
+        if self._daily_budget is not None and not self._daily_budget.is_allowed():
+            self._warn(
+                "Peak Guard EV '%s': service call OVERGESLAGEN wegens dagelijks "
+                "API-budget (%d/%d calls vandaag). Reden: %s",
+                device_name,
+                self._daily_budget.calls_today,
+                self._daily_budget.max_calls,
+                reason,
+            )
+            return False
+        return True
 
     def _record_call(self) -> None:
         """Registreer dat we zojuist een EV service call hebben gemaakt."""
@@ -242,7 +271,26 @@ class EVGuard:
         *,
         blocking: bool = True,
     ) -> None:
-        """Wrapper rond hass.services.async_call die elke call naar JSONL logt."""
+        """
+        Wrapper rond hass.services.async_call die elke call naar JSONL logt en
+        het dagelijkse EV-API-budget handhaaft.
+
+        Dit is het ENIGE punt waar echte EV-service-calls (dus echte Tesla
+        API-aanroepen) vertrekken, dus het dagbudget wordt hier hard
+        gehandhaafd — onafhankelijk van of de aanroeper zelf _rate_check()/
+        _record_call() correct gebruikt. Zie v1.8.12: die per-call-site
+        boekhouding bleek eerder foutgevoelig (retries die niet meetelden).
+        """
+        if self._daily_budget is not None and not self._daily_budget.is_allowed():
+            self._warn(
+                "Peak Guard EV: %s.%s OVERGESLAGEN — dagelijks API-budget bereikt "
+                "(%d/%d calls vandaag, entity '%s')",
+                domain, service,
+                self._daily_budget.calls_today, self._daily_budget.max_calls,
+                data.get("entity_id", ""),
+            )
+            raise HomeAssistantError("Peak Guard: dagelijks EV API-budget bereikt")
+
         start = monotonic()
         error_str: Optional[str] = None
         try:
@@ -253,6 +301,9 @@ class EVGuard:
             error_str = str(err)
             raise
         finally:
+            if self._daily_budget is not None:
+                self._daily_budget.record()
+                self.hass.async_create_task(self._daily_budget.async_save())
             if self._api_logger is not None:
                 ctx = self._log_ctx
                 try:
