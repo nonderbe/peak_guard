@@ -59,7 +59,7 @@ The integration lives entirely in `custom_components/peak_guard/`.
 | `PeakAvoidTracker` | `avoided_peak_tracker.py` | Tracks peak avoidance events and computes kW/EUR impact |
 | `QuarterCalculator` | `quarter_calculator.py` | Derives quarterly average power from cumulative kWh sensor |
 | `QuarterStore` | `quarter_store.py` | Persists rolling 30-day quarter history |
-| `EVRateLimiter` | `models.py` | Sliding-window rate limiter (max 12 calls / 10 min per EV device) |
+| `EVRateLimiter` | `models.py` | Sliding-window rate limiter (max 12 calls / 10 min, one instance shared globally across all EV devices on the `EVGuard`) |
 | `EVDeviceGuard` | `models.py` | Per-device state machine for EV charger (idle → waiting_for_stable → charging → sleeping) |
 
 `CascadeDevice` remains as a backward-compat alias for `_BaseCascadeDevice`.
@@ -75,7 +75,7 @@ The integration lives entirely in `custom_components/peak_guard/`.
 EV chargers are significantly more complex than simple switches. All logic lives in `deciders/ev_guard.py` (`EVGuard`), called via `EVChargerDevice.apply()` / `.restore()`.
 
 - **Entities**: switch (on/off), number (charge current in A), optional SOC-limit number
-- **Rate limiter**: max 12 service calls per 10 minutes per device (`EVRateLimiter`)
+- **Rate limiter**: max 12 service calls per 10 minutes, one `EVRateLimiter` instance shared globally across every EV device on the `EVGuard` (not per-device). `_record_call()` is invoked for every real `_svc()` attempt — including failed retries — so a command that exhausts all `EV_CMD_MAX_RETRIES` still counts fully against the window; retry loops re-check `_rate_check()` before each attempt after the first so a filled window aborts the retry instead of continuing to call the underlying (e.g. Tesla) API unthrottled
 - **Start-threshold gate**: surplus must reach `start_threshold_w` before debounce even begins; drops below → debounce is reset
 - **Debounce / `_surplus_floor`**: 20 s wallclock timer (`EV_DEBOUNCE_STABLE_S`); the 10th-percentile floor of the surplus history must be positive before the EV is started; state is `WAITING_FOR_STABLE` while waiting
 - **1 A hysteresis** (`EV_HYSTERESIS_AMPS`): prevents thrashing on small surplus changes

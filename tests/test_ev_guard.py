@@ -396,6 +396,29 @@ class TestApplyActionSolar:
         assert guard.state == EVState.CHARGING
         assert len(self.st.started) == 1, "Solar meting moet geregistreerd worden"
 
+    @patch("custom_components.peak_guard.deciders.ev_guard.asyncio.sleep", new_callable=AsyncMock)
+    async def test_rate_limiter_counts_every_real_attempt_including_failures(self, _mock_sleep):
+        """
+        turn_on faalt op elke retry-poging (bv. Tesla meldt 'vehicle not online').
+        Elke poging is een ECHTE service-aanroep (en dus een echte Tesla API-call)
+        en moet meetellen in de rate-limiter, ook als de actie als geheel mislukt.
+        Regressietest: _record_call() werd voorheen alleen bij succes aangeroepen,
+        waardoor volledig mislukte retry-reeksen onzichtbaar bleven voor de
+        rate-limiter en zich ongelimiteerd elke cyclus konden herhalen.
+        """
+        self.hass.services._raise_on.add("turn_on")
+        guard = self.ev_guard.get_guard(self.device.id)
+        guard.debounce_start_at = datetime.now(timezone.utc) - timedelta(seconds=25)
+        make_surplus_history(guard, seconds_span=25.0, value_w=5000.0)
+        await self._apply_solar(5000.0)
+
+        attempts = self.hass.services.calls_for("turn_on")
+        assert len(attempts) == 3, "Moet 3 echte pogingen doen (EV_CMD_MAX_RETRIES + 1)"
+        assert self.ev_guard.rate_limiter.calls_in_window == len(attempts), (
+            "Elke echte API-poging moet meetellen in de rate-limiter, "
+            "ook mislukte pogingen"
+        )
+
     async def test_min_off_cooldown_blocks_turn_on(self):
         """
         EV 10 s geleden door PG uitgeschakeld (min OFF = 300 s)

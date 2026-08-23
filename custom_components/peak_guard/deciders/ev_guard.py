@@ -1017,11 +1017,17 @@ class EVGuard:
             turn_off_ok = False
             _last_err: Optional[HomeAssistantError] = None
             for _attempt in range(EV_CMD_MAX_RETRIES + 1):
+                if _attempt > 0 and not self._rate_check(
+                    device.name, "turn_off retry voor piekbeperking"
+                ):
+                    break
                 try:
                     await self._svc("switch", "turn_off", {"entity_id": sw_entity})
+                    self._record_call()
                     turn_off_ok = True
                     break
                 except HomeAssistantError as ha_err:
+                    self._record_call()
                     _last_err = ha_err
                     if _attempt < EV_CMD_MAX_RETRIES:
                         self._warn(
@@ -1040,7 +1046,6 @@ class EVGuard:
                 )
                 return excess
 
-            self._record_call()
             self._track_action(sw_entity, "switch.turn_off")
 
             if cur_entity and current_a is not None:
@@ -1508,11 +1513,17 @@ class EVGuard:
                 turn_on_ok = False
                 _last_err: Optional[HomeAssistantError] = None
                 for _attempt in range(EV_CMD_MAX_RETRIES + 1):
+                    if _attempt > 0 and not self._rate_check(
+                        device.name, "turn_on retry voor injectiepreventie"
+                    ):
+                        break
                     try:
                         await self._svc("switch", "turn_on", {"entity_id": sw_entity})
+                        self._record_call()
                         turn_on_ok = True
                         break
                     except HomeAssistantError as ha_err:
+                        self._record_call()
                         _last_err = ha_err
                         if _attempt < EV_CMD_MAX_RETRIES:
                             self._warn(
@@ -1535,7 +1546,6 @@ class EVGuard:
                     )
                     return excess
 
-                self._record_call()
                 self._track_action(sw_entity, "switch.turn_on")
                 guard.state           = EVState.CHARGING
                 guard.skip_reason     = ""
