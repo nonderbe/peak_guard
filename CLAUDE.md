@@ -19,7 +19,7 @@ python3 -m venv .venv && .venv/bin/python -m pip install -r requirements-test.tx
 
 `requirements-test.txt` (pytest, pytest-asyncio) is test tooling only — the integration itself still has no third-party dependencies.
 
-The test suite uses stub modules in `tests/conftest.py` to avoid a live HA install; the stubbed `homeassistant.util.dt.as_local` uses a fixed Europe/Brussels time zone. Seven test files:
+The test suite uses stub modules in `tests/conftest.py` to avoid a live HA install; the stubbed `homeassistant.util.dt.as_local` uses a fixed Europe/Brussels time zone. Ten test files:
 - `tests/test_ev_guard.py` — 48 tests covering the EV state machine, rate limiter, debounce, and Tesla-specific paths
 - `tests/test_tracker.py` — 21 tests covering the financial calculations in `PeakAvoidTracker` and `SolarShiftTracker`
 - `tests/test_peak_floor.py` — 24 tests covering the 2.5 kW capacity-tariff floor (decider, savings, billed peak, decision log)
@@ -27,6 +27,9 @@ The test suite uses stub modules in `tests/conftest.py` to avoid a live HA insta
 - `tests/test_power_units.py` — 10 tests covering kW → W conversion of the consumption and peak sensors
 - `tests/test_local_month.py` — 16 tests covering month/year boundaries in local time (quarter store, rollover, event-table timestamps)
 - `tests/test_startup_restore.py` — 11 tests covering the startup restore of the year total and the finalisation of months missed while HA was down
+- `tests/test_monthly_peak_history.py` — 33 tests covering the 36-month monthly-peak records in `QuarterStore` (recording, pruning, persistence, upgrade seeding, history queries, rejection of implausible quarters and invalid records)
+- `tests/test_quarter_calculator.py` — 10 tests covering `QuarterCalculator` when the meter reading drops and recovers or yields an impossible value, and non-finite sensor states
+- `tests/test_energy_units.py` — 7 tests covering Wh/MWh → kWh conversion of the energy sensor
 
 `controller.py` and the frontend panel are not importable in this harness and are not covered.
 
@@ -53,7 +56,7 @@ The integration lives entirely in `custom_components/peak_guard/`.
 
 6. **Frontend panel** (`frontend/peak_guard_panel.js`): A ~3500-line custom Web Component (no framework) that polls `/api/peak_guard/cascade` every 15 seconds, shows real-time status (countdown, last loop timestamp), and lets users drag-drop reorder devices and configure EV charger setups.
 
-7. **Persistence** (HA `Store` API): Eight stores survive restarts — cascade config, 30-day quarter history, peak and solar year savings, peak and solar month state (events), per-device monthly savings, and the EV daily call budget. Keys are in `const.py` (`STORAGE_KEY_*`) and `sensor.py` (`_STORAGE_KEY_*_STATE`).
+7. **Persistence** (HA `Store` API): Eight stores survive restarts — cascade config, quarter history with monthly peaks, peak and solar year savings, peak and solar month state (events), per-device monthly savings, and the EV daily call budget. Keys are in `const.py` (`STORAGE_KEY_*`) and `sensor.py` (`_STORAGE_KEY_*_STATE`).
 
 ### Key classes
 
@@ -69,7 +72,7 @@ The integration lives entirely in `custom_components/peak_guard/`.
 | `from_dict()` | `models.py` | Factory that deserialises a dict into the correct subclass; migrates old `ev_*`-prefixed formats automatically |
 | `PeakAvoidTracker` | `avoided_peak_tracker.py` | Tracks peak avoidance events and computes kW/EUR impact |
 | `QuarterCalculator` | `quarter_calculator.py` | Derives quarterly average power from cumulative kWh sensor |
-| `QuarterStore` | `quarter_store.py` | Persists rolling 30-day quarter history |
+| `QuarterStore` | `quarter_store.py` | Persists the rolling 32-day quarter history and one monthly-peak record per month for 36 months |
 | `EVRateLimiter` | `models.py` | Sliding-window rate limiter (max 12 calls / 10 min, one instance shared globally across all EV devices on the `EVGuard`) |
 | `EVDailyCallBudget` | `ev_call_budget.py` | Persistent (HA `Store`) daily cap on real EV-API calls — long-horizon backstop above `EVRateLimiter`; survives restarts |
 | `EVDeviceGuard` | `models.py` | Per-device state machine for EV charger (idle → waiting_for_stable → charging → sleeping) |
@@ -102,6 +105,7 @@ EV chargers are significantly more complex than simple switches. All logic lives
 
 - `FLUVIUS_REGIO_TARIEVEN`: 2026 capacity tariffs in €/kW/year, keyed by Flemish region name
 - `CAPACITY_MIN_KW = 2.5` — minimum billed monthly peak; see "2.5 kW capacity floor" below
+- `QUARTER_HISTORY_DAYS = 32`, `MONTHLY_PEAK_HISTORY_MONTHS = 36`, `MAX_PLAUSIBLE_QUARTER_KW = 100` — see "Quarter history and monthly peaks" below
 - `DEFAULT_BUFFER_WATTS = 100` — threshold margin in watts
 - `DEFAULT_UPDATE_INTERVAL = 5` — configured monitoring loop interval in seconds; the controller enforces a 60 s minimum, so the effective default is 60 s
 - `DEFAULT_POWER_DETECTION_TOLERANCE_PERCENT = 10` — tolerance for "natural stop" detection
@@ -122,6 +126,29 @@ Deliberately *not* floored: `sensor.peak_guard_monthly_peak_kw` (exposes the flo
 
 Peak Guard computes in W. The consumption sensor and the monthly-peak sensor are read through `deciders/base.py::read_power_w()`, which multiplies by 1000 when the entity's `unit_of_measurement` is kW (case-insensitive) and treats any other or missing unit as W. The panel applies the same rule in `_powerW()`. This matters because the floor would otherwise mask a kW peak sensor (3.2 → 2500 W). Device power sensors and other entities still go through plain `read_sensor()`.
 
+The cumulative energy sensor that feeds the quarter calculation is read through `read_energy_kwh()`: Wh is divided by 1000, MWh multiplied by 1000, anything else is read as kWh.
+
+### Quarter history and monthly peaks
+
+`QuarterStore` keeps two layers in one HA store (`peak_guard.quarters`):
+
+- **Quarters** — `QUARTER_HISTORY_DAYS` (32) days of 15-minute values, enough to cover any full calendar month. Needed for the running month (hypothetical-peak calculation in the tracker).
+- **Monthly peaks** — one record per local calendar month (`year`, `month`, `ts`, `kw`), raised whenever a higher quarter is added, kept for `MONTHLY_PEAK_HISTORY_MONTHS` (36). On load the records are also seeded from whatever quarters are still stored, which is how an older store without `monthly_peaks` upgrades.
+
+Because a monthly record can only rise and stays for 36 months, measurement errors are kept out at three points:
+
+- `QuarterCalculator` declares the running quarter invalid when the cumulative reading drops (sensor reset, or a register briefly missing from a summed template sensor). It reports 0 kW for the rest of that quarter and does not close it, so the jump back up is never counted as consumption. The same happens when the running value exceeds `MAX_PLAUSIBLE_QUARTER_KW` after the first minute of a quarter (a glitch that is the quarter's first reading produces no negative delta); within the first minute such a value is only shown as 0, because one step of a coarse sensor can cause it (0.2 kWh after 5 s reads as 144 kW).
+- `QuarterStore.add_quarter()` and the load path reject quarters that are not finite, negative, or above `MAX_PLAUSIBLE_QUARTER_KW` (100 kW) — e.g. values stored 1000× too high by a Wh energy sensor before v1.8.16. If more than 10% of the stored quarters are implausible at load, the whole quarter history is discarded as wrong-unit data, because the values that happen to fall under the cap are just as wrong.
+- `read_sensor()` returns `None` for `nan`/`inf` states.
+
+Pruning counts back from the current local month; a future-dated record (wrong clock) is left alone and cannot push real history out. There is no UI to correct a wrong-but-plausible record — that needs a hand edit of `.storage/peak_guard.quarters`.
+
+Every query (`get_month_peak`, `get_monthly_peaks`, the 12-month average and the billed peak) reads the merge of both layers (`_peaks_by_month`). The billed peak and rolling average use the last 12 months; the history sensor exposes all stored months. With fewer than 12 months of history the average runs over the months available.
+
+### Simulation mode
+
+`/api/peak_guard/simulate` pins the consumption the controller steers on (`_simulation_consumption`, W). `/api/peak_guard/cascade` reports it under `simulation`; the panel shows that value instead of the real sensor, with a "Simulatie" note on the consumption card. The panel only refreshes it on its 15-second poll.
+
 ### Time: stored in UTC, calendar boundaries in local time
 
 Fluvius bills the capacity tariff per calendar month in Belgian time and the P1 meter resets its monthly peak at local midnight. All timestamps are stored and compared in UTC, but everything that assigns a moment to a month or year goes through `utils.local_year_month()` (HA's configured time zone via `dt_util.as_local`): `QuarterStore` month peaks, the month/year rollover and persistence keys in `SharedCapacityState`, and the startup restore. Event timestamps are shown in local time, both in the sensor attribute tables (`_fmt_ts`) and in the panel's event log (browser-local). Still UTC on purpose: the EV daily call budget day (`ev_call_budget.py`) and the EV API log file date.
@@ -136,6 +163,7 @@ If HA was down across a month boundary, the live rollover in `SharedCapacityStat
 |---|---|---|
 | `/api/peak_guard/cascade` | GET, POST | Fetch or update the full cascade configuration |
 | `/api/peak_guard/force_check` | POST | Trigger an immediate monitoring cycle |
+| `/api/peak_guard/simulate` | GET, POST | Read or set simulation mode (`consumption_w` in W, `null` to switch it off) |
 
 ## No external Python dependencies
 

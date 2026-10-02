@@ -230,7 +230,7 @@ class PeakGuardPanel extends HTMLElement {
 
     const getVal = (id) => (id ? this._powerW(this._hass.states[id]) : null);
 
-    const consumption = getVal(consumption_sensor);
+    const consumption = this._simulatedConsumption() ?? getVal(consumption_sensor);
     const rawPeak = getVal(peak_sensor);
     const peak = this._effectivePeak(rawPeak, capacity_min_w);
     const isInjecting = consumption != null && consumption < 0;
@@ -247,6 +247,8 @@ class PeakGuardPanel extends HTMLElement {
       consumption != null ? `${consumption.toFixed(0)} W` : "—",
       this._consumptionClass(consumption, peak, buffer_watts)
     );
+    const simEl = this.shadowRoot.querySelector("#status-consumption-sim");
+    if (simEl) simEl.textContent = this._simulationNote();
     setTextAndClass("#status-peak", peak != null ? `${peak.toFixed(0)} W` : "—");
     const rawPeakEl = this.shadowRoot.querySelector("#status-peak-raw");
     if (rawPeakEl) rawPeakEl.textContent = this._rawPeakNote(rawPeak, peak);
@@ -433,6 +435,19 @@ class PeakGuardPanel extends HTMLElement {
     return unit === "kw" ? v * 1000 : v;
   }
 
+  // Simulatiemodus (/api/peak_guard/simulate): de controller stuurt dan op
+  // een opgelegd verbruik en negeert de echte sensor — zie
+  // PeakGuardController._read_consumption. Het paneel toont dezelfde waarde.
+  // Geeft null als er geen simulatie actief is.
+  _simulatedConsumption() {
+    const sim = this._data?.simulation;
+    return sim?.active && typeof sim.consumption_w === "number" ? sim.consumption_w : null;
+  }
+
+  _simulationNote() {
+    return this._simulatedConsumption() != null ? "⚠ Simulatie — echte sensor genegeerd" : "";
+  }
+
   // Onder het capaciteitsminimum (2500 W) is geen capaciteitstarief
   // verschuldigd: Peak Guard stuurt nooit op een lagere maandpiek, ook al
   // meldt de P1-meter minder. Zelfde regel als effective_peak_w in utils.py.
@@ -461,7 +476,7 @@ class PeakGuardPanel extends HTMLElement {
     const cfg = this._data?.config || {};
     const getVal = (id) => (id && this._hass ? this._powerW(this._hass.states[id]) : null);
 
-    const consumption = getVal(cfg.consumption_sensor);
+    const consumption = this._simulatedConsumption() ?? getVal(cfg.consumption_sensor);
     const rawPeak = getVal(cfg.peak_sensor);
     const peak = this._effectivePeak(rawPeak, cfg.capacity_min_w);
     const isInjecting = consumption != null && consumption < 0;
@@ -474,6 +489,7 @@ class PeakGuardPanel extends HTMLElement {
           <div class="value ${this._consumptionClass(consumption, peak, cfg.buffer_watts)}" id="status-consumption">
             ${consumption != null ? `${consumption.toFixed(0)} W` : "—"}
           </div>
+          <div class="sublabel simulation" id="status-consumption-sim">${this._simulationNote()}</div>
         </div>
         <div class="status-card">
           <div class="label">Maandpiek</div>
@@ -1017,7 +1033,7 @@ class PeakGuardPanel extends HTMLElement {
     // Haal surpluswaarde op via de consumptiesensor
     const consumptionSensor = this._data?.config?.consumption_sensor;
     const consumptionState  = consumptionSensor ? this._hass?.states[consumptionSensor] : null;
-    const consumption       = this._powerW(consumptionState) ?? 0;
+    const consumption       = this._simulatedConsumption() ?? this._powerW(consumptionState) ?? 0;
     const surplus_w         = (consumption < 0) ? Math.abs(consumption) : 0;
 
     const state  = guard.state ?? "idle";
@@ -2258,6 +2274,7 @@ class PeakGuardPanel extends HTMLElement {
           font-size: .8em; margin-top: 4px; min-height: 1.2em;
           color: var(--secondary-text-color, #757575);
         }
+        .status-card .sublabel.simulation { color: #f57c00; font-weight: 700; }
 
         .tabs {
           display: flex; border-bottom: 2px solid var(--divider-color, #e0e0e0);

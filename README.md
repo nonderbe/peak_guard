@@ -50,9 +50,9 @@ Tijdens de installatie stel je in:
 
 | Instelling | Beschrijving | Standaard |
 |---|---|---|
-| Sensor huidig verbruik | Vermogenssensor (W), pos. = afname | — |
-| Sensor maandelijkse piek | Maandpiek-sensor (W) | — |
-| Energiesensor | Cumulatieve kWh-teller (stijgend) | — |
+| Sensor huidig verbruik | Vermogenssensor (W of kW), pos. = afname | — |
+| Sensor maandelijkse piek | Maandpiek-sensor (W of kW) | — |
+| Energiesensor | Cumulatieve energieteller (stijgend), in kWh, Wh of MWh | — |
 | Fluvius-netgebied | Jouw distributieregio voor tarief 2026 | Antwerpen |
 | Buffer (W) | Marge boven de piek vóór ingreep | 100 W |
 | Controle-interval (s) | Hoe vaak Peak Guard controleert | 5 s |

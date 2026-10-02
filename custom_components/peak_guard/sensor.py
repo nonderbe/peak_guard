@@ -57,6 +57,7 @@ from .quarter_store import QuarterStore
 from .monthly_device_savings_store import MonthlyDeviceSavingsStore
 from .avoided_peak_tracker import PeakAvoidTracker, PeakEvent, SolarShiftTracker, SolarEvent
 from .utils import local_year_month
+from .deciders.base import read_energy_kwh
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -381,7 +382,7 @@ class SharedCapacityState:
         else:
             self.monthly_peak_kw = max(self.monthly_peak_kw, self.current_quarter_kw)
 
-        self.historical_peaks = self.store.get_monthly_peaks_last_12()
+        self.historical_peaks = self.store.get_monthly_peaks()
         self.rolling_avg_kw = self.store.get_rolling_12_month_avg()
 
         self.billed_peak_kw = self.store.get_billed_avg_kw()
@@ -581,16 +582,8 @@ class SharedCapacityState:
         return entry_month == local_year_month(now)
 
     def _read_energy(self) -> Optional[float]:
-        """Lees de huidige kWh-waarde van de energiesensor."""
-        if not self.energy_sensor_id:
-            return None
-        state = self.hass.states.get(self.energy_sensor_id)
-        if state is None or state.state in ("unknown", "unavailable", ""):
-            return None
-        try:
-            return float(state.state)
-        except (ValueError, TypeError):
-            return None
+        """Lees de huidige waarde van de energiesensor, omgerekend naar kWh."""
+        return read_energy_kwh(self.hass, self.energy_sensor_id)
 
 
 # ------------------------------------------------------------------ #
@@ -679,8 +672,8 @@ class MonthlyPeakSensor(PeakGuardSensorBase):
 
 class HistoricalMonthlyPeaksSensor(PeakGuardSensorBase):
     """
-    Laatste 12 maandpieken als attribuut.
-    State = aantal maanden met data.
+    Maandpieken van de laatste MONTHLY_PEAK_HISTORY_MONTHS (36) maanden als
+    attribuut. State = aantal maanden met data.
     """
 
     def __init__(self, shared: SharedCapacityState) -> None:
@@ -734,8 +727,9 @@ class BilledPeakSensor(PeakGuardSensorBase):
     """
     Aangerekende piek = gemiddelde van de laatste 12 maandpieken, waarbij
     elke maandpiek minstens 2,5 kW telt — de methode die Fluvius gebruikt
-    voor de facturatie. Benadering: QuarterStore bewaart slechts
-    QUARTER_HISTORY_DAYS aan kwartieren, dus niet de volledige 12 maanden.
+    voor de facturatie. QuarterStore bewaart de maandpieken 36 maanden; zolang
+    er minder dan 12 maanden historiek is, wordt over de beschikbare maanden
+    gemiddeld.
     """
 
     def __init__(self, shared: SharedCapacityState) -> None:

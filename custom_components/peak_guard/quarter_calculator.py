@@ -12,7 +12,7 @@ van het blok. Het lopende gemiddeld vermogen is:
            = delta_kWh * 60 / verstreken_minuten
 
 Aan het einde van een kwartier wordt de definitieve waarde opgeslagen
-in de geschiedenis (max. 30 dagen × 96 kwartieren = 2880 entries).
+in de geschiedenis (QUARTER_HISTORY_DAYS × 96 kwartieren).
 """
 
 from __future__ import annotations
@@ -21,9 +21,14 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 
+from .const import MAX_PLAUSIBLE_QUARTER_KW
 from .utils import quarter_start as _quarter_start
 
 _LOGGER = logging.getLogger(__name__)
+
+# Zolang een kwartier korter dan dit loopt, kan één stap van een grove sensor
+# het lopende gemiddelde nog boven MAX_PLAUSIBLE_QUARTER_KW duwen.
+_SETTLE_MINUTES = 1.0
 
 
 class QuarterCalculator:
@@ -45,6 +50,10 @@ class QuarterCalculator:
         self._last_finished_value: Optional[float] = None
         self._last_finished_ts: Optional[datetime] = None
         self._quarter_just_finished: bool = False
+        # True zodra de meterstand in het lopende kwartier terugsprong: het
+        # of een onmogelijk vermogen opleverde: het kwartier is dan
+        # onbetrouwbaar en wordt niet afgesloten.
+        self._quarter_invalid: bool = False
 
     # ---------------------------------------------------------------- #
     #  Publieke interface                                                #
@@ -102,16 +111,24 @@ class QuarterCalculator:
 
         # Nieuw kwartier gestart?
         if q_start > self._current_quarter_start:
-            # Sla de definitieve waarde op van het afgelopen kwartier
-            self._last_finished_value = self._current_kw
-            self._last_finished_ts = self._current_quarter_start
-            self._quarter_just_finished = True
-            _LOGGER.debug(
-                "Kwartier %s afgesloten: %.3f kW",
-                self._current_quarter_start.isoformat(),
-                self._current_kw,
-            )
+            if self._quarter_invalid:
+                _LOGGER.warning(
+                    "QuarterCalculator: kwartier %s niet afgesloten — de "
+                    "meterstand sprong terug tijdens dit kwartier",
+                    self._current_quarter_start.isoformat(),
+                )
+            else:
+                # Sla de definitieve waarde op van het afgelopen kwartier
+                self._last_finished_value = self._current_kw
+                self._last_finished_ts = self._current_quarter_start
+                self._quarter_just_finished = True
+                _LOGGER.debug(
+                    "Kwartier %s afgesloten: %.3f kW",
+                    self._current_quarter_start.isoformat(),
+                    self._current_kw,
+                )
             # Reset voor het nieuwe kwartier
+            self._quarter_invalid = False
             self._current_quarter_start = q_start
             self._quarter_start_energy = energy_kwh
             self._current_kw = 0.0
@@ -124,19 +141,43 @@ class QuarterCalculator:
             self._current_kw = 0.0
             return 0.0
 
+        if self._quarter_invalid:
+            # Rest van een onbetrouwbaar kwartier: niets meten tot het volgende.
+            return 0.0
+
         delta_kwh = energy_kwh - self._quarter_start_energy
         if delta_kwh < 0:
-            # Sensor reset of overflow: reset referentie
+            # Meterstand sprong terug (sensor-reset, of een register dat kort
+            # wegviel). Springt hij daarna weer omhoog, dan zou die sprong als
+            # verbruik tellen en een reusachtige piek geven. Het kwartier is
+            # dus onbetrouwbaar: meet niet verder en sluit het niet af.
             _LOGGER.warning(
-                "QuarterCalculator: negatieve energiedelta (%.3f kWh) — referentie gereset",
+                "QuarterCalculator: negatieve energiedelta (%.3f kWh) — "
+                "lopend kwartier ongeldig verklaard",
                 delta_kwh,
             )
-            self._quarter_start_energy = energy_kwh
+            self._quarter_invalid = True
             self._current_kw = 0.0
             return 0.0
 
         # P = delta_kWh / (elapsed_min / 60) = delta_kWh * 60 / elapsed_min
-        self._current_kw = round(delta_kwh * 60.0 / elapsed_minutes, 4)
+        current_kw = round(delta_kwh * 60.0 / elapsed_minutes, 4)
+        if current_kw > MAX_PLAUSIBLE_QUARTER_KW:
+            # Onmogelijk hoog. In de eerste minuut kan dat nog een gewone
+            # stap van een grove sensor zijn (0,1 kWh na 5 s = 72 kW): toon
+            # dan voorlopig 0. Daarna is het een meetfout — typisch een te
+            # lage eerste meting van het kwartier gevolgd door een sprong
+            # terug omhoog — en is het hele kwartier onbetrouwbaar.
+            if elapsed_minutes >= _SETTLE_MINUTES:
+                _LOGGER.warning(
+                    "QuarterCalculator: onmogelijk kwartiervermogen (%.0f kW) — "
+                    "lopend kwartier ongeldig verklaard",
+                    current_kw,
+                )
+                self._quarter_invalid = True
+            self._current_kw = 0.0
+            return 0.0
+        self._current_kw = current_kw
         return self._current_kw
 
     def restore(

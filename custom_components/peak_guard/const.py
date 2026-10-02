@@ -37,7 +37,15 @@ DEFAULT_REGIO = "Antwerpen"
 
 CAPACITY_MIN_KW = 2.5
 QUARTER_SECONDS = 900
-QUARTER_HISTORY_DAYS = 30
+# Kwartierhistoriek: 32 dagen, zodat ook een maand van 31 dagen volledig
+# beschikbaar blijft voor de lopende maand.
+QUARTER_HISTORY_DAYS = 32
+# Aantal maanden waarvoor de maandpiek bewaard blijft (los van de kwartieren).
+MONTHLY_PEAK_HISTORY_MONTHS = 36
+# Hoogste kwartiergemiddelde dat nog als echte meting aanvaard wordt. Ruim
+# boven een zware aansluiting (3×63 A ≈ 43 kW); alles daarboven is een
+# meetfout (terugspringende meterstand, verkeerde eenheid) en wordt geweigerd.
+MAX_PLAUSIBLE_QUARTER_KW = 100.0
 
 # ------------------------------------------------------------------ #
 #  Standaardwaarden                                                    #

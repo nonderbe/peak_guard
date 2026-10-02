@@ -12,6 +12,7 @@ Abstracte BaseDecider met gedeelde helpers:
 from __future__ import annotations
 
 import logging
+import math
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional
 
@@ -56,9 +57,11 @@ def read_sensor(hass: HomeAssistant, entity_id: Optional[str]) -> Optional[float
     if state is None or state.state in ("unknown", "unavailable", ""):
         return None
     try:
-        return float(state.state)
+        value = float(state.state)
     except (ValueError, TypeError):
         return None
+    # "nan"/"inf" zijn geldige floats maar geen meting.
+    return value if math.isfinite(value) else None
 
 
 def read_power_w(hass: HomeAssistant, entity_id: Optional[str]) -> Optional[float]:
@@ -75,6 +78,25 @@ def read_power_w(hass: HomeAssistant, entity_id: Optional[str]) -> Optional[floa
     attributes = getattr(hass.states.get(entity_id), "attributes", None) or {}
     unit = str(attributes.get("unit_of_measurement") or "").strip().lower()
     return value * 1000.0 if unit == "kw" else value
+
+
+def read_energy_kwh(hass: HomeAssistant, entity_id: Optional[str]) -> Optional[float]:
+    """
+    Lees een cumulatieve energiesensor uit in kWh.
+
+    De kwartierberekening rekent in kWh. Een sensor in Wh of MWh wordt
+    omgerekend; elke andere of ontbrekende eenheid wordt als kWh gelezen.
+    """
+    value = read_sensor(hass, entity_id)
+    if value is None:
+        return None
+    attributes = getattr(hass.states.get(entity_id), "attributes", None) or {}
+    unit = str(attributes.get("unit_of_measurement") or "").strip()
+    if unit.lower() == "wh":
+        return value / 1000.0
+    if unit == "MWh":
+        return value * 1000.0
+    return value
 
 
 class BaseDecider:
