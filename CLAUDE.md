@@ -19,7 +19,7 @@ python3 -m venv .venv && .venv/bin/python -m pip install -r requirements-test.tx
 
 `requirements-test.txt` (pytest, pytest-asyncio) is test tooling only — the integration itself still has no third-party dependencies.
 
-The test suite uses stub modules in `tests/conftest.py` to avoid a live HA install; the stubbed `homeassistant.util.dt.as_local` uses a fixed Europe/Brussels time zone. Ten test files:
+The test suite uses stub modules in `tests/conftest.py` to avoid a live HA install; the stubbed `homeassistant.util.dt.as_local` uses a fixed Europe/Brussels time zone. Eleven test files:
 - `tests/test_ev_guard.py` — 48 tests covering the EV state machine, rate limiter, debounce, and Tesla-specific paths
 - `tests/test_tracker.py` — 21 tests covering the financial calculations in `PeakAvoidTracker` and `SolarShiftTracker`
 - `tests/test_peak_floor.py` — 24 tests covering the 2.5 kW capacity-tariff floor (decider, savings, billed peak, decision log)
@@ -30,6 +30,7 @@ The test suite uses stub modules in `tests/conftest.py` to avoid a live HA insta
 - `tests/test_monthly_peak_history.py` — 33 tests covering the 36-month monthly-peak records in `QuarterStore` (recording, pruning, persistence, upgrade seeding, history queries, rejection of implausible quarters and invalid records)
 - `tests/test_quarter_calculator.py` — 10 tests covering `QuarterCalculator` when the meter reading drops and recovers or yields an impossible value, and non-finite sensor states
 - `tests/test_energy_units.py` — 7 tests covering Wh/MWh → kWh conversion of the energy sensor
+- `tests/test_peak_verification.py` — 16 tests covering the automatic removal of quarters and monthly records that contradict the P1 meter's monthly peak
 
 `controller.py` and the frontend panel are not importable in this harness and are not covered.
 
@@ -105,7 +106,7 @@ EV chargers are significantly more complex than simple switches. All logic lives
 
 - `FLUVIUS_REGIO_TARIEVEN`: 2026 capacity tariffs in €/kW/year, keyed by Flemish region name
 - `CAPACITY_MIN_KW = 2.5` — minimum billed monthly peak; see "2.5 kW capacity floor" below
-- `QUARTER_HISTORY_DAYS = 32`, `MONTHLY_PEAK_HISTORY_MONTHS = 36`, `MAX_PLAUSIBLE_QUARTER_KW = 100` — see "Quarter history and monthly peaks" below
+- `QUARTER_HISTORY_DAYS = 32`, `MONTHLY_PEAK_HISTORY_MONTHS = 36`, `MAX_PLAUSIBLE_QUARTER_KW = 100`, `PEAK_VERIFY_*` — see "Quarter history and monthly peaks" below
 - `DEFAULT_BUFFER_WATTS = 100` — threshold margin in watts
 - `DEFAULT_UPDATE_INTERVAL = 5` — configured monitoring loop interval in seconds; the controller enforces a 60 s minimum, so the effective default is 60 s
 - `DEFAULT_POWER_DETECTION_TOLERANCE_PERCENT = 10` — tolerance for "natural stop" detection
@@ -141,7 +142,15 @@ Because a monthly record can only rise and stays for 36 months, measurement erro
 - `QuarterStore.add_quarter()` and the load path reject quarters that are not finite, negative, or above `MAX_PLAUSIBLE_QUARTER_KW` (100 kW) — e.g. values stored 1000× too high by a Wh energy sensor before v1.8.16. If more than 10% of the stored quarters are implausible at load, the whole quarter history is discarded as wrong-unit data, because the values that happen to fall under the cap are just as wrong.
 - `read_sensor()` returns `None` for `nan`/`inf` states.
 
-Pruning counts back from the current local month; a future-dated record (wrong clock) is left alone and cannot push real history out. There is no UI to correct a wrong-but-plausible record — that needs a hand edit of `.storage/peak_guard.quarters`.
+Pruning counts back from the current local month; a future-dated record (wrong clock) is left alone and cannot push real history out.
+
+**Automatic correction against the P1 meter.** Errors that pass those filters (wrong but plausible, e.g. 11 kW) are removed without user action. Every sensor update, `SharedCapacityState._verify_against_meter()` reads the configured peak sensor — the meter's own monthly peak, the billing reference — and calls `QuarterStore.async_remove_unconfirmed_peaks()`. No closed quarter of the running month can exceed the meter's monthly peak, so any own quarter above `meter_peak × PEAK_VERIFY_TOLERANCE (1.15) + PEAK_VERIFY_MARGIN_KW (0.25)` is deleted, the month's record is rebuilt from the remaining quarters, and a warning is logged with the removed values. The tolerance absorbs the difference between the meter's exact quarter average and Peak Guard's estimate from one-minute readings. Details:
+
+- A quarter is only judged `PEAK_VERIFY_GRACE_MINUTES` (10) after it ended, so the meter has had time to report it.
+- Only the running month is checked — the meter resets its peak at month change. Consequently the last quarter of each month (23:45–00:00) is never verified, and neither are months recorded before v1.8.17.
+- Nothing happens when the peak sensor is unavailable, not configured, or one of Peak Guard's own sensors (circular reference).
+- Only values that are too high are removed. A record that is too low (HA was down during the real peak, or the quarter was voided) is not raised to the meter's value.
+- The check trusts the peak sensor: a sensor stuck on a stale low value would cause genuine new peaks to be deleted from Peak Guard's own history (steering is unaffected by that; it already depends on the same sensor).
 
 Every query (`get_month_peak`, `get_monthly_peaks`, the 12-month average and the billed peak) reads the merge of both layers (`_peaks_by_month`). The billed peak and rolling average use the last 12 months; the history sensor exposes all stored months. With fewer than 12 months of history the average runs over the months available.
 
@@ -156,6 +165,21 @@ Fluvius bills the capacity tariff per calendar month in Belgian time and the P1 
 ### Startup after a missed month change
 
 If HA was down across a month boundary, the live rollover in `SharedCapacityState._async_update` never ran. `sensor.py::restore_peak_tracker()` then keeps the stored year total as the year base (the stale month state is discarded), and `MonthlyDeviceSavingsStore.async_finalize_before()` freezes the still-open per-device records of earlier months with their last persisted values. The live rollover calls it too, because after a mid-month restart the tracker only knows devices with a new event.
+
+## Known limitations
+
+Accepted as-is; listed so they are not rediscovered as bugs.
+
+- **Energy sensor must be strictly increasing.** Any drop in the cumulative reading, however small, voids the running quarter (`QuarterCalculator`). A computed sensor that occasionally dips (e.g. a Riemann integral of net power, or a sum of registers with a `float(0)` fallback) loses each such quarter, with one log warning per occurrence. There is no epsilon.
+- **Unrecognised energy units are read as kWh.** Only Wh and MWh are converted (`read_energy_kwh`). GWh, joule units, or a Wh sensor without a `unit_of_measurement` are taken as kWh with no warning; a unitless Wh sensor then has most quarters rejected by the 100 kW cap.
+- **Unrecognised power units are read as W.** Only kW is converted (`read_power_w`).
+- **A small meter drop exactly on a quarter boundary** (the first reading of a quarter is too low by less than ~25 kWh and recovers) yields a plausible phantom quarter. It is stored, and removed again by the P1-meter check once that quarter is 10 minutes old — except for the last quarter of a month.
+- **Monthly-peak history starts at v1.8.16.** Older months are absent; until 12 months exist the billed peak averages over the months available. Downgrading to ≤ v1.8.15 drops the monthly records.
+- **Meter replacement costs one quarter** (the drop voids it).
+- **Simulation mode in the panel** refreshes on the 15-second poll, not live.
+- **EV daily call budget and EV API log file date run on UTC days**, not local days.
+- **`controller.py` and the frontend panel are not covered by the test suite.** Panel helpers have only been exercised in Node, not in a browser.
+- **Time-zone handling is tested against a stub** of `homeassistant.util.dt`, not a live HA.
 
 ## REST API
 

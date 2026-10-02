@@ -36,6 +36,7 @@ from homeassistant.helpers.restore_state import RestoreEntity
 from .const import (
     DOMAIN,
     CONF_ENERGY_SENSOR,
+    CONF_PEAK_SENSOR,
     CONF_REGIO,
     FLUVIUS_REGIO_TARIEVEN,
     CAPACITY_MIN_KW,
@@ -57,7 +58,7 @@ from .quarter_store import QuarterStore
 from .monthly_device_savings_store import MonthlyDeviceSavingsStore
 from .avoided_peak_tracker import PeakAvoidTracker, PeakEvent, SolarShiftTracker, SolarEvent
 from .utils import local_year_month
-from .deciders.base import read_energy_kwh
+from .deciders.base import read_energy_kwh, read_power_w
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -241,6 +242,8 @@ async def async_setup_entry(
         peak_state_store=peak_state_store,
         solar_state_store=solar_state_store,
         device_savings_store=device_savings_store,
+        # Zelfde samenvoeging als de controller: opties gaan voor op de initiële config.
+        peak_sensor_id={**entry.data, **entry.options}.get(CONF_PEAK_SENSOR),
     )
 
     entities = [
@@ -305,9 +308,13 @@ class SharedCapacityState:
         peak_state_store,
         solar_state_store,
         device_savings_store,
+        peak_sensor_id: Optional[str] = None,
     ) -> None:
         self.hass = hass
         self.energy_sensor_id = energy_sensor_id
+        # Maandpiek-sensor van de P1-meter: referentie om eigen kwartierwaarden
+        # te controleren (zie _verify_against_meter).
+        self.peak_sensor_id = peak_sensor_id
         self.store = store
         self.calculator = calculator
         self.tarief = tarief
@@ -373,6 +380,8 @@ class SharedCapacityState:
             finished_ts = self.calculator.last_finished_ts
             if finished_kw is not None and finished_ts is not None:
                 await self.store.add_quarter(finished_ts, finished_kw)
+
+        await self._verify_against_meter(now)
 
         # Afgeleide waarden herberekenen
         self.monthly_peak_kw = self.store.get_current_month_peak()
@@ -571,6 +580,22 @@ class SharedCapacityState:
         # Alle sensoren laten weten dat ze kunnen updaten
         for entity in self._listeners:
             entity.async_schedule_update_ha_state()
+
+    async def _verify_against_meter(self, now: datetime) -> None:
+        """
+        Wis eigen kwartierwaarden die de maandpiek van de P1-meter tegenspreken.
+
+        De meter is de referentie voor de facturatie. Zonder bruikbare
+        meterwaarde (sensor niet ingesteld of onbeschikbaar) gebeurt er niets.
+        Een van Peak Guards eigen sensoren als piek-sensor is geen
+        onafhankelijke referentie en wordt niet gebruikt.
+        """
+        if not self.peak_sensor_id or self.peak_sensor_id.startswith(f"sensor.{DOMAIN}_"):
+            return
+        meter_peak_w = read_power_w(self.hass, self.peak_sensor_id)
+        if meter_peak_w is None or meter_peak_w < 0:
+            return
+        await self.store.async_remove_unconfirmed_peaks(meter_peak_w / 1000.0, now)
 
     @staticmethod
     def _entry_in_current_month(entry: dict, now: datetime) -> bool:

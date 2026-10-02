@@ -1,6 +1,6 @@
 # Peak Guard — Next Steps
 
-Updated: 2026-06-10.
+Updated: 2026-10-02.
 
 ## Status Legend
 - ✅ Done
@@ -131,6 +131,21 @@ Then in Peak Guard UI, change the Tesla `location_tracker` field from
 | v1.8.2 | Solar injection prevention blocked when Tesla switch/tracker entities report `unknown` |
 | v1.8.1 | Keep EV charging at hw-min when solar still covers part of draw |
 | v1.8.0 | Tesla API JSONL logging + Logboek tab; replace 15-second sleep loop with state-machine wake-up (P0-3) |
+
+---
+
+## Open items — accepted limitations (2026-10-02, v1.8.17)
+
+Not planned; the owner decided these need no work. Full descriptions are in
+CLAUDE.md under "Known limitations".
+
+| Item | Status |
+|------|--------|
+| Energy sensor that is not strictly increasing loses each quarter in which it dips (no epsilon) | ⏳ accepted |
+| Unrecognised energy units (GWh, unitless Wh) are read as kWh without a warning | ⏳ accepted |
+| Last quarter of each month is not verified against the P1 meter | ⏳ accepted |
+| Too-low monthly records are not raised to the P1 meter's value | ⏳ accepted |
+| `controller.py` and the panel have no automated tests | ⏳ accepted |
 
 ---
 

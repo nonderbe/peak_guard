@@ -46,6 +46,16 @@ MONTHLY_PEAK_HISTORY_MONTHS = 36
 # boven een zware aansluiting (3×63 A ≈ 43 kW); alles daarboven is een
 # meetfout (terugspringende meterstand, verkeerde eenheid) en wordt geweigerd.
 MAX_PLAUSIBLE_QUARTER_KW = 100.0
+# Controle van de eigen kwartierwaarden tegen de maandpiek van de P1-meter.
+# Een afgesloten kwartier van de lopende maand kan niet hoger zijn dan die
+# maandpiek; ligt het erboven, dan is het een meetfout en wordt het gewist.
+#   grens = meterpiek × PEAK_VERIFY_TOLERANCE + PEAK_VERIFY_MARGIN_KW
+# De marge vangt het verschil op tussen de meter (exact kwartiergemiddelde)
+# en de eigen schatting uit minuutmetingen. Een kwartier wordt pas beoordeeld
+# PEAK_VERIFY_GRACE_MINUTES na zijn einde, zodat de meter het kan melden.
+PEAK_VERIFY_TOLERANCE = 1.15
+PEAK_VERIFY_MARGIN_KW = 0.25
+PEAK_VERIFY_GRACE_MINUTES = 10
 
 # ------------------------------------------------------------------ #
 #  Standaardwaarden                                                    #

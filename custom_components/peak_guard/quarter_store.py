@@ -32,6 +32,10 @@ from .const import (
     CAPACITY_MIN_KW,
     MAX_PLAUSIBLE_QUARTER_KW,
     MONTHLY_PEAK_HISTORY_MONTHS,
+    PEAK_VERIFY_GRACE_MINUTES,
+    PEAK_VERIFY_MARGIN_KW,
+    PEAK_VERIFY_TOLERANCE,
+    QUARTER_SECONDS,
     STORAGE_KEY_QUARTERS,
     STORAGE_VERSION_QUARTERS,
     QUARTER_HISTORY_DAYS,
@@ -205,6 +209,75 @@ class QuarterStore:
         self._record_month_peak(entry["ts"], entry["kw"])
         self._prune_month_peaks()
         await self.async_save()
+
+    async def async_remove_unconfirmed_peaks(
+        self, meter_peak_kw: float, now: datetime,
+    ) -> list[dict]:
+        """
+        Verwijder kwartieren van de lopende maand die de P1-meter tegenspreekt.
+
+        meter_peak_kw is de maandpiek die de meter zelf rapporteert. Geen
+        enkel afgesloten kwartier van deze maand kan daar boven liggen, dus
+        een eigen waarde boven
+            meter_peak_kw × PEAK_VERIFY_TOLERANCE + PEAK_VERIFY_MARGIN_KW
+        is een meetfout. Zulke kwartieren worden gewist en het maandpiek-
+        record wordt opnieuw opgebouwd uit de kwartieren die overblijven.
+
+        Een kwartier wordt pas beoordeeld PEAK_VERIFY_GRACE_MINUTES na zijn
+        einde. Vorige maanden blijven ongemoeid: de meter kent alleen de
+        lopende maand. Geeft de verwijderde entries terug ({"ts", "kw"}).
+        """
+        limit = meter_peak_kw * PEAK_VERIFY_TOLERANCE + PEAK_VERIFY_MARGIN_KW
+        month = local_year_month(now)
+        settled_before = now - timedelta(
+            seconds=QUARTER_SECONDS, minutes=PEAK_VERIFY_GRACE_MINUTES,
+        )
+
+        def is_wrong(entry: dict) -> bool:
+            if entry["kw"] <= limit:
+                return False
+            try:
+                return datetime.fromisoformat(entry["ts"]) <= settled_before
+            except (ValueError, TypeError):
+                # Record zonder bruikbaar tijdstip: niet te dateren, dus ook
+                # niet te vertrouwen als het de meter tegenspreekt.
+                return True
+
+        removed = [
+            e for e in self._entries
+            if self._entry_month(e) == month and is_wrong(e)
+        ]
+        record = self._monthly_peaks.get(month)
+        record_wrong = record is not None and is_wrong(record)
+        if not removed and not record_wrong:
+            return []
+
+        if record_wrong and not any(e["ts"] == record["ts"] for e in removed):
+            # Het record verwijst naar een kwartier dat niet (meer) in de
+            # historiek zit.
+            removed.append(dict(record))
+        removed_ts = {e["ts"] for e in removed}
+        self._entries = deque(
+            (e for e in self._entries if e["ts"] not in removed_ts),
+            maxlen=_MAX_ENTRIES,
+        )
+        # Record van de lopende maand opnieuw opbouwen uit wat overblijft.
+        self._monthly_peaks.pop(month, None)
+        for e in self._entries:
+            if self._entry_month(e) == month:
+                self._record_month_peak(e["ts"], e["kw"])
+        await self.async_save()
+
+        new_peak = self._monthly_peaks.get(month)
+        _LOGGER.warning(
+            "QuarterStore: %d kwartier(en) verwijderd uit maand %04d-%02d omdat "
+            "ze boven de maandpiek van de P1-meter liggen (meter: %.2f kW, "
+            "grens: %.2f kW): %s. Maandpiek is nu %s.",
+            len(removed), month[0], month[1], meter_peak_kw, limit,
+            ", ".join(f"{e['ts']} = {e['kw']:.2f} kW" for e in removed),
+            f"{new_peak['kw']:.2f} kW" if new_peak else "onbekend",
+        )
+        return removed
 
     def _record_month_peak(self, ts: str, kw: float) -> None:
         """Verhoog het maandpiek-record van de maand van dit kwartier, indien hoger."""
