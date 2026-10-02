@@ -228,13 +228,7 @@ class PeakGuardPanel extends HTMLElement {
     if (!this._data?.config) return;
     const { consumption_sensor, peak_sensor, capacity_min_w, buffer_watts } = this._data.config;
 
-    const getVal = (id) => {
-      if (!id) return null;
-      const s = this._hass.states[id];
-      if (!s) return null;
-      const v = parseFloat(s.state);
-      return isNaN(v) ? null : v;
-    };
+    const getVal = (id) => (id ? this._powerW(this._hass.states[id]) : null);
 
     const consumption = getVal(consumption_sensor);
     const rawPeak = getVal(peak_sensor);
@@ -428,6 +422,17 @@ class PeakGuardPanel extends HTMLElement {
   //  Status kaarten                                                      //
   // ------------------------------------------------------------------ //
 
+  // Vermogen in W uit een HA-state (verbruiks- of maandpiek-sensor). Een
+  // sensor in kW wordt omgerekend — zelfde regel als read_power_w in
+  // deciders/base.py. Geeft null bij een ontbrekende of niet-numerieke state.
+  _powerW(stateObj) {
+    if (!stateObj) return null;
+    const v = parseFloat(stateObj.state);
+    if (isNaN(v)) return null;
+    const unit = String(stateObj.attributes?.unit_of_measurement ?? "").trim().toLowerCase();
+    return unit === "kw" ? v * 1000 : v;
+  }
+
   // Onder het capaciteitsminimum (2500 W) is geen capaciteitstarief
   // verschuldigd: Peak Guard stuurt nooit op een lagere maandpiek, ook al
   // meldt de P1-meter minder. Zelfde regel als effective_peak_w in utils.py.
@@ -454,13 +459,7 @@ class PeakGuardPanel extends HTMLElement {
 
   _renderStatusCards() {
     const cfg = this._data?.config || {};
-    const getVal = (id) => {
-      if (!id || !this._hass) return null;
-      const s = this._hass.states[id];
-      if (!s) return null;
-      const v = parseFloat(s.state);
-      return isNaN(v) ? null : v;
-    };
+    const getVal = (id) => (id && this._hass ? this._powerW(this._hass.states[id]) : null);
 
     const consumption = getVal(cfg.consumption_sensor);
     const rawPeak = getVal(cfg.peak_sensor);
@@ -1018,7 +1017,7 @@ class PeakGuardPanel extends HTMLElement {
     // Haal surpluswaarde op via de consumptiesensor
     const consumptionSensor = this._data?.config?.consumption_sensor;
     const consumptionState  = consumptionSensor ? this._hass?.states[consumptionSensor] : null;
-    const consumption       = consumptionState ? parseFloat(consumptionState.state) : 0;
+    const consumption       = this._powerW(consumptionState) ?? 0;
     const surplus_w         = (consumption < 0) ? Math.abs(consumption) : 0;
 
     const state  = guard.state ?? "idle";
@@ -2789,18 +2788,19 @@ class PeakGuardPanel extends HTMLElement {
       })),
     ].sort((a, b) => b.ts.localeCompare(a.ts)).slice(0, 100);
 
+    // Tijdstempels zijn UTC; tijd en dag worden in lokale tijd getoond.
     const fmtTs = (iso) => {
       if (!iso) return "—";
       const d = new Date(iso);
       if (isNaN(d.getTime())) return iso.slice(0, 16).replace("T", " ");
-      return `${String(d.getUTCHours()).padStart(2,"0")}:${String(d.getUTCMinutes()).padStart(2,"0")}`;
+      return `${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}`;
     };
 
     const dayKey = (iso) => {
       if (!iso) return "";
       const d = new Date(iso);
       if (isNaN(d.getTime())) return iso.slice(0, 10);
-      return `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,"0")}-${String(d.getUTCDate()).padStart(2,"0")}`;
+      return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
     };
 
     const fmtDayLabel = (key) => {
@@ -2809,7 +2809,7 @@ class PeakGuardPanel extends HTMLElement {
       const maanden = ["jan","feb","mrt","apr","mei","jun","jul","aug","sep","okt","nov","dec"];
       const now = new Date();
       const todayKey = dayKey(now.toISOString());
-      const yesterdayKey = dayKey(new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - 1)).toISOString());
+      const yesterdayKey = dayKey(new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1).toISOString());
       if (key === todayKey)     return `Vandaag — ${day} ${maanden[m-1]} ${y}`;
       if (key === yesterdayKey) return `Gisteren — ${day} ${maanden[m-1]} ${y}`;
       return `${day} ${maanden[m-1]} ${y}`;

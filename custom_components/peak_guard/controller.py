@@ -11,7 +11,7 @@ from homeassistant.helpers.storage import Store
 from .avoided_peak_tracker import PeakAvoidTracker, SolarShiftTracker
 from .decision_logger import DecisionLogger
 from .deciders import EVGuard, InjectionDecider, PeakDecider
-from .deciders.base import read_sensor
+from .deciders.base import read_power_w, read_sensor
 from .models import (
     BaseCascadeDevice,
     DeviceSnapshot,
@@ -377,14 +377,17 @@ class PeakGuardController:
         return max(raw, 60.0)
 
     def _read_consumption(self) -> Optional[float]:
-        """Return the current consumption in W (simulation takes priority)."""
+        """Return the current consumption in W (simulation takes priority).
+
+        A consumption sensor that reports in kW is converted to W.
+        """
         if self._simulation_consumption is not None:
             _LOGGER.warning(
                 "Peak Guard [SIMULATIE] verbruik=%.0f W (echte sensor genegeerd)",
                 self._simulation_consumption,
             )
             return self._simulation_consumption
-        return self._sensor_value(self.config.get(CONF_CONSUMPTION_SENSOR))
+        return read_power_w(self.hass, self.config.get(CONF_CONSUMPTION_SENSOR))
 
     async def _dispatch(self, consumption: float, now: datetime) -> None:
         """Run peak/inject cascade and restore logic for one loop tick."""

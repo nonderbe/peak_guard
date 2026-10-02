@@ -20,7 +20,7 @@ from ..const import (
 )
 from ..models import BaseCascadeDevice, DeviceSnapshot
 from ..utils import effective_peak_w
-from .base import BaseDecider
+from .base import BaseDecider, read_power_w
 
 if TYPE_CHECKING:
     from ..avoided_peak_tracker import PeakAvoidTracker, SolarShiftTracker
@@ -62,7 +62,6 @@ class PeakDecider(BaseDecider):
         )
         self._cascade = cascade
         self._snapshots = snapshots
-        self._kw_unit_warned = False
 
     # ------------------------------------------------------------------ #
     #  Publieke interface                                                  #
@@ -73,14 +72,13 @@ class PeakDecider(BaseDecider):
         Controleer of het verbruik de maandpiek − buffer overschrijdt.
         Zo ja, start de piek-cascade.
         """
-        raw_peak = self._sensor_value(self.config.get(CONF_PEAK_SENSOR))
+        raw_peak = read_power_w(self.hass, self.config.get(CONF_PEAK_SENSOR))
         if raw_peak is None:
             _LOGGER.warning(
                 "Peak Guard: piek-sensor '%s' niet beschikbaar — piekcheck overgeslagen",
                 self.config.get(CONF_PEAK_SENSOR),
             )
             return
-        self._warn_if_peak_sensor_in_kw()
         # Onder 2,5 kW is geen capaciteitstarief verschuldigd: stuur nooit
         # op een lagere piek dan dat minimum, ook al meldt de P1-meter minder.
         peak = effective_peak_w(raw_peak)
@@ -106,28 +104,6 @@ class PeakDecider(BaseDecider):
                 )
             await self._run_cascade(self._cascade, excess, self._snapshots, "peak", now)
 
-    def _warn_if_peak_sensor_in_kw(self) -> None:
-        """
-        Peak Guard rekent in W. Een piek-sensor in kW (bv. 3,2) wordt door de
-        2,5 kW-ondergrens altijd 2500 W en valt dus niet meer vanzelf op —
-        meld het één keer in de log.
-        """
-        if self._kw_unit_warned:
-            return
-        entity_id = self.config.get(CONF_PEAK_SENSOR)
-        state = self.hass.states.get(entity_id) if entity_id else None
-        attributes = getattr(state, "attributes", None) or {}
-        unit = str(attributes.get("unit_of_measurement") or "").strip().lower()
-        if unit != "kw":
-            return
-        self._kw_unit_warned = True
-        _LOGGER.warning(
-            "Peak Guard: piek-sensor '%s' rapporteert in kW, maar Peak Guard "
-            "rekent in W — de maandpiek wordt daardoor altijd als %.0f W gezien. "
-            "Kies een sensor in W.",
-            entity_id, effective_peak_w(0.0),
-        )
-
     async def check_restore(self, consumption: float, now: Optional[datetime] = None) -> None:
         """
         Controleer of eerder uitgeschakelde apparaten veilig hersteld kunnen
@@ -135,7 +111,7 @@ class PeakDecider(BaseDecider):
         """
         if not self._snapshots:
             return
-        raw_peak = self._sensor_value(self.config.get(CONF_PEAK_SENSOR))
+        raw_peak = read_power_w(self.hass, self.config.get(CONF_PEAK_SENSOR))
         if raw_peak is None:
             return
         peak = effective_peak_w(raw_peak)

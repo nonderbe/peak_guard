@@ -19,8 +19,10 @@ from __future__ import annotations
 import asyncio
 import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import ModuleType
 from typing import List
+from zoneinfo import ZoneInfo
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -42,6 +44,18 @@ class RestoreEntity:
     """Zie SensorEntity."""
 
 
+# Vaste tijdzone voor de tests: de maandgrens van het capaciteitstarief volgt
+# de lokale (Belgische) tijd, niet UTC.
+TEST_TIME_ZONE = ZoneInfo("Europe/Brussels")
+
+
+def _as_local(dt: datetime) -> datetime:
+    """Stand-in voor homeassistant.util.dt.as_local."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=TEST_TIME_ZONE)
+    return dt.astimezone(TEST_TIME_ZONE)
+
+
 def _mod(name: str, **attrs) -> ModuleType:
     m = ModuleType(name)
     for k, v in attrs.items():
@@ -49,8 +63,15 @@ def _mod(name: str, **attrs) -> ModuleType:
     return m
 
 
+_dt_util = _mod("homeassistant.util.dt",
+               as_local=_as_local,
+               DEFAULT_TIME_ZONE=TEST_TIME_ZONE,
+               utcnow=lambda: datetime.now(timezone.utc))
+
 sys.modules.update({
     "homeassistant":                         _mod("homeassistant"),
+    "homeassistant.util":                    _mod("homeassistant.util", dt=_dt_util),
+    "homeassistant.util.dt":                 _dt_util,
     "homeassistant.core":                    _mod("homeassistant.core",
                                                   HomeAssistant=object,
                                                   callback=lambda f: f),
@@ -98,7 +119,7 @@ sys.modules.update({
 #  Stap 2: custom_components-stub (omzeil __init__.py + controller.py)         #
 # ──────────────────────────────────────────────────────────────────────────── #
 
-_ROOT = "/Users/nielsonderbeke/Projects/peak_guard"
+_ROOT = str(Path(__file__).resolve().parent.parent)
 _PG   = f"{_ROOT}/custom_components/peak_guard"
 _DEC  = f"{_PG}/deciders"
 

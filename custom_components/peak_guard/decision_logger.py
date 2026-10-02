@@ -23,7 +23,7 @@ from .const import (
     CONF_UPDATE_INTERVAL,
     DOMAIN,
 )
-from .deciders.base import read_sensor
+from .deciders.base import read_power_w
 from .utils import effective_peak_w
 from .models import (
     BaseCascadeDevice,
@@ -78,7 +78,7 @@ class DecisionLogger:
         now_str = now_local.strftime("%Y-%m-%d %H:%M:%S")
         today_str = now_local.strftime("%Y-%m-%d")
 
-        raw_peak = read_sensor(self._hass, self._config.get(CONF_PEAK_SENSOR))
+        raw_peak = read_power_w(self._hass, self._config.get(CONF_PEAK_SENSOR))
         # Zelfde 2,5 kW-ondergrens als PeakDecider, zodat de log de grens toont
         # waarop werkelijk gestuurd wordt.
         peak = effective_peak_w(raw_peak) if raw_peak is not None else None

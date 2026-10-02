@@ -7,17 +7,23 @@ Slaat maximaal 30 dagen × 96 kwartieren = 2880 entries op in
 HA's persistente opslag (homeassistant.helpers.storage).
 
 Elke entry: {"ts": "2026-03-01T00:00:00+00:00", "kw": 3.141}
+
+Tijdstempels worden in UTC opgeslagen. De maand waartoe een kwartier behoort
+wordt in lokale tijd bepaald (utils.local_year_month): het capaciteitstarief
+loopt per kalendermaand in Belgische tijd.
 """
 
 from __future__ import annotations
 
 import logging
 from collections import deque
+from functools import lru_cache
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
+from homeassistant.util import dt as dt_util
 
 from .const import (
     CAPACITY_MIN_KW,
@@ -25,11 +31,23 @@ from .const import (
     STORAGE_VERSION_QUARTERS,
     QUARTER_HISTORY_DAYS,
 )
+from .utils import local_year_month
 
 _LOGGER = logging.getLogger(__name__)
 
 # Maximale entries = 30 dagen × 96 kwartieren per dag
 _MAX_ENTRIES = QUARTER_HISTORY_DAYS * 96
+
+
+@lru_cache(maxsize=2 * _MAX_ENTRIES)
+def _local_month_of(ts: str, time_zone: str) -> tuple[int, int]:
+    """(year, month) in lokale tijd voor een ISO-tijdstempel.
+
+    Gecachet: elke entry wordt per sensorupdate tientallen keren aan een
+    maand getoetst, en een tijdstempel verandert nooit van maand. De tijdzone
+    zit in de sleutel zodat een gewijzigde HA-tijdzone meteen doorwerkt.
+    """
+    return local_year_month(datetime.fromisoformat(ts))
 
 
 class QuarterStore:
@@ -96,8 +114,7 @@ class QuarterStore:
 
     def get_current_month_peak(self) -> Optional[float]:
         """Hoogste kwartierpiek-waarde voor de huidige maand (kW), of None."""
-        now = datetime.now(timezone.utc)
-        return self.get_month_peak(now.year, now.month)
+        return self.get_month_peak(*local_year_month(dt_util.utcnow()))
 
     def get_monthly_peaks_last_12(self) -> list[dict]:
         """
@@ -105,12 +122,12 @@ class QuarterStore:
 
         Elke entry: {"year": int, "month": int, "ts": str, "kw": float}
         """
-        now = datetime.now(timezone.utc)
+        current_year, current_month = local_year_month(dt_util.utcnow())
         results = []
         for delta in range(12):
             # Loop terug van de huidige maand
-            month = now.month - delta
-            year = now.year
+            month = current_month - delta
+            year = current_year
             while month <= 0:
                 month += 12
                 year -= 1
@@ -157,11 +174,10 @@ class QuarterStore:
 
     @staticmethod
     def _entry_month(entry: dict) -> tuple[int, int]:
-        """Geeft (year, month) voor een entry-dict."""
+        """Geeft (year, month) in lokale tijd voor een entry-dict."""
         try:
-            dt = datetime.fromisoformat(entry["ts"])
-            return (dt.year, dt.month)
-        except (KeyError, ValueError):
+            return _local_month_of(entry["ts"], str(dt_util.DEFAULT_TIME_ZONE))
+        except (KeyError, ValueError, TypeError):
             return (0, 0)
 
     def _peak_ts_for_month(self, year: int, month: int) -> Optional[str]:

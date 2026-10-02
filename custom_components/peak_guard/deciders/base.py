@@ -61,6 +61,22 @@ def read_sensor(hass: HomeAssistant, entity_id: Optional[str]) -> Optional[float
         return None
 
 
+def read_power_w(hass: HomeAssistant, entity_id: Optional[str]) -> Optional[float]:
+    """
+    Lees een vermogenssensor (verbruik of maandpiek) uit in W.
+
+    Peak Guard rekent in W. Rapporteert de sensor in kW (bv. de maandpiek van
+    de DSMR-integratie), dan wordt de waarde omgerekend; elke andere of
+    ontbrekende eenheid wordt als W gelezen.
+    """
+    value = read_sensor(hass, entity_id)
+    if value is None:
+        return None
+    attributes = getattr(hass.states.get(entity_id), "attributes", None) or {}
+    unit = str(attributes.get("unit_of_measurement") or "").strip().lower()
+    return value * 1000.0 if unit == "kw" else value
+
+
 class BaseDecider:
     def __init__(
         self,

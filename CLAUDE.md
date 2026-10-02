@@ -11,18 +11,27 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Validation / CI
 
-Local tests run with:
+Local tests run from a project virtualenv (the system Python is externally managed, so `pip install` into it is refused):
 ```
-python3 -m pytest tests/ -v
+python3 -m venv .venv && .venv/bin/python -m pip install -r requirements-test.txt   # once
+.venv/bin/python -m pytest tests/ -v
 ```
 
-The test suite uses stub modules in `tests/conftest.py` to avoid a live HA install. Four test files:
+`requirements-test.txt` (pytest, pytest-asyncio) is test tooling only — the integration itself still has no third-party dependencies.
+
+The test suite uses stub modules in `tests/conftest.py` to avoid a live HA install; the stubbed `homeassistant.util.dt.as_local` uses a fixed Europe/Brussels time zone. Seven test files:
 - `tests/test_ev_guard.py` — 48 tests covering the EV state machine, rate limiter, debounce, and Tesla-specific paths
 - `tests/test_tracker.py` — 21 tests covering the financial calculations in `PeakAvoidTracker` and `SolarShiftTracker`
-- `tests/test_peak_floor.py` — 26 tests covering the 2.5 kW capacity-tariff floor (decider, savings, billed peak, decision log)
-- `tests/test_month_rollover.py` — 3 tests covering the month/year rollover order in `SharedCapacityState`
+- `tests/test_peak_floor.py` — 24 tests covering the 2.5 kW capacity-tariff floor (decider, savings, billed peak, decision log)
+- `tests/test_month_rollover.py` — 4 tests covering the month/year rollover order in `SharedCapacityState`
+- `tests/test_power_units.py` — 10 tests covering kW → W conversion of the consumption and peak sensors
+- `tests/test_local_month.py` — 16 tests covering month/year boundaries in local time (quarter store, rollover, event-table timestamps)
+- `tests/test_startup_restore.py` — 11 tests covering the startup restore of the year total and the finalisation of months missed while HA was down
 
-GitHub Actions also runs on every push/PR to `main`:
+`controller.py` and the frontend panel are not importable in this harness and are not covered.
+
+GitHub Actions (`.github/workflows/validate.yml`) also runs on every push/PR to `main`:
+- **Tests** — the pytest suite on Python 3.13 and 3.14
 - **HACS validation** — checks integration structure, manifest, and metadata
 - **hassfest validation** — checks HA integration conformance
 
@@ -34,17 +43,17 @@ The integration lives entirely in `custom_components/peak_guard/`.
 
 1. **Setup** (`__init__.py` → `async_setup_entry`): Loads config, creates `PeakGuardController`, registers REST API endpoints (`/api/peak_guard/cascade`, `/api/peak_guard/force_check`), registers the sidebar panel, and starts the monitoring loop.
 
-2. **Monitoring loop** (`controller.py` → `_monitoring_loop_async`): Runs every 5–60 seconds (configurable). Reads current power and monthly peak from HA sensors, computes quarterly average via `QuarterCalculator`, then drives the **peak cascade** (turn devices off) or **inject cascade** (turn devices on) as needed.
+2. **Monitoring loop** (`controller.py` → `_monitor_loop`): Runs every `update_interval` seconds with a hard minimum of 60 s — `_resolve_interval()` raises lower configured values (including the default of 5) to 60 and logs a warning, to protect the EV API quota. The loop also wakes early on an EV entity state change or a `force_check` call (`trigger_wakeup()`). Each tick reads current power and the monthly peak from HA sensors, then drives the **peak cascade** (turn devices off) or **inject cascade** (turn devices on) as needed.
 
 3. **Cascade execution**: Devices in each cascade are stored as `_BaseCascadeDevice` subclass instances in priority order. The controller iterates them, calls `device.apply(excess, snapshots, ctx)` polymorphically, and records events in the appropriate tracker. `CascadeContext` bundles `hass`, trackers, `ev_guard`, and callbacks into a single dependency-injection object threaded through the loop.
 
 4. **Trackers** (`avoided_peak_tracker.py`, and the solar equivalent): Record avoidance/shift events through a 3-phase lifecycle (pending → active → completed), compute kW impact on the quarterly history, and calculate EUR savings using Fluvius 2026 tariffs from `const.py`.
 
-5. **Sensor updates** (`sensor.py`): 16+ read-only sensors are updated each monitoring cycle and also on a 1-minute interval. They expose quarter kW, monthly peak, capacity costs, savings, shifted kWh, etc.
+5. **Sensor updates** (`sensor.py`): 16+ read-only sensors are updated each monitoring cycle and also on a 1-minute interval. `SharedCapacityState` derives the quarterly average from the cumulative kWh sensor via `QuarterCalculator` on that timer. The sensors expose quarter kW, monthly peak, capacity costs, savings, shifted kWh, etc.
 
-6. **Frontend panel** (`frontend/peak_guard_panel.js`): A ~2000-line custom Web Component (no framework) that polls `/api/peak_guard/cascade` every 15 seconds, shows real-time status (countdown, last loop timestamp), and lets users drag-drop reorder devices and configure EV charger setups.
+6. **Frontend panel** (`frontend/peak_guard_panel.js`): A ~3500-line custom Web Component (no framework) that polls `/api/peak_guard/cascade` every 15 seconds, shows real-time status (countdown, last loop timestamp), and lets users drag-drop reorder devices and configure EV charger setups.
 
-7. **Persistence** (HA `Store` API): Three stores — cascade config (`peak_guard.cascade`), 30-day quarter history (`peak_guard.quarters`), and savings state (`peak_guard.savings`) — survive restarts.
+7. **Persistence** (HA `Store` API): Eight stores survive restarts — cascade config, 30-day quarter history, peak and solar year savings, peak and solar month state (events), per-device monthly savings, and the EV daily call budget. Keys are in `const.py` (`STORAGE_KEY_*`) and `sensor.py` (`_STORAGE_KEY_*_STATE`).
 
 ### Key classes
 
@@ -94,7 +103,7 @@ EV chargers are significantly more complex than simple switches. All logic lives
 - `FLUVIUS_REGIO_TARIEVEN`: 2026 capacity tariffs in €/kW/year, keyed by Flemish region name
 - `CAPACITY_MIN_KW = 2.5` — minimum billed monthly peak; see "2.5 kW capacity floor" below
 - `DEFAULT_BUFFER_WATTS = 100` — threshold margin in watts
-- `DEFAULT_UPDATE_INTERVAL = 5` — monitoring loop frequency in seconds
+- `DEFAULT_UPDATE_INTERVAL = 5` — configured monitoring loop interval in seconds; the controller enforces a 60 s minimum, so the effective default is 60 s
 - `DEFAULT_POWER_DETECTION_TOLERANCE_PERCENT = 10` — tolerance for "natural stop" detection
 - `DEFAULT_SOLAR_NETTO_EUR_PER_KWH = 0.25` — assumed injection savings in €/kWh
 
@@ -102,12 +111,24 @@ EV chargers are significantly more complex than simple switches. All logic lives
 
 Below `CAPACITY_MIN_KW` (2.5 kW) no extra capacity tariff is due, so there is no financial reason to limit consumption under it. The floor is applied in every place that uses the monthly peak:
 
-- **Control**: `PeakDecider.check()` / `check_restore()` pass the P1 peak-sensor reading through `utils.effective_peak_w()` (`max(raw, 2500 W)`). The cascade starts at `effective_peak − buffer`. An unavailable sensor still skips the check — it is never silently replaced by 2500 W. Because the floor would mask a peak sensor that reports in kW (3.2 → 2500 W), `_warn_if_peak_sensor_in_kw()` logs a one-time warning when the sensor's unit is kW.
+- **Control**: `PeakDecider.check()` / `check_restore()` pass the P1 peak-sensor reading through `utils.effective_peak_w()` (`max(raw, 2500 W)`). The cascade starts at `effective_peak − buffer`. An unavailable sensor still skips the check — it is never silently replaced by 2500 W.
 - **Savings**: `PeakAvoidTracker._avoided_kw()` computes `max(hypo, 2.5) − max(actual, 2.5)`, for both the month total and per-device attribution. Avoided peaks that stay entirely below 2.5 kW count as €0.
 - **Billed peak**: `QuarterStore.get_billed_avg_kw()` floors each monthly peak at 2.5 kW *before* averaging (Fluvius applies the minimum per month, not on the 12-month average).
 - **Display**: the decision log and the panel show the effective peak, plus the raw P1 value when it is lower. The panel gets the floor from `config.capacity_min_w` in `/api/peak_guard/cascade` rather than hard-coding it. "Huidig verbruik" is red at or above the effective peak and orange in the buffer zone below it (`peak − buffer < consumption < peak`), where the cascade is already shedding devices.
 
 Deliberately *not* floored: `sensor.peak_guard_monthly_peak_kw` (exposes the floored value as attribute `effectieve_piek_kw`), the historical monthly peaks and the raw rolling 12-month average — these keep showing measured values.
+
+### Power units (W vs kW)
+
+Peak Guard computes in W. The consumption sensor and the monthly-peak sensor are read through `deciders/base.py::read_power_w()`, which multiplies by 1000 when the entity's `unit_of_measurement` is kW (case-insensitive) and treats any other or missing unit as W. The panel applies the same rule in `_powerW()`. This matters because the floor would otherwise mask a kW peak sensor (3.2 → 2500 W). Device power sensors and other entities still go through plain `read_sensor()`.
+
+### Time: stored in UTC, calendar boundaries in local time
+
+Fluvius bills the capacity tariff per calendar month in Belgian time and the P1 meter resets its monthly peak at local midnight. All timestamps are stored and compared in UTC, but everything that assigns a moment to a month or year goes through `utils.local_year_month()` (HA's configured time zone via `dt_util.as_local`): `QuarterStore` month peaks, the month/year rollover and persistence keys in `SharedCapacityState`, and the startup restore. Event timestamps are shown in local time, both in the sensor attribute tables (`_fmt_ts`) and in the panel's event log (browser-local). Still UTC on purpose: the EV daily call budget day (`ev_call_budget.py`) and the EV API log file date.
+
+### Startup after a missed month change
+
+If HA was down across a month boundary, the live rollover in `SharedCapacityState._async_update` never ran. `sensor.py::restore_peak_tracker()` then keeps the stored year total as the year base (the stale month state is discarded), and `MonthlyDeviceSavingsStore.async_finalize_before()` freezes the still-open per-device records of earlier months with their last persisted values. The live rollover calls it too, because after a mid-month restart the tracker only knows devices with a new event.
 
 ## REST API
 

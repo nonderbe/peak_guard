@@ -136,26 +136,6 @@ class TestPeakDeciderFloor:
         await _decider(hass, ev_guard, device).check(9000.0)
         assert device.applied_excess == []
 
-    async def test_kw_peak_sensor_is_reported_once(self, hass, ev_guard, caplog):
-        """
-        Een piek-sensor in kW wordt door de vloer gemaskeerd (3,2 → 2500 W).
-        Dat moet zichtbaar zijn in de log, maar niet elke cyclus opnieuw.
-        """
-        hass.states.set(PEAK_SENSOR, "3.2", {"unit_of_measurement": "kW"})
-        decider = _decider(hass, ev_guard, FakeDevice())
-        with caplog.at_level("WARNING"):
-            await decider.check(1000.0)
-            await decider.check(1000.0)
-        unit_warnings = [r for r in caplog.records if "kW" in r.getMessage()]
-        assert len(unit_warnings) == 1
-        assert PEAK_SENSOR in unit_warnings[0].getMessage()
-
-    async def test_watt_peak_sensor_gives_no_unit_warning(self, hass, ev_guard, caplog):
-        hass.states.set(PEAK_SENSOR, "400", {"unit_of_measurement": "W"})
-        with caplog.at_level("WARNING"):
-            await _decider(hass, ev_guard, FakeDevice()).check(1000.0)
-        assert caplog.records == []
-
     async def test_restore_uses_floored_headroom(self, hass, ev_guard):
         """
         P1-piek 400 W, verbruik 1000 W, apparaat 1000 W.

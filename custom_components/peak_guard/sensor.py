@@ -51,10 +51,12 @@ from .const import (
     DEFAULT_SOLAR_NETTO_EUR_PER_KWH,
 )
 from homeassistant.helpers.storage import Store
+from homeassistant.util import dt as dt_util
 from .quarter_calculator import QuarterCalculator
 from .quarter_store import QuarterStore
 from .monthly_device_savings_store import MonthlyDeviceSavingsStore
 from .avoided_peak_tracker import PeakAvoidTracker, PeakEvent, SolarShiftTracker, SolarEvent
+from .utils import local_year_month
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -65,6 +67,72 @@ _UPDATE_INTERVAL = timedelta(minutes=1)
 _STORAGE_KEY_PEAK_STATE   = "peak_guard.peak_state"
 _STORAGE_KEY_SOLAR_STATE  = "peak_guard.solar_state"
 _STORAGE_VERSION_STATE    = 1
+
+
+def restore_peak_tracker(
+    peak_tracker: PeakAvoidTracker,
+    saved_year: Optional[dict],
+    peak_state: Optional[dict],
+    year: int,
+    month: int,
+) -> None:
+    """
+    Herstel de piekbesparing in de tracker vanuit de persistente opslag.
+
+    saved_year : inhoud van de jaarbesparing-store ({"year", "savings_euro_this_year"})
+    peak_state : inhoud van de maandstaat-store (events, maandbesparing, hypo-pieken)
+    year/month : de huidige kalendermaand in lokale tijd
+
+    De maandstaat wordt alleen hersteld als hij bij de huidige maand hoort.
+    De jaarbasis (jaartotaal min de lopende maand) wordt altijd afgeleid:
+    hoort de opgeslagen maandstaat bij een vorige maand — HA stond uit tijdens
+    de maandwissel — dan is de lopende maand nog leeg en telt het volledige
+    opgeslagen jaartotaal als basis. Zonder die stap overschrijft de eerste
+    herberekening het jaartotaal met enkel de nieuwe maand.
+    """
+    if saved_year and saved_year.get("year") == year:
+        peak_tracker.savings_euro_this_year = float(
+            saved_year.get("savings_euro_this_year", 0.0)
+        )
+
+    if (peak_state
+            and peak_state.get("year") == year
+            and peak_state.get("month") == month):
+        peak_tracker.avoided_kw_this_month   = float(peak_state.get("avoided_kw_this_month", 0.0))
+        peak_tracker.savings_euro_this_month = float(peak_state.get("savings_euro_this_month", 0.0))
+        # Herstel lijst van hypothetische pieken — zorgt dat _recalc_hypo() na herstart
+        # de hoogste bekende hypo als vloer gebruikt (in plaats van 0).
+        peak_tracker.hypothetical_peaks_this_month = [
+            float(v) for v in peak_state.get("hypothetical_peaks_this_month", [])
+        ]
+        for ev_dict in peak_state.get("events", []):
+            try:
+                ev = PeakEvent(
+                    device_id=ev_dict["device_id"],
+                    device_name=ev_dict["device_name"],
+                    nominal_kw=float(ev_dict["nominal_kw"]),
+                    avoid_ts=datetime.fromisoformat(ev_dict["avoid_ts"]),
+                    turnon_ts=datetime.fromisoformat(ev_dict["turnon_ts"]),
+                    natural_stop_ts=datetime.fromisoformat(ev_dict["natural_stop_ts"]),
+                    measured_duration_min=float(ev_dict["measured_duration_min"]),
+                    added_energy_kwh=float(ev_dict["added_energy_kwh"]),
+                    avoided_peak_kw=float(ev_dict["avoided_peak_kw"]),
+                    savings_euro=float(ev_dict["savings_euro"]),
+                    hypothetical_peak_kw=float(ev_dict.get("hypothetical_peak_kw", 0.0)),
+                )
+                peak_tracker.events.append(ev)
+            except (KeyError, ValueError):
+                pass
+        _LOGGER.info(
+            "Peak Guard: %d piek-events hersteld vanuit opslag (%d hypo-pieken)",
+            len(peak_tracker.events),
+            len(peak_tracker.hypothetical_peaks_this_month),
+        )
+
+    # Jaarbasis zodat _recalc_month_savings() de jaarbesparing correct herberekent.
+    peak_tracker._savings_euro_year_base = round(
+        max(0.0, peak_tracker.savings_euro_this_year - peak_tracker.savings_euro_this_month), 4
+    )
 
 
 async def async_setup_entry(
@@ -94,80 +162,45 @@ async def async_setup_entry(
     ))
     solar_tracker.set_netto_eur_per_kwh(netto_eur)
 
-    # Laad persistente jaarbesparingen — piek
+    # De opgeslagen staat hoort bij een kalendermaand/-jaar in lokale tijd.
+    current_year, current_month = local_year_month(dt_util.utcnow())
+
+    # Laad persistente jaarbesparingen, events en maandstatistieken — piek
     savings_store = Store(hass, STORAGE_VERSION_SAVINGS, STORAGE_KEY_SAVINGS)
     saved_data = await savings_store.async_load()
-    if saved_data:
-        current_year = datetime.now(timezone.utc).year
-        if saved_data.get("year") == current_year:
-            peak_tracker.savings_euro_this_year = float(
-                saved_data.get("savings_euro_this_year", 0.0)
-            )
+    peak_state_store = Store(hass, _STORAGE_VERSION_STATE, _STORAGE_KEY_PEAK_STATE)
+    peak_state = await peak_state_store.async_load()
+    restore_peak_tracker(
+        peak_tracker, saved_data, peak_state, current_year, current_month
+    )
 
     # Laad persistente jaarbesparingen — solar
     solar_savings_store = Store(hass, STORAGE_VERSION_SOLAR_SAVINGS, STORAGE_KEY_SOLAR_SAVINGS)
     solar_saved = await solar_savings_store.async_load()
     if solar_saved:
-        current_year = datetime.now(timezone.utc).year
         if solar_saved.get("year") == current_year:
             solar_tracker.savings_euro_this_year = float(
                 solar_saved.get("savings_euro_this_year", 0.0)
             )
 
-    # Laad persistente events en maandstatistieken — piek
-    peak_state_store = Store(hass, _STORAGE_VERSION_STATE, _STORAGE_KEY_PEAK_STATE)
-    peak_state = await peak_state_store.async_load()
-    if peak_state:
-        current_month = datetime.now(timezone.utc).month
-        current_year  = datetime.now(timezone.utc).year
-        if (peak_state.get("year") == current_year
-                and peak_state.get("month") == current_month):
-            peak_tracker.avoided_kw_this_month   = float(peak_state.get("avoided_kw_this_month", 0.0))
-            peak_tracker.savings_euro_this_month  = float(peak_state.get("savings_euro_this_month", 0.0))
-            # Herstel lijst van hypothetische pieken — zorgt dat _recalc_hypo() na herstart
-            # de hoogste bekende hypo als vloer gebruikt (in plaats van 0).
-            peak_tracker.hypothetical_peaks_this_month = [
-                float(v) for v in peak_state.get("hypothetical_peaks_this_month", [])
-            ]
-            # Herstel jaarbasis zodat _recalc_month_savings() de jaarbesparing correct herberekent.
-            peak_tracker._savings_euro_year_base = round(
-                max(0.0, peak_tracker.savings_euro_this_year - peak_tracker.savings_euro_this_month), 4
-            )
-            # Herstel events
-            for ev_dict in peak_state.get("events", []):
-                try:
-                    ev = PeakEvent(
-                        device_id=ev_dict["device_id"],
-                        device_name=ev_dict["device_name"],
-                        nominal_kw=float(ev_dict["nominal_kw"]),
-                        avoid_ts=datetime.fromisoformat(ev_dict["avoid_ts"]),
-                        turnon_ts=datetime.fromisoformat(ev_dict["turnon_ts"]),
-                        natural_stop_ts=datetime.fromisoformat(ev_dict["natural_stop_ts"]),
-                        measured_duration_min=float(ev_dict["measured_duration_min"]),
-                        added_energy_kwh=float(ev_dict["added_energy_kwh"]),
-                        avoided_peak_kw=float(ev_dict["avoided_peak_kw"]),
-                        savings_euro=float(ev_dict["savings_euro"]),
-                        hypothetical_peak_kw=float(ev_dict.get("hypothetical_peak_kw", 0.0)),
-                    )
-                    peak_tracker.events.append(ev)
-                except (KeyError, ValueError):
-                    pass
-            _LOGGER.info(
-                "Peak Guard: %d piek-events hersteld vanuit opslag (%d hypo-pieken)",
-                len(peak_tracker.events),
-                len(peak_tracker.hypothetical_peaks_this_month),
-            )
-
     # Laad persistente maandhistoriek van piekbesparing per apparaat
     device_savings_store = MonthlyDeviceSavingsStore(hass)
     await device_savings_store.async_load()
+    # Stond HA uit tijdens een maandwissel, dan is die maand nooit afgesloten.
+    closed = await device_savings_store.async_finalize_before(
+        current_year, current_month
+    )
+    if closed:
+        _LOGGER.info(
+            "Peak Guard: %d open maandrecord(s) per apparaat van vorige "
+            "maanden alsnog bevroren (maandwissel gemist terwijl HA uit stond)",
+            closed,
+        )
 
     # Laad persistente events en maandstatistieken — solar
     solar_state_store = Store(hass, _STORAGE_VERSION_STATE, _STORAGE_KEY_SOLAR_STATE)
     solar_state = await solar_state_store.async_load()
     if solar_state:
-        current_month = datetime.now(timezone.utc).month
-        current_year  = datetime.now(timezone.utc).year
         if (solar_state.get("year") == current_year
                 and solar_state.get("month") == current_month):
             solar_tracker.shifted_kwh_this_month  = float(solar_state.get("shifted_kwh_this_month", 0.0))
@@ -359,8 +392,8 @@ class SharedCapacityState:
             )
 
         # Jaar/maand-reset + context voor BEIDE trackers
-        current_month = now.month
-        current_year  = now.year
+        # In lokale tijd: het capaciteitstarief loopt per Belgische kalendermaand.
+        current_year, current_month = local_year_month(now)
 
         year_changed = (
             self._current_year is not None and current_year != self._current_year
@@ -387,6 +420,12 @@ class SharedCapacityState:
                         avoided_kw=d["avoided_kw"], savings_euro=d["savings_euro"],
                         finalized=True,
                     )
+                # Na een herstart midden in de maand levert de tracker alleen
+                # nog apparaten met een nieuw event aan. Sluit daarom ook de
+                # overige open records van vorige maanden in de opslag af.
+                await self._device_savings_store.async_finalize_before(
+                    current_year, current_month
+                )
                 _LOGGER.info(
                     "Peak Guard: maandbesparing per apparaat bevroren voor %04d-%02d",
                     self._current_year, self._current_month,
@@ -436,7 +475,7 @@ class SharedCapacityState:
             val = self._peak_tracker.savings_euro_this_year
             if val != self._last_persisted_peak_savings:
                 await self._savings_store.async_save({
-                    "year": now.year, "savings_euro_this_year": val,
+                    "year": current_year, "savings_euro_this_year": val,
                 })
                 self._last_persisted_peak_savings = val
 
@@ -445,7 +484,7 @@ class SharedCapacityState:
             val = self._solar_tracker.savings_euro_this_year
             if val != self._last_persisted_solar_savings:
                 await self._solar_savings_store.async_save({
-                    "year": now.year, "savings_euro_this_year": val,
+                    "year": current_year, "savings_euro_this_year": val,
                 })
                 self._last_persisted_solar_savings = val
 
@@ -471,8 +510,8 @@ class SharedCapacityState:
                     for e in self._peak_tracker.events
                 ]
                 await self._peak_state_store.async_save({
-                    "year":                  now.year,
-                    "month":                 now.month,
+                    "year":                  current_year,
+                    "month":                 current_month,
                     "avoided_kw_this_month": self._peak_tracker.avoided_kw_this_month,
                     "savings_euro_this_month": msv,
                     "hypothetical_peaks_this_month": list(self._peak_tracker.hypothetical_peaks_this_month),
@@ -491,7 +530,7 @@ class SharedCapacityState:
                 fingerprint = (d["hypothetical_peak_kw"], d["avoided_kw"])
                 if self._last_persisted_device_hypo.get(device_id) != fingerprint:
                     await self._device_savings_store.async_upsert(
-                        year=now.year, month=now.month,
+                        year=current_year, month=current_month,
                         device_id=device_id, device_name=d["device_name"],
                         hypothetical_peak_kw=d["hypothetical_peak_kw"],
                         actual_monthly_peak_kw=d["actual_monthly_peak_kw"],
@@ -519,8 +558,8 @@ class SharedCapacityState:
                     for e in self._solar_tracker.events
                 ]
                 await self._solar_state_store.async_save({
-                    "year":                   now.year,
-                    "month":                  now.month,
+                    "year":                   current_year,
+                    "month":                  current_month,
                     "shifted_kwh_this_month": self._solar_tracker.shifted_kwh_this_month,
                     "savings_euro_this_month": msv,
                     "events":                 events_data,
@@ -534,12 +573,12 @@ class SharedCapacityState:
 
     @staticmethod
     def _entry_in_current_month(entry: dict, now: datetime) -> bool:
-        """True als de entry tot de huidige maand behoort."""
+        """True als de entry tot de huidige (lokale) kalendermaand behoort."""
         try:
-            dt = datetime.fromisoformat(entry["ts"])
-            return dt.year == now.year and dt.month == now.month
-        except (KeyError, ValueError):
+            entry_month = local_year_month(datetime.fromisoformat(entry["ts"]))
+        except (KeyError, ValueError, TypeError):
             return False
+        return entry_month == local_year_month(now)
 
     def _read_energy(self) -> Optional[float]:
         """Lees de huidige kWh-waarde van de energiesensor."""
@@ -1466,9 +1505,9 @@ class OverviewRecentEventsSensor(_OverviewBase):
 
     @staticmethod
     def _fmt_ts(iso: str) -> str:
-        """ISO-timestamp naar leesbare notatie: '21 mrt 14:03'."""
+        """ISO-timestamp naar leesbare notatie in lokale tijd: '21 mrt 14:03'."""
         try:
-            dt = datetime.fromisoformat(iso)
+            dt = dt_util.as_local(datetime.fromisoformat(iso))
             maanden = ["jan","feb","mrt","apr","mei","jun",
                        "jul","aug","sep","okt","nov","dec"]
             return f"{dt.day} {maanden[dt.month - 1]} {dt.strftime('%H:%M')}"

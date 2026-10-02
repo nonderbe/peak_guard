@@ -29,8 +29,14 @@ class FakeDeviceSavingsStore:
     def __init__(self) -> None:
         self.upserts: list[dict] = []
 
+        self.finalize_calls: list[tuple[int, int]] = []
+
     async def async_upsert(self, **kwargs) -> None:
         self.upserts.append(kwargs)
+
+    async def async_finalize_before(self, year: int, month: int) -> int:
+        self.finalize_calls.append((year, month))
+        return 0
 
 
 def _shared(device_store: FakeDeviceSavingsStore):
@@ -103,3 +109,18 @@ class TestYearRollover:
 
         assert peak.savings_euro_this_month == 0.0
         assert peak.savings_euro_this_year == pytest.approx(25.0)
+
+    async def test_month_change_closes_all_open_records_of_earlier_months(self):
+        """
+        Na een herstart midden in de maand kent de tracker alleen nog de
+        apparaten met een nieuw event. De maandwissel moet daarom ook de
+        records in de opslag afsluiten die de tracker niet meer aanlevert.
+        """
+        device_store = FakeDeviceSavingsStore()
+        shared, peak = _shared(device_store)
+        await shared._async_update(datetime(2026, 11, 30, 22, 0, tzinfo=timezone.utc))
+        assert device_store.finalize_calls == []
+
+        await shared._async_update(datetime(2026, 12, 1, 0, 1, tzinfo=timezone.utc))
+
+        assert device_store.finalize_calls == [(2026, 12)]

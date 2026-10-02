@@ -10,7 +10,9 @@ maandpiek op dat moment en de resulterende kW- en EUR-besparing
 
 Elke entry wordt continu bijgewerkt zolang de maand loopt ("finalized": False)
 en definitief bevroren zodra de maand afsluit ("finalized": True) — zie
-SharedCapacityState._async_update in sensor.py. Zo overleeft de attributie
+SharedCapacityState._async_update in sensor.py. Een maandwissel die gemist
+wordt omdat Home Assistant uit stond, wordt bij de volgende start alsnog
+afgesloten via async_finalize_before(). Zo overleeft de attributie
 per apparaat de maandwissel, in tegenstelling tot de events-log en
 hypothetical_peaks_this_month, die bij reset_month() verloren gaan.
 """
@@ -96,6 +98,30 @@ class MonthlyDeviceSavingsStore:
                 "finalized": finalized,
             })
         await self.async_save()
+
+    async def async_finalize_before(self, year: int, month: int) -> int:
+        """
+        Bevries alle nog open records van maanden vóór (year, month).
+
+        Vangt de maandwissel op die gemist wordt als Home Assistant uit staat
+        op het moment van de wissel: de record van die maand blijft dan op
+        finalized=False staan. De opgeslagen waarden zijn de laatst bekende
+        stand van die maand (ze worden bij elke wijziging weggeschreven), dus
+        ze worden ongewijzigd bevroren. Geeft het aantal bevroren records terug.
+        """
+        closed = 0
+        for e in self._entries:
+            entry_year, entry_month = e.get("year"), e.get("month")
+            # Sla beschadigde records over: dit draait bij het opstarten en
+            # mag de sensor-setup nooit afbreken.
+            if not isinstance(entry_year, int) or not isinstance(entry_month, int):
+                continue
+            if (entry_year, entry_month) < (year, month) and not e.get("finalized"):
+                e["finalized"] = True
+                closed += 1
+        if closed:
+            await self.async_save()
+        return closed
 
     # ---------------------------------------------------------------- #
     #  Bevragen                                                         #
