@@ -2,7 +2,7 @@
 Peak Guard — deciders/peak_decider.py
 
 PeakDecider: bewaakt het kwartiervermogen en schakelt apparaten uit
-als het verbruik de maandpiek (+buffer) dreigt te overschrijden.
+als het verbruik de maandpiek (min. 2,5 kW) − buffer dreigt te overschrijden.
 Herstelt apparaten zodra er weer voldoende headroom is.
 """
 from __future__ import annotations
@@ -19,6 +19,7 @@ from ..const import (
     DEFAULT_BUFFER_WATTS,
 )
 from ..models import BaseCascadeDevice, DeviceSnapshot
+from ..utils import effective_peak_w
 from .base import BaseDecider
 
 if TYPE_CHECKING:
@@ -32,7 +33,7 @@ class PeakDecider(BaseDecider):
     """
     Beslisser voor piekbeperking (Modus 1).
 
-    check()         — overschrijdt het verbruik de piekgrens + buffer?
+    check()         — overschrijdt het verbruik de piekgrens − buffer?
                       Zo ja, start de cascade om apparaten uit te schakelen.
     check_restore() — is er genoeg headroom om eerder uitgeschakelde
                       apparaten te herstellen?
@@ -61,6 +62,7 @@ class PeakDecider(BaseDecider):
         )
         self._cascade = cascade
         self._snapshots = snapshots
+        self._kw_unit_warned = False
 
     # ------------------------------------------------------------------ #
     #  Publieke interface                                                  #
@@ -68,22 +70,26 @@ class PeakDecider(BaseDecider):
 
     async def check(self, consumption: float, now: Optional[datetime] = None) -> None:
         """
-        Controleer of het verbruik de maandpiek + buffer overschrijdt.
+        Controleer of het verbruik de maandpiek − buffer overschrijdt.
         Zo ja, start de piek-cascade.
         """
-        peak = self._sensor_value(self.config.get(CONF_PEAK_SENSOR))
-        if peak is None:
+        raw_peak = self._sensor_value(self.config.get(CONF_PEAK_SENSOR))
+        if raw_peak is None:
             _LOGGER.warning(
                 "Peak Guard: piek-sensor '%s' niet beschikbaar — piekcheck overgeslagen",
                 self.config.get(CONF_PEAK_SENSOR),
             )
             return
+        self._warn_if_peak_sensor_in_kw()
+        # Onder 2,5 kW is geen capaciteitstarief verschuldigd: stuur nooit
+        # op een lagere piek dan dat minimum, ook al meldt de P1-meter minder.
+        peak = effective_peak_w(raw_peak)
         buffer = float(self.config.get(CONF_BUFFER_WATTS, DEFAULT_BUFFER_WATTS))
         excess = consumption - peak + buffer
         _LOGGER.debug(
-            "Peak Guard _check_peak: verbruik=%.0f W, piek=%.0f W, "
+            "Peak Guard _check_peak: verbruik=%.0f W, piek=%.0f W (P1: %.0f W), "
             "buffer=%.0f W, overschot=%.0f W",
-            consumption, peak, buffer, excess,
+            consumption, peak, raw_peak, buffer, excess,
         )
         if excess > 0:
             enabled_devices = [d for d in self._cascade if d.enabled]
@@ -100,6 +106,28 @@ class PeakDecider(BaseDecider):
                 )
             await self._run_cascade(self._cascade, excess, self._snapshots, "peak", now)
 
+    def _warn_if_peak_sensor_in_kw(self) -> None:
+        """
+        Peak Guard rekent in W. Een piek-sensor in kW (bv. 3,2) wordt door de
+        2,5 kW-ondergrens altijd 2500 W en valt dus niet meer vanzelf op —
+        meld het één keer in de log.
+        """
+        if self._kw_unit_warned:
+            return
+        entity_id = self.config.get(CONF_PEAK_SENSOR)
+        state = self.hass.states.get(entity_id) if entity_id else None
+        attributes = getattr(state, "attributes", None) or {}
+        unit = str(attributes.get("unit_of_measurement") or "").strip().lower()
+        if unit != "kw":
+            return
+        self._kw_unit_warned = True
+        _LOGGER.warning(
+            "Peak Guard: piek-sensor '%s' rapporteert in kW, maar Peak Guard "
+            "rekent in W — de maandpiek wordt daardoor altijd als %.0f W gezien. "
+            "Kies een sensor in W.",
+            entity_id, effective_peak_w(0.0),
+        )
+
     async def check_restore(self, consumption: float, now: Optional[datetime] = None) -> None:
         """
         Controleer of eerder uitgeschakelde apparaten veilig hersteld kunnen
@@ -107,9 +135,10 @@ class PeakDecider(BaseDecider):
         """
         if not self._snapshots:
             return
-        peak = self._sensor_value(self.config.get(CONF_PEAK_SENSOR))
-        if peak is None:
+        raw_peak = self._sensor_value(self.config.get(CONF_PEAK_SENSOR))
+        if raw_peak is None:
             return
+        peak = effective_peak_w(raw_peak)
         buffer = float(self.config.get(CONF_BUFFER_WATTS, DEFAULT_BUFFER_WATTS))
         headroom = peak - buffer - consumption
         if headroom <= 0:

@@ -9,7 +9,7 @@ Twee volledig gescheiden trackers in één module:
       2. start_measurement_on_turnon(device_id, .) @ cascade herinschakeling
       3. complete_peak_calculation(device_id, now) @ natuurlijke power-drop
     Berekening: kW-impact op kwartierblokken vanaf avoid_ts.
-    Besparing : (hypo_peak − actual_peak) × tarief_eur_kw_jaar / 12
+    Besparing : (max(hypo_peak, 2,5) − max(actual_peak, 2,5)) × tarief_eur_kw_jaar / 12
 
   SolarShiftTracker  — modus 2: injectiepreventie
     Twee stappen:
@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional
 
+from .const import CAPACITY_MIN_KW
 from .utils import quarter_start as _quarter_start
 
 _LOGGER = logging.getLogger(__name__)
@@ -321,8 +322,9 @@ class PeakAvoidTracker:
         Voor elk apparaat dat dit maand minstens één piek-vermijdend event
         voltooide: vergelijk de hoogste hypothetische piek die dát apparaat
         alleen heeft vermeden met de werkelijke maandpiek — dezelfde
-        (hypo − actual) × tarief/12-methodologie als de globale maandbesparing,
-        maar per apparaat toegepast in plaats van gesommeerd over events.
+        (hypo − actual) × tarief/12-methodologie als de globale maandbesparing
+        (inclusief de 2,5 kW-ondergrens, zie _avoided_kw), maar per apparaat
+        toegepast in plaats van gesommeerd over events.
 
         Retourneert een lijst dicts, één per apparaat:
         device_id, device_name, hypothetical_peak_kw, actual_monthly_peak_kw,
@@ -330,7 +332,7 @@ class PeakAvoidTracker:
         """
         result: List[Dict[str, object]] = []
         for device_id, hypo in self.device_max_hypo_this_month.items():
-            avoided_kw = round(max(0.0, hypo - self._actual_monthly_peak), 4)
+            avoided_kw = self._avoided_kw(hypo)
             savings_euro = round(avoided_kw * self._tarief / 12.0, 4)
             result.append({
                 "device_id": device_id,
@@ -371,19 +373,29 @@ class PeakAvoidTracker:
         combined = max(live, floor)
         self.hypothetical_monthly_peak_kw = combined if combined > 0 else None
 
+    def _avoided_kw(self, hypo_kw: float) -> float:
+        """
+        Vermeden kW die ook echt geld oplevert: beide pieken worden eerst
+        opgetrokken naar CAPACITY_MIN_KW, want onder dat minimum wordt geen
+        extra capaciteitstarief aangerekend.
+        """
+        billed_hypo   = max(hypo_kw, CAPACITY_MIN_KW)
+        billed_actual = max(self._actual_monthly_peak, CAPACITY_MIN_KW)
+        return round(max(0.0, billed_hypo - billed_actual), 4)
+
     def _recalc_month_savings(self) -> None:
         """
         Herbereken maand- en jaarbesparing holistisch op basis van de huidige
         hypothetische maandpiek versus de werkelijke maandpiek.
 
         De maandbesparing is een enkelvoudige waarde:
-            (hypo_maandpiek − werkelijke_maandpiek) × tarief / 12
+            (max(hypo_maandpiek, 2,5) − max(werkelijke_maandpiek, 2,5)) × tarief / 12
 
         Dit voorkomt dat individuele events dubbel worden opgeteld, en zorgt
         dat een latere echte piek de besparing automatisch vermindert.
         """
         hypo = self.hypothetical_monthly_peak_kw or 0.0
-        self.avoided_kw_this_month  = round(max(0.0, hypo - self._actual_monthly_peak), 4)
+        self.avoided_kw_this_month  = self._avoided_kw(hypo)
         self.savings_euro_this_month = round(
             self.avoided_kw_this_month * self._tarief / 12.0, 4
         )

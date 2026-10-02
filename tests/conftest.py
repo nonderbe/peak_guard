@@ -33,6 +33,15 @@ class HomeAssistantError(Exception):
     """Echte Exception-klasse zodat 'except HomeAssistantError' werkt."""
 
 
+class SensorEntity:
+    """Eigen stub-klasse (niet `object`): sensor.py erft tegelijk van
+    SensorEntity en RestoreEntity, en twee keer `object` als basis mag niet."""
+
+
+class RestoreEntity:
+    """Zie SensorEntity."""
+
+
 def _mod(name: str, **attrs) -> ModuleType:
     m = ModuleType(name)
     for k, v in attrs.items():
@@ -60,7 +69,7 @@ sys.modules.update({
                                                   async_register_panel=AsyncMock()),
     "homeassistant.components.frontend":     _mod("homeassistant.components.frontend"),
     "homeassistant.components.sensor":       _mod("homeassistant.components.sensor",
-                                                  SensorEntity=object,
+                                                  SensorEntity=SensorEntity,
                                                   SensorDeviceClass=MagicMock(),
                                                   SensorStateClass=MagicMock()),
     "homeassistant.components.button":       _mod("homeassistant.components.button",
@@ -81,7 +90,7 @@ sys.modules.update({
     "homeassistant.helpers.entity_platform": _mod("homeassistant.helpers.entity_platform",
                                                   AddEntitiesCallback=object),
     "homeassistant.helpers.restore_state":   _mod("homeassistant.helpers.restore_state",
-                                                  RestoreEntity=object),
+                                                  RestoreEntity=RestoreEntity),
     "homeassistant.helpers.selector":        _mod("homeassistant.helpers.selector"),
 })
 
@@ -138,8 +147,9 @@ from custom_components.peak_guard.deciders.ev_guard import EVGuard  # noqa: E402
 
 class MockState:
     """Nep-state object zoals hass.states.get() retourneert."""
-    def __init__(self, state_str: str) -> None:
+    def __init__(self, state_str: str, attributes: dict | None = None) -> None:
         self.state = state_str
+        self.attributes = attributes or {}
         from datetime import timezone
         self.last_updated = datetime.now(timezone.utc)
 
@@ -147,13 +157,17 @@ class MockState:
 class MockStateRegistry:
     def __init__(self) -> None:
         self._states: dict[str, str] = {}
+        self._attributes: dict[str, dict] = {}
 
-    def set(self, entity_id: str, state_str: str) -> None:
+    def set(self, entity_id: str, state_str: str, attributes: dict | None = None) -> None:
         self._states[entity_id] = state_str
+        self._attributes[entity_id] = attributes or {}
 
     def get(self, entity_id: str):
         val = self._states.get(entity_id)
-        return MockState(val) if val is not None else None
+        if val is None:
+            return None
+        return MockState(val, self._attributes.get(entity_id))
 
 
 class MockServiceRegistry:

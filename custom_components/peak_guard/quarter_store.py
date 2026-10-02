@@ -20,6 +20,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
 
 from .const import (
+    CAPACITY_MIN_KW,
     STORAGE_KEY_QUARTERS,
     STORAGE_VERSION_QUARTERS,
     QUARTER_HISTORY_DAYS,
@@ -132,6 +133,19 @@ class QuarterStore:
         if not peaks:
             return None
         return round(sum(p["kw"] for p in peaks) / len(peaks), 4)
+
+    def get_billed_avg_kw(self) -> float:
+        """
+        Aangerekende piek (kW): gemiddelde van de laatste 12 maandpieken,
+        waarbij elke maandpiek eerst wordt opgetrokken naar CAPACITY_MIN_KW —
+        Fluvius past het minimum per maand toe, niet op het gemiddelde.
+        """
+        peaks = self.get_monthly_peaks_last_12()
+        if not peaks:
+            return CAPACITY_MIN_KW
+        return round(
+            sum(max(p["kw"], CAPACITY_MIN_KW) for p in peaks) / len(peaks), 4
+        )
 
     def get_all_entries(self) -> list[dict]:
         """Alle opgeslagen entries (voor debugging/diagnostics)."""

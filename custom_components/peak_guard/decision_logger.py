@@ -24,6 +24,7 @@ from .const import (
     DOMAIN,
 )
 from .deciders.base import read_sensor
+from .utils import effective_peak_w
 from .models import (
     BaseCascadeDevice,
     EVChargerDevice,
@@ -77,9 +78,12 @@ class DecisionLogger:
         now_str = now_local.strftime("%Y-%m-%d %H:%M:%S")
         today_str = now_local.strftime("%Y-%m-%d")
 
-        peak = read_sensor(self._hass, self._config.get(CONF_PEAK_SENSOR))
+        raw_peak = read_sensor(self._hass, self._config.get(CONF_PEAK_SENSOR))
+        # Zelfde 2,5 kW-ondergrens als PeakDecider, zodat de log de grens toont
+        # waarop werkelijk gestuurd wordt.
+        peak = effective_peak_w(raw_peak) if raw_peak is not None else None
         buffer_w = float(self._config.get(CONF_BUFFER_WATTS, DEFAULT_BUFFER_WATTS))
-        target = (peak + buffer_w) if peak is not None else None
+        target = (peak - buffer_w) if peak is not None else None
 
         lines: list = []
 
@@ -101,6 +105,8 @@ class DecisionLogger:
 
         if peak is not None:
             lines.append(f"Maandpiek:         {peak:.0f} W")
+            if raw_peak < peak:
+                lines.append(f"Maandpiek (P1):    {raw_peak:.0f} W")
             lines.append(f"Buffer:            {buffer_w:.0f} W")
             lines.append(f"Target peak:       {target:.0f} W")
         else:

@@ -16,9 +16,11 @@ Local tests run with:
 python3 -m pytest tests/ -v
 ```
 
-The test suite uses stub modules in `tests/conftest.py` to avoid a live HA install. Two test files:
-- `tests/test_ev_guard.py` — 38 tests covering the EV state machine, rate limiter, debounce, and Tesla-specific paths
-- `tests/test_tracker.py` — 16 tests covering the financial calculations in `PeakAvoidTracker` and `SolarShiftTracker`
+The test suite uses stub modules in `tests/conftest.py` to avoid a live HA install. Four test files:
+- `tests/test_ev_guard.py` — 48 tests covering the EV state machine, rate limiter, debounce, and Tesla-specific paths
+- `tests/test_tracker.py` — 21 tests covering the financial calculations in `PeakAvoidTracker` and `SolarShiftTracker`
+- `tests/test_peak_floor.py` — 26 tests covering the 2.5 kW capacity-tariff floor (decider, savings, billed peak, decision log)
+- `tests/test_month_rollover.py` — 3 tests covering the month/year rollover order in `SharedCapacityState`
 
 GitHub Actions also runs on every push/PR to `main`:
 - **HACS validation** — checks integration structure, manifest, and metadata
@@ -90,10 +92,22 @@ EV chargers are significantly more complex than simple switches. All logic lives
 ### Configuration constants (`const.py`)
 
 - `FLUVIUS_REGIO_TARIEVEN`: 2026 capacity tariffs in €/kW/year, keyed by Flemish region name
+- `CAPACITY_MIN_KW = 2.5` — minimum billed monthly peak; see "2.5 kW capacity floor" below
 - `DEFAULT_BUFFER_WATTS = 100` — threshold margin in watts
 - `DEFAULT_UPDATE_INTERVAL = 5` — monitoring loop frequency in seconds
 - `DEFAULT_POWER_DETECTION_TOLERANCE_PERCENT = 10` — tolerance for "natural stop" detection
 - `DEFAULT_SOLAR_NETTO_EUR_PER_KWH = 0.25` — assumed injection savings in €/kWh
+
+### 2.5 kW capacity floor
+
+Below `CAPACITY_MIN_KW` (2.5 kW) no extra capacity tariff is due, so there is no financial reason to limit consumption under it. The floor is applied in every place that uses the monthly peak:
+
+- **Control**: `PeakDecider.check()` / `check_restore()` pass the P1 peak-sensor reading through `utils.effective_peak_w()` (`max(raw, 2500 W)`). The cascade starts at `effective_peak − buffer`. An unavailable sensor still skips the check — it is never silently replaced by 2500 W. Because the floor would mask a peak sensor that reports in kW (3.2 → 2500 W), `_warn_if_peak_sensor_in_kw()` logs a one-time warning when the sensor's unit is kW.
+- **Savings**: `PeakAvoidTracker._avoided_kw()` computes `max(hypo, 2.5) − max(actual, 2.5)`, for both the month total and per-device attribution. Avoided peaks that stay entirely below 2.5 kW count as €0.
+- **Billed peak**: `QuarterStore.get_billed_avg_kw()` floors each monthly peak at 2.5 kW *before* averaging (Fluvius applies the minimum per month, not on the 12-month average).
+- **Display**: the decision log and the panel show the effective peak, plus the raw P1 value when it is lower. The panel gets the floor from `config.capacity_min_w` in `/api/peak_guard/cascade` rather than hard-coding it. "Huidig verbruik" is red at or above the effective peak and orange in the buffer zone below it (`peak − buffer < consumption < peak`), where the cascade is already shedding devices.
+
+Deliberately *not* floored: `sensor.peak_guard_monthly_peak_kw` (exposes the floored value as attribute `effectieve_piek_kw`), the historical monthly peaks and the raw rolling 12-month average — these keep showing measured values.
 
 ## REST API
 

@@ -31,6 +31,7 @@ from .const import (
     DEFAULT_UPDATE_INTERVAL,
     DEFAULT_POWER_DETECTION_TOLERANCE_PERCENT,
     ACTION_EV_CHARGER,
+    CAPACITY_MIN_KW,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -177,6 +178,7 @@ class PeakGuardController:
                 "peak_sensor":        self.config.get(CONF_PEAK_SENSOR),
                 "buffer_watts":       self.config.get(CONF_BUFFER_WATTS, DEFAULT_BUFFER_WATTS),
                 "update_interval":    self.config.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL),
+                "capacity_min_w":     CAPACITY_MIN_KW * 1000.0,
             },
             "status": {
                 "monitoring":   self._monitoring,

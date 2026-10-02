@@ -351,8 +351,7 @@ class SharedCapacityState:
         self.historical_peaks = self.store.get_monthly_peaks_last_12()
         self.rolling_avg_kw = self.store.get_rolling_12_month_avg()
 
-        rolling = self.rolling_avg_kw if self.rolling_avg_kw is not None else 0.0
-        self.billed_peak_kw = round(max(rolling, CAPACITY_MIN_KW), 4)
+        self.billed_peak_kw = self.store.get_billed_avg_kw()
 
         if self.billed_peak_kw is not None:
             self.monthly_cost_euro = round(
@@ -363,15 +362,18 @@ class SharedCapacityState:
         current_month = now.month
         current_year  = now.year
 
-        if self._current_year is not None and current_year != self._current_year:
-            if self._peak_tracker:
-                self._peak_tracker.reset_year()
-            if self._solar_tracker:
-                self._solar_tracker.reset_year()
-            _LOGGER.info("Peak Guard: nieuw jaar — jaarbesparingen gereset")
-        self._current_year = current_year
+        year_changed = (
+            self._current_year is not None and current_year != self._current_year
+        )
+        month_changed = year_changed or (
+            self._current_month is not None and current_month != self._current_month
+        )
 
-        if self._current_month is not None and current_month != self._current_month:
+        # Volgorde is belangrijk: sluit eerst de afgelopen maand af (onder het
+        # oude jaar), reset daarna pas het jaar. reset_month() telt de maand bij
+        # de jaarbasis op; in de omgekeerde volgorde lekt december in het
+        # nieuwe jaar en wordt hij onder het verkeerde jaartal bevroren.
+        if month_changed:
             # Bevries de per-apparaat besparing van de afgelopen maand vóórdat
             # de tracker gereset wordt — anders gaat device_max_hypo_this_month
             # onherroepelijk verloren (zie reset_month()).
@@ -401,6 +403,14 @@ class SharedCapacityState:
             self._last_persisted_device_hypo        = {}
             _LOGGER.info("Peak Guard: nieuwe maand — trackers gereset")
         self._current_month = current_month
+
+        if year_changed:
+            if self._peak_tracker:
+                self._peak_tracker.reset_year()
+            if self._solar_tracker:
+                self._solar_tracker.reset_year()
+            _LOGGER.info("Peak Guard: nieuw jaar — jaarbesparingen gereset")
+        self._current_year = current_year
 
         # Injecteer kwartierdata in piek-tracker
         if self._peak_tracker is not None:
@@ -613,6 +623,16 @@ class MonthlyPeakSensor(PeakGuardSensorBase):
         v = self._shared.monthly_peak_kw
         return round(v, 3) if v is not None else None
 
+    @property
+    def extra_state_attributes(self) -> dict:
+        v = self._shared.monthly_peak_kw
+        return {
+            "effectieve_piek_kw": (
+                round(max(v, CAPACITY_MIN_KW), 3) if v is not None else None
+            ),
+            "minimum_bijdrage_kw": CAPACITY_MIN_KW,
+        }
+
 
 # ------------------------------------------------------------------ #
 #  Sensor 3 — Historische maandpieken                                 #
@@ -673,8 +693,10 @@ class Rolling12MonthAvgSensor(PeakGuardSensorBase):
 
 class BilledPeakSensor(PeakGuardSensorBase):
     """
-    Aangerekende piek = max(voortschrijdend gemiddelde, 2,5 kW).
-    Dit is de waarde die Fluvius gebruikt voor de facturatie.
+    Aangerekende piek = gemiddelde van de laatste 12 maandpieken, waarbij
+    elke maandpiek minstens 2,5 kW telt — de methode die Fluvius gebruikt
+    voor de facturatie. Benadering: QuarterStore bewaart slechts
+    QUARTER_HISTORY_DAYS aan kwartieren, dus niet de volledige 12 maanden.
     """
 
     def __init__(self, shared: SharedCapacityState) -> None:
@@ -814,6 +836,9 @@ class HypotheticalMonthlyPeakSensor(_TrackerSensorBase):
         return {
             "actual_monthly_peak_kw": round(actual, 3),
             "verschil_kw": round((hypo or actual) - actual, 3),
+            # verschil_kw vergelijkt de gemeten waarden; alleen het deel boven
+            # de 2,5 kW-ondergrens levert ook echt een besparing op.
+            "verschil_boven_minimum_kw": round(self._tracker.avoided_kw_this_month, 3),
         }
 
 

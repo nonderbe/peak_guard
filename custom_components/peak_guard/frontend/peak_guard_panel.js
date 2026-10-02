@@ -226,7 +226,7 @@ class PeakGuardPanel extends HTMLElement {
 
   _updateLiveStatus() {
     if (!this._data?.config) return;
-    const { consumption_sensor, peak_sensor } = this._data.config;
+    const { consumption_sensor, peak_sensor, capacity_min_w, buffer_watts } = this._data.config;
 
     const getVal = (id) => {
       if (!id) return null;
@@ -237,10 +237,10 @@ class PeakGuardPanel extends HTMLElement {
     };
 
     const consumption = getVal(consumption_sensor);
-    const peak = getVal(peak_sensor);
+    const rawPeak = getVal(peak_sensor);
+    const peak = this._effectivePeak(rawPeak, capacity_min_w);
     const isInjecting = consumption != null && consumption < 0;
     const injectionValue = isInjecting ? Math.abs(consumption) : 0;
-    const overPeak = consumption != null && peak != null && consumption >= peak;
 
     const setTextAndClass = (selector, text, cls) => {
       const el = this.shadowRoot.querySelector(selector);
@@ -251,9 +251,11 @@ class PeakGuardPanel extends HTMLElement {
     setTextAndClass(
       "#status-consumption",
       consumption != null ? `${consumption.toFixed(0)} W` : "—",
-      overPeak ? "warning" : "ok"
+      this._consumptionClass(consumption, peak, buffer_watts)
     );
     setTextAndClass("#status-peak", peak != null ? `${peak.toFixed(0)} W` : "—");
+    const rawPeakEl = this.shadowRoot.querySelector("#status-peak-raw");
+    if (rawPeakEl) rawPeakEl.textContent = this._rawPeakNote(rawPeak, peak);
     setTextAndClass(
       "#status-injection",
       `${injectionValue.toFixed(0)} W`,
@@ -426,6 +428,30 @@ class PeakGuardPanel extends HTMLElement {
   //  Status kaarten                                                      //
   // ------------------------------------------------------------------ //
 
+  // Onder het capaciteitsminimum (2500 W) is geen capaciteitstarief
+  // verschuldigd: Peak Guard stuurt nooit op een lagere maandpiek, ook al
+  // meldt de P1-meter minder. Zelfde regel als effective_peak_w in utils.py.
+  _effectivePeak(rawPeak, capacityMinW) {
+    if (rawPeak == null) return null;
+    return Math.max(rawPeak, capacityMinW ?? 0);
+  }
+
+  // Kleur van "Huidig verbruik": rood zodra de maandpiek bereikt is, oranje
+  // in de bufferzone eronder (piek − buffer < verbruik < piek) — daar schakelt
+  // de piek-cascade al apparaten uit, zie PeakDecider.check().
+  _consumptionClass(consumption, peak, bufferW) {
+    if (consumption == null || peak == null || consumption <= 0) return "ok";
+    if (consumption >= peak) return "warning";
+    if (consumption > peak - (bufferW ?? 0)) return "caution";
+    return "ok";
+  }
+
+  _rawPeakNote(rawPeak, peak) {
+    return rawPeak != null && peak != null && rawPeak < peak
+      ? `P1: ${rawPeak.toFixed(0)} W`
+      : "";
+  }
+
   _renderStatusCards() {
     const cfg = this._data?.config || {};
     const getVal = (id) => {
@@ -437,16 +463,16 @@ class PeakGuardPanel extends HTMLElement {
     };
 
     const consumption = getVal(cfg.consumption_sensor);
-    const peak = getVal(cfg.peak_sensor);
+    const rawPeak = getVal(cfg.peak_sensor);
+    const peak = this._effectivePeak(rawPeak, cfg.capacity_min_w);
     const isInjecting = consumption != null && consumption < 0;
     const injectionValue = isInjecting ? Math.abs(consumption) : 0;
-    const overPeak = consumption != null && peak != null && consumption > 0 && consumption >= peak;
 
     return `
       <div class="status-row">
         <div class="status-card">
           <div class="label">Huidig verbruik</div>
-          <div class="value ${overPeak ? "warning" : "ok"}" id="status-consumption">
+          <div class="value ${this._consumptionClass(consumption, peak, cfg.buffer_watts)}" id="status-consumption">
             ${consumption != null ? `${consumption.toFixed(0)} W` : "—"}
           </div>
         </div>
@@ -455,6 +481,7 @@ class PeakGuardPanel extends HTMLElement {
           <div class="value" id="status-peak">
             ${peak != null ? `${peak.toFixed(0)} W` : "—"}
           </div>
+          <div class="sublabel" id="status-peak-raw">${this._rawPeakNote(rawPeak, peak)}</div>
         </div>
         <div class="status-card">
           <div class="label">Teruglevering</div>
@@ -2226,7 +2253,12 @@ class PeakGuardPanel extends HTMLElement {
         }
         .value { font-size: 1.9em; font-weight: 700; }
         .value.ok { color: #388e3c; }
+        .value.caution { color: #f57c00; }
         .value.warning { color: #d32f2f; }
+        .status-card .sublabel {
+          font-size: .8em; margin-top: 4px; min-height: 1.2em;
+          color: var(--secondary-text-color, #757575);
+        }
 
         .tabs {
           display: flex; border-bottom: 2px solid var(--divider-color, #e0e0e0);

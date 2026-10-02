@@ -152,14 +152,15 @@ class TestPeakAvoidTracker:
         """
         4 kW device avoided for a full 15-min quarter.
         Extra load in that quarter = 4 kW (1 kWh / 0.25 h).
-        With no actual load → hypo = 4 kW → avoided = 4 kW.
+        With no actual load → hypo = 4 kW. The actual peak (0 kW) is billed
+        at the 2.5 kW minimum, so only 4.0 − 2.5 = 1.5 kW is really avoided.
         """
         t = self._tracker(tarief=TARIEF)
         event = self._full_cycle(t, nominal_kw=4.0, duration_min=15.0)
         assert event is not None
-        assert event.avoided_peak_kw == pytest.approx(4.0)
-        # savings = 4.0 kW × (120 €/kW/year) / 12 months = 40 €
-        assert event.savings_euro == pytest.approx(40.0)
+        assert event.avoided_peak_kw == pytest.approx(1.5)
+        # savings = 1.5 kW × (120 €/kW/year) / 12 months = 15 €
+        assert event.savings_euro == pytest.approx(15.0)
 
     def test_hypothetical_peak_kw_field_is_populated(self):
         """event.hypothetical_peak_kw reflects the computed monthly hypo."""
@@ -260,6 +261,8 @@ class TestDeviceMonthlySavings:
         Tesla avoids 2 kW in one quarter, then Boiler avoids 5 kW in a later,
         distinct quarter. Each device's own snapshot reflects the hypo at the
         moment its event completed, so both keep their own genuine value.
+        With no actual load the billed peak is the 2.5 kW minimum: Tesla's
+        2 kW stays below it (nothing avoided), Boiler avoids 5.0 − 2.5 kW.
         """
         t = self._tracker(tarief=TARIEF)
         self._cycle(t, "tesla", "Tesla", nominal_kw=2.0, avoid_ts=Q)
@@ -267,11 +270,11 @@ class TestDeviceMonthlySavings:
 
         by_device = {d["device_id"]: d for d in t.get_device_monthly_savings()}
         assert by_device["tesla"]["hypothetical_peak_kw"] == pytest.approx(2.0)
-        assert by_device["tesla"]["avoided_kw"] == pytest.approx(2.0)
+        assert by_device["tesla"]["avoided_kw"] == pytest.approx(0.0)
         assert by_device["boiler"]["hypothetical_peak_kw"] == pytest.approx(5.0)
-        assert by_device["boiler"]["avoided_kw"] == pytest.approx(5.0)
+        assert by_device["boiler"]["avoided_kw"] == pytest.approx(2.5)
         # savings = avoided_kw × tarief / 12
-        assert by_device["boiler"]["savings_euro"] == pytest.approx(5.0 * TARIEF / 12)
+        assert by_device["boiler"]["savings_euro"] == pytest.approx(2.5 * TARIEF / 12)
 
     def test_later_higher_event_raises_the_devices_own_snapshot(self):
         """
