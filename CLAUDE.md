@@ -4,10 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this project is
 
-**Peak Guard** is a Home Assistant custom integration for Belgian electricity customers on Fluvius capacity-based tariffs. It has two operating modes:
+**Peak Guard** is a Home Assistant custom integration for Belgian electricity customers on Fluvius capacity-based tariffs. It has two operating modes, plus a charging schedule:
 
 1. **Modus 1 – Peak Limitation**: Turns off configured devices when the current quarterly average power threatens to exceed the monthly peak, then restores them once the threat passes. Tracks avoided peaks and calculates cost savings.
 2. **Modus 2 – Injection Prevention**: When solar surplus is injected into the grid, turns on consumers (EV charger, boiler, etc.) to shift that energy locally, avoiding poor sell-back rates.
+3. **Planning – charging schedule**: During configured windows (time windows, or a tariff sensor such as `sensor.p1_meter_tarief` = 2), charges an EV to a target SoC or keeps a switch on. Overrides Modus 2; Modus 1 keeps priority. See "Charging schedule" below.
 
 ## Validation / CI
 
@@ -19,7 +20,7 @@ python3 -m venv .venv && .venv/bin/python -m pip install -r requirements-test.tx
 
 `requirements-test.txt` (pytest, pytest-asyncio) is test tooling only — the integration itself still has no third-party dependencies.
 
-The test suite uses stub modules in `tests/conftest.py` to avoid a live HA install; the stubbed `homeassistant.util.dt.as_local` uses a fixed Europe/Brussels time zone. Eleven test files:
+The test suite uses stub modules in `tests/conftest.py` to avoid a live HA install; the stubbed `homeassistant.util.dt.as_local` uses a fixed Europe/Brussels time zone. Twelve test files:
 - `tests/test_ev_guard.py` — 48 tests covering the EV state machine, rate limiter, debounce, and Tesla-specific paths
 - `tests/test_tracker.py` — 21 tests covering the financial calculations in `PeakAvoidTracker` and `SolarShiftTracker`
 - `tests/test_peak_floor.py` — 24 tests covering the 2.5 kW capacity-tariff floor (decider, savings, billed peak, decision log)
@@ -31,6 +32,7 @@ The test suite uses stub modules in `tests/conftest.py` to avoid a live HA insta
 - `tests/test_quarter_calculator.py` — 10 tests covering `QuarterCalculator` when the meter reading drops and recovers or yields an impossible value, and non-finite sensor states
 - `tests/test_energy_units.py` — 7 tests covering Wh/MWh → kWh conversion of the energy sensor
 - `tests/test_peak_verification.py` — 16 tests covering the automatic removal of quarters and monthly records that contradict the P1 meter's monthly peak
+- `tests/test_schedule.py` — 63 tests covering the charging schedule: window logic (midnight, DST, overlap, tariff sensor), serialisation, `ScheduleDecider`, and the peak > schedule > injection interplay through `deciders/dispatch.run_tick`
 
 `controller.py` and the frontend panel are not importable in this harness and are not covered.
 
@@ -47,7 +49,7 @@ The integration lives entirely in `custom_components/peak_guard/`.
 
 1. **Setup** (`__init__.py` → `async_setup_entry`): Loads config, creates `PeakGuardController`, registers REST API endpoints (`/api/peak_guard/cascade`, `/api/peak_guard/force_check`), registers the sidebar panel, and starts the monitoring loop.
 
-2. **Monitoring loop** (`controller.py` → `_monitor_loop`): Runs every `update_interval` seconds with a hard minimum of 60 s — `_resolve_interval()` raises lower configured values (including the default of 5) to 60 and logs a warning, to protect the EV API quota. The loop also wakes early on an EV entity state change or a `force_check` call (`trigger_wakeup()`). Each tick reads current power and the monthly peak from HA sensors, then drives the **peak cascade** (turn devices off) or **inject cascade** (turn devices on) as needed.
+2. **Monitoring loop** (`controller.py` → `_monitor_loop`; the per-tick decider order is in `deciders/dispatch.py::run_tick`): Runs every `update_interval` seconds with a hard minimum of 60 s — `_resolve_interval()` raises lower configured values (including the default of 5) to 60 and logs a warning, to protect the EV API quota. The loop also wakes early on an EV entity state change or a `force_check` call (`trigger_wakeup()`). Each tick reads current power and the monthly peak from HA sensors, then drives the **peak cascade** (turn devices off) or **inject cascade** (turn devices on) as needed.
 
 3. **Cascade execution**: Devices in each cascade are stored as `_BaseCascadeDevice` subclass instances in priority order. The controller iterates them, calls `device.apply(excess, snapshots, ctx)` polymorphically, and records events in the appropriate tracker. `CascadeContext` bundles `hass`, trackers, `ev_guard`, and callbacks into a single dependency-injection object threaded through the loop.
 
@@ -57,7 +59,7 @@ The integration lives entirely in `custom_components/peak_guard/`.
 
 6. **Frontend panel** (`frontend/peak_guard_panel.js`): A ~3500-line custom Web Component (no framework) that polls `/api/peak_guard/cascade` every 15 seconds, shows real-time status (countdown, last loop timestamp), and lets users drag-drop reorder devices and configure EV charger setups.
 
-7. **Persistence** (HA `Store` API): Eight stores survive restarts — cascade config, quarter history with monthly peaks, peak and solar year savings, peak and solar month state (events), per-device monthly savings, and the EV daily call budget. Keys are in `const.py` (`STORAGE_KEY_*`) and `sensor.py` (`_STORAGE_KEY_*_STATE`).
+7. **Persistence** (HA `Store` API): Eight stores survive restarts — cascade config (incl. the charging schedule and its runtime state), quarter history with monthly peaks, peak and solar year savings, peak and solar month state (events), per-device monthly savings, and the EV daily call budget. Keys are in `const.py` (`STORAGE_KEY_*`) and `sensor.py` (`_STORAGE_KEY_*_STATE`).
 
 ### Key classes
 
@@ -68,7 +70,7 @@ The integration lives entirely in `custom_components/peak_guard/`.
 | `SwitchOffDevice` | `models.py` | Simple switch-off device (peak cascade) |
 | `SwitchOnDevice` | `models.py` | Simple switch-on device (inject cascade) |
 | `ThrottleDevice` | `models.py` | Throttleable device with min/max/power_per_unit |
-| `EVChargerDevice` | `models.py` | EV charger — all EV fields directly on the class (switch_entity, current_entity, phases, soc_entity, …) |
+| `EVChargerDevice` | `models.py` | EV charger — all EV fields directly on the class (switch_entity, current_entity, phases, soc_entity, charge_state_sensor, …) |
 | `CascadeContext` | `models.py` | Dependency-injection bag threaded through cascade loop (hass, trackers, ev_guard, callbacks) |
 | `from_dict()` | `models.py` | Factory that deserialises a dict into the correct subclass; migrates old `ev_*`-prefixed formats automatically |
 | `PeakAvoidTracker` | `avoided_peak_tracker.py` | Tracks peak avoidance events and computes kW/EUR impact |
@@ -76,7 +78,9 @@ The integration lives entirely in `custom_components/peak_guard/`.
 | `QuarterStore` | `quarter_store.py` | Persists the rolling 32-day quarter history and one monthly-peak record per month for 36 months |
 | `EVRateLimiter` | `models.py` | Sliding-window rate limiter (max 12 calls / 10 min, one instance shared globally across all EV devices on the `EVGuard`) |
 | `EVDailyCallBudget` | `ev_call_budget.py` | Persistent (HA `Store`) daily cap on real EV-API calls — long-horizon backstop above `EVRateLimiter`; survives restarts |
-| `EVDeviceGuard` | `models.py` | Per-device state machine for EV charger (idle → waiting_for_stable → charging → sleeping) |
+| `EVDeviceGuard` | `models.py` | Per-device state machine for EV charger (idle → waiting_for_stable → charging → sleeping); `scheduled` flag while the schedule drives it |
+| `ScheduleEntry` / `ScheduleWindow` | `models.py` | A scheduled device (a copy of a cascade device, same `id`) and its time/sensor windows |
+| `ScheduleDecider` | `deciders/schedule_decider.py` | Runs the charging schedule; decides ownership against the peak and inject cascades |
 
 `CascadeDevice` remains as a backward-compat alias for `_BaseCascadeDevice`.
 
@@ -101,6 +105,22 @@ EV chargers are significantly more complex than simple switches. All logic lives
 - **Wake-up support**: detects sleeping EV (via `status_sensor`), calls `wake_button`, waits up to `EV_WAKE_TIMEOUT_S`, then backs off for `EV_WAKE_COOLDOWN_S` on failure
 - **Location guard**: skips all action when `location_tracker` is present and EV is not home
 - **Manual-start detection**: if `switch_entity` reports `unknown`/`unavailable` but `status_sensor` confirms charging, the EV is treated as already on. This "handmatige start" path sets `guard.state = CHARGING` **and** calls `solar_tracker.start_solar_measurement` so the session is tracked even though Peak Guard didn't initiate it. Relevant for Tesla, whose switch entity is permanently `unknown`.
+
+### Charging schedule (Planning tab)
+
+`schedule.py` holds the pure window logic and parsing; `deciders/schedule_decider.py` the control. Entries are stored in the cascade store under `schedule`, runtime state (active window, fulfilled, pending stop/rest limit, tariff-sensor memory) under `schedule_state`. REST: POST `/api/peak_guard/cascade` with `type: "schedule"`, `entries: [...]`; GET returns `schedule` and `status.schedule`.
+
+- **Windows**: `kind="time"` (start days, `start`/`end` in local wall-clock time; `end <= start` runs into the next day, `start == end` is 24 h) or `kind="sensor"` (active while the sensor equals `active_state`, numeric states normalised so `2.0 == 2`). A tariff sensor that goes unavailable keeps its last state for `SCHEDULE_SENSOR_STALE_S` (15 min), and for the first 15 min after a (re)start regardless of age (the last state is persisted at least every 5 min), so a restart doesn't end and restart a window. Active = any window active; overlapping windows take the highest `target_soc`. Edges are detected on that merged state.
+- **Ownership per tick**: peak (peak snapshot) > schedule (window active, EV target not reached) > solar (inject snapshot). `InjectionDecider` skips schedule-owned devices (`is_controlled`); `PeakDecider.check_restore` skips scheduled EVs (`skip_peak_restore`) because restoring an EV (`power_watts=0`, Tesla switch possibly `unknown`) would flap — the schedule restores it itself when there is headroom for the minimum current. `PeakDecider.check()` is never skipped.
+- **EV in window**: takes over an inject snapshot; sets the charge limit to the window target (only when it differs); starts at `floor((effective_peak − buffer − house load) / V)` capped at `max_current`; only raises the current later (≥ 2 A, ≥ 5 min), decreases are left to the peak cascade. A `turn_on` that doesn't lead to charging is retried after 3 min, and after 3 attempts backs off 30 min. Fulfilled (sticky per window) when the battery ≥ target, or the charge state is `complete` at the target limit → released; solar may then charge on to `max_soc`.
+- **Window end**: drops any peak snapshot; hands a running charge to solar when there would be surplus without the EV (and the EV is in the inject cascade), otherwise stops it; then sets the rest limit (`rest_soc`, deferred while the car is asleep). `EVGuard._set_soc_override(False)` uses `soc_rest_for()` (window target in a window, else `rest_soc`) instead of the snapshot value.
+- **Outside windows** (`block_unplanned`): a charge Peak Guard didn't start and that isn't solar-owned is stopped after `SCHEDULE_UNPLANNED_GRACE_S` (2 min), unless there would be surplus without the EV (→ handed to solar) or `manual_override` is set on any copy of the device. The block wins over `rest_soc`.
+- **Is it charging?** `EVGuard.is_charging()`: switch `on` (and charge state not stopped/complete), or charge state `charging`/`starting`. The charge state comes from the EV field `charge_state_sensor` (e.g. Tesla `sensor.*_opladen`), falling back to textual values of `status_sensor`; a binary online/asleep status sensor is not used for this.
+- **Without consumption reading** `run_tick(None)` still runs the schedule so windows close and stops happen; nothing is started.
+- **Switch entries**: ON in the window if headroom ≥ `power_watts`, previous state restored at the end. A peak snapshot of a switch that was already on before the window is left for the peak restore.
+- **Shared guards**: `EVGuard` keys guards by `device.id`. When the same EV has a different id in the peak cascade, `_sync_guards()` copies the switch state to that guard after every schedule action, otherwise `_apply_peak` would skip a needed `turn_off` as redundant.
+- **Removing or disabling an entry mid-window** closes the window the same way as its end (stop, rest limit).
+- **Is it charging?** A known charge state wins over the switch (a Tesla switch can stay `on` after unplugging).
 
 ### Configuration constants (`const.py`)
 
@@ -180,12 +200,16 @@ Accepted as-is; listed so they are not rediscovered as bugs.
 - **EV daily call budget and EV API log file date run on UTC days**, not local days.
 - **`controller.py` and the frontend panel are not covered by the test suite.** Panel helpers have only been exercised in Node, not in a browser.
 - **Time-zone handling is tested against a stub** of `homeassistant.util.dt`, not a live HA.
+- **Schedule precision is the loop interval** (~60 s) for time windows; tariff-sensor changes wake the loop immediately.
+- **Schedule fulfilment relies on the battery sensor and charge state**, which can be stale while the car sleeps.
+- **A schedule stores a copy of the device.** The panel refreshes it when the device is edited in a cascade; edits made elsewhere (e.g. directly in the store) don't propagate.
+- **The EV wizard can't clear an optional entity field** (empty input falls back to the old value) — pre-existing.
 
 ## REST API
 
 | Endpoint | Methods | Purpose |
 |---|---|---|
-| `/api/peak_guard/cascade` | GET, POST | Fetch or update the full cascade configuration |
+| `/api/peak_guard/cascade` | GET, POST | Fetch or update the full cascade configuration (`type`: `peak`, `inject` or `schedule`) |
 | `/api/peak_guard/force_check` | POST | Trigger an immediate monitoring cycle |
 | `/api/peak_guard/simulate` | GET, POST | Read or set simulation mode (`consumption_w` in W, `null` to switch it off) |
 

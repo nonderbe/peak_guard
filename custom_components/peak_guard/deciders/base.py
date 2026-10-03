@@ -149,9 +149,14 @@ class BaseDecider:
         cascade: List[BaseCascadeDevice],
         snapshots: Dict[str, DeviceSnapshot],
         reverse: bool = True,
+        skip_fn: Optional[Callable[[BaseCascadeDevice], bool]] = None,
     ) -> List[tuple]:
         candidates = []
         for device in cascade:
+            if skip_fn is not None and skip_fn(device):
+                # Laadschema beheert dit apparaat nu; snapshot blijft liggen
+                # zodat het schema hem kan overnemen of opruimen.
+                continue
             if device.entity_id in snapshots:
                 if device.manual_override:
                     del snapshots[device.entity_id]
@@ -175,11 +180,16 @@ class BaseDecider:
         snapshots: Dict[str, DeviceSnapshot],
         cascade_type: str = "peak",
         now: Optional[datetime] = None,
+        skip_fn: Optional[Callable[[BaseCascadeDevice], bool]] = None,
     ) -> None:
         if now is None:
             now = datetime.now(timezone.utc)
         sorted_devices = sorted(
-            [d for d in cascade if d.enabled and not d.manual_override],
+            [
+                d for d in cascade
+                if d.enabled and not d.manual_override
+                and not (skip_fn is not None and skip_fn(d))
+            ],
             key=lambda x: x.priority,
         )
         label = "PIEK" if cascade_type == "peak" else "SOLAR"

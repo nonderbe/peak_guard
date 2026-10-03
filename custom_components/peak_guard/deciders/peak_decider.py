@@ -62,6 +62,11 @@ class PeakDecider(BaseDecider):
         )
         self._cascade = cascade
         self._snapshots = snapshots
+        # Laadschema: apparaten die het schema nu beheert, overslaan.
+        self._skip_fn: Optional[Callable[[BaseCascadeDevice], bool]] = None
+
+    def set_skip_fn(self, skip_fn: Optional[Callable[[BaseCascadeDevice], bool]]) -> None:
+        self._skip_fn = skip_fn
 
     # ------------------------------------------------------------------ #
     #  Publieke interface                                                  #
@@ -126,7 +131,7 @@ class PeakDecider(BaseDecider):
             return
 
         snapshots_to_restore = self._get_restore_candidates(
-            self._cascade, self._snapshots, reverse=True
+            self._cascade, self._snapshots, reverse=True, skip_fn=self._skip_fn
         )
         if not snapshots_to_restore:
             return

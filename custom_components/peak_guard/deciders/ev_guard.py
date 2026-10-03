@@ -30,6 +30,7 @@ from ..const import (
     DEFAULT_EV_MAX_AMPERE,
     DEFAULT_EV_MIN_AMPERE,
     DEFAULT_EV_SOLAR_START_THRESHOLD_W,
+    SCHEDULE_START_CONFIRM_S,
 )
 from .base import track_action
 from ..models import (
@@ -88,6 +89,10 @@ class EVGuard:
         # Dagelijks API-budget — geïnjecteerd vanuit __init__.py na initialisatie.
         # None = geen dagplafond gehandhaafd (bv. in tests).
         self._daily_budget = None
+        # Laadschema: geeft per entity_id de laadlimiet die PG achterlaat als
+        # het een SOC-override opheft (doel van het actieve venster of de
+        # rust-laadlimiet). None = geen schema → originele limiet herstellen.
+        self._soc_rest_lookup = None
 
     # ------------------------------------------------------------------ #
     #  Properties voor controller.to_dict()                               #
@@ -105,6 +110,10 @@ class EVGuard:
         """Koppel het dagelijkse EV-API-budget (aangeroepen vanuit __init__.py)."""
         self._daily_budget = budget
 
+    def set_soc_rest_lookup(self, lookup) -> None:
+        """Koppel de laadschema-lookup (entity_id → laadlimiet of None)."""
+        self._soc_rest_lookup = lookup
+
     def status_dict(self) -> dict:
         """Return serialisable guard status for the REST API / to_dict()."""
         now = datetime.now(timezone.utc)
@@ -119,6 +128,7 @@ class EVGuard:
                     "pending_amps":        guard.pending_amps,
                     "last_sent_amps":      int(guard.last_sent_amps) if guard.last_sent_amps is not None else None,
                     "skip_reason":         guard.skip_reason,
+                    "scheduled":           guard.scheduled,
                     "turned_off_by_pg":    guard.turned_off_by_pg,
                     "min_off_remaining_s": max(0.0, EV_MIN_OFF_DURATION_S - (
                         now - guard.turned_off_at
@@ -543,6 +553,139 @@ class EVGuard:
         return True, floor_w
 
     # ------------------------------------------------------------------ #
+    #  Gedeelde stappen: wake-up en inschakelen                            #
+    # ------------------------------------------------------------------ #
+
+    async def _wake_gate(
+        self,
+        device: EVChargerDevice,
+        guard: EVDeviceGuard,
+        now: datetime,
+        label: str,
+    ) -> Optional[str]:
+        """
+        Wake-up state machine vóór een turn_on.
+
+        Geeft None als de EV wakker is (of geen wake-button heeft) en het laden
+        mag starten; anders de reden waarom nu niet (ook gezet in
+        guard.skip_reason). Drukt de wake-button één keer en pollt daarna op
+        volgende iteraties; blokkeert de event loop nooit.
+        """
+        if guard.wake_cooldown_until is not None and now < guard.wake_cooldown_until:
+            remaining_s = (guard.wake_cooldown_until - now).total_seconds()
+            guard.skip_reason = f"wake-up cooldown ({remaining_s:.0f}s resterend)"
+            _LOGGER.debug(
+                "Peak Guard [%s]: '%s' wake-up OVERGESLAGEN — cooldown actief "
+                "(%.0f s resterend na mislukte wake-poging)",
+                label, device.name, remaining_s,
+            )
+            return guard.skip_reason
+
+        if device.wake_button and not self.is_connected(device):
+            status_entity = device.status_sensor or "(geen sensor)"
+            status_val    = "onbekend"
+            if device.status_sensor:
+                _st = self.hass.states.get(device.status_sensor)
+                status_val = _st.state if _st else "niet gevonden"
+
+            if guard.state == EVState.SLEEPING and guard.wake_requested_at is not None:
+                elapsed = (now - guard.wake_requested_at).total_seconds()
+                if elapsed <= EV_WAKE_TIMEOUT_S:
+                    guard.skip_reason = (
+                        f"wachten op Tesla wake-up "
+                        f"({elapsed:.0f}s/{EV_WAKE_TIMEOUT_S:.0f}s)"
+                    )
+                    _LOGGER.debug(
+                        "Peak Guard [%s]: '%s' — wachten op Tesla wake-up "
+                        "(%.0f s verstreken van %.0f s timeout)",
+                        label, device.name, elapsed, EV_WAKE_TIMEOUT_S,
+                    )
+                    return guard.skip_reason
+                # Timeout verstreken zonder dat de auto wakker werd.
+                guard.state               = EVState.IDLE
+                guard.wake_requested_at   = None
+                guard.wake_cooldown_until = now + timedelta(seconds=EV_WAKE_COOLDOWN_S)
+                guard.skip_reason = (
+                    f"Tesla niet wakker na wake-up poging "
+                    f"(volgende poging over {EV_WAKE_COOLDOWN_S:.0f}s)"
+                )
+                self._warn(
+                    "Peak Guard [%s]: '%s' — Tesla niet wakker na %.0f s "
+                    "('%s' = '%s') — laden uitgesteld, volgende wake-poging over %.0f s",
+                    label, device.name, EV_WAKE_TIMEOUT_S, status_entity, status_val,
+                    EV_WAKE_COOLDOWN_S,
+                )
+                return guard.skip_reason
+
+            # Eerste poging: wake-button indrukken en volgende iteratie verder.
+            _LOGGER.info(
+                "Peak Guard [%s]: '%s' — Tesla in slaapstand "
+                "('%s' = '%s') → wake button '%s' aanroepen",
+                label, device.name, status_entity, status_val, device.wake_button,
+            )
+            try:
+                await self._svc(
+                    "button", "press",
+                    {"entity_id": device.wake_button},
+                    blocking=False,
+                )
+            except Exception as wake_err:
+                self._warn(
+                    "Peak Guard [%s]: '%s' — wake-up aanroep mislukt: %s",
+                    label, device.name, wake_err,
+                )
+            guard.state             = EVState.SLEEPING
+            guard.wake_requested_at = now
+            guard.skip_reason       = "wake-up verstuurd, wachten op Tesla"
+            return guard.skip_reason
+
+        if guard.state == EVState.SLEEPING:
+            # Auto werd wakker (is_connected() werd True) — toestand resetten.
+            _LOGGER.info(
+                "Peak Guard [%s]: '%s' — Tesla nu wakker → laden starten",
+                label, device.name,
+            )
+            guard.state             = EVState.IDLE
+            guard.wake_requested_at = None
+            guard.wake_cooldown_until = None
+        return None
+
+    async def _turn_on_with_retry(
+        self,
+        device: EVChargerDevice,
+        sw_entity: str,
+        label: str,
+        reason: str,
+    ) -> tuple:
+        """switch.turn_on met retries; elke poging telt mee in de rate-limiter.
+
+        Geeft (ok, laatste_fout) terug. Vóór elke herhaling wordt de
+        rate-limiter opnieuw gecontroleerd zodat een vol venster de lus stopt.
+        """
+        last_err: Optional[HomeAssistantError] = None
+        for attempt in range(EV_CMD_MAX_RETRIES + 1):
+            if attempt > 0 and not self._rate_check(
+                device.name, f"turn_on retry voor {reason}"
+            ):
+                break
+            try:
+                await self._svc("switch", "turn_on", {"entity_id": sw_entity})
+                self._record_call()
+                return True, None
+            except HomeAssistantError as ha_err:
+                self._record_call()
+                last_err = ha_err
+                if attempt < EV_CMD_MAX_RETRIES:
+                    self._warn(
+                        "Peak Guard [%s]: '%s' turn_on mislukt "
+                        "(poging %d/%d): %s — over %.0f s opnieuw proberen",
+                        label, device.name, attempt + 1, EV_CMD_MAX_RETRIES + 1,
+                        ha_err, EV_CMD_RETRY_DELAY_S,
+                    )
+                    await asyncio.sleep(EV_CMD_RETRY_DELAY_S)
+        return False, last_err
+
+    # ------------------------------------------------------------------ #
     #  SOC-limiet override                                                 #
     # ------------------------------------------------------------------ #
 
@@ -553,7 +696,11 @@ class EVGuard:
         original_soc: Optional[float] = None,
     ) -> None:
         """Stel de SOC-limiet in (override=True) of herstel hem (override=False)."""
-        if device.max_soc is None:
+        rest_soc = (
+            self._soc_rest_lookup(device.entity_id)
+            if (not override and self._soc_rest_lookup is not None) else None
+        )
+        if device.max_soc is None and rest_soc is None:
             _LOGGER.debug(
                 "Peak Guard EV: '%s' SOC-limiet overgeslagen — ev_max_soc niet geconfigureerd",
                 device.name,
@@ -576,6 +723,8 @@ class EVGuard:
                 device.name, target_soc, soc_entity,
             )
         else:
+            if rest_soc is not None:
+                original_soc = float(rest_soc)
             target_soc = float(original_soc) if original_soc is not None else 80.0
             if original_soc is None:
                 self._warn(
@@ -905,6 +1054,218 @@ class EVGuard:
         return True
 
     # ------------------------------------------------------------------ #
+    #  Laadschema — hulpmethoden voor ScheduleDecider                     #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def voltage(device: EVChargerDevice) -> float:
+        phases = int(device.phases) if device.phases else 1
+        return EV_VOLTS_3PHASE if phases == 3 else EV_VOLTS_1PHASE
+
+    @staticmethod
+    def hw_min_amps(device: EVChargerDevice) -> float:
+        return float(
+            device.min_current if device.min_current is not None
+            else (device.min_value if device.min_value is not None else DEFAULT_EV_MIN_AMPERE)
+        )
+
+    def _charge_state(self, device: EVChargerDevice) -> str:
+        """Laadstatus in kleine letters; '' als onbekend.
+
+        Bron: charge_state_sensor, anders status_sensor. Een binaire
+        status-sensor ('on'/'off' = online/slaap) levert hier niets bruikbaars
+        op; enkel tekstuele laadstatussen tellen.
+        """
+        for entity_id in (device.charge_state_sensor, device.status_sensor):
+            if not entity_id:
+                continue
+            st = self.hass.states.get(entity_id)
+            if st is None:
+                continue
+            s = st.state.lower().strip()
+            if s in ("charging", "starting", "stopped", "complete", "fully_charged",
+                     "disconnected", "no_power", "nopower"):
+                return s
+        return ""
+
+    def is_charging(self, device: EVChargerDevice) -> bool:
+        """True als de EV echt laadt.
+
+        Schakelaar 'on', of een laadstatus 'charging'/'starting' (Tesla-
+        schakelaars die 'unknown' melden). Bewust NIET 'connected' of
+        'complete' zoals de fallback in apply_action: een ingeplugde of volle
+        auto laadt niet.
+        """
+        charge_state = self._charge_state(device)
+        if charge_state:
+            # Een gekende laadstatus is leidend: een Tesla-schakelaar blijft
+            # vaak 'on' na uitpluggen ('disconnected') of aan de limiet.
+            return charge_state in ("charging", "starting")
+        sw_state = self.hass.states.get(device.switch_entity or device.entity_id)
+        return sw_state is not None and sw_state.state == "on"
+
+    def charge_complete(self, device: EVChargerDevice) -> bool:
+        """True als de laadstatus meldt dat de auto aan zijn laadlimiet zit."""
+        return self._charge_state(device) in ("complete", "fully_charged")
+
+    def read_current_a(self, device: EVChargerDevice) -> Optional[float]:
+        if not device.current_entity:
+            return None
+        st = self.hass.states.get(device.current_entity)
+        if st is None:
+            return None
+        try:
+            return float(st.state)
+        except (ValueError, TypeError):
+            return None
+
+    def charging_draw_w(self, device: EVChargerDevice) -> float:
+        """Geschat laadvermogen (W); 0 als de EV niet laadt."""
+        if not self.is_charging(device):
+            return 0.0
+        guard = self._guards.get(device.id)
+        amps = self.read_current_a(device)
+        if amps is None and guard is not None:
+            amps = guard.last_sent_amps
+        if amps is None:
+            amps = self.hw_min_amps(device)
+        return max(0.0, amps) * self.voltage(device)
+
+    async def set_soc_limit(self, device: EVChargerDevice, value: float, reason: str) -> bool:
+        """Zet de laadlimiet (SoC) los van max_soc; True bij succes."""
+        if not device.soc_entity:
+            return False
+        if not self._rate_check(device.name, f"laadlimiet {value:.0f}% ({reason})"):
+            return False
+        self._log_ctx = {"device": device.name, "cascade": "schedule", "surplus_w": 0.0}
+        try:
+            await self._svc(
+                "number", "set_value",
+                {"entity_id": device.soc_entity, "value": float(value)},
+            )
+        except HomeAssistantError as err:
+            self._record_call()
+            self._warn(
+                "Peak Guard [SCHEMA]: '%s' laadlimiet %.0f%% instellen mislukt: %s",
+                device.name, value, err,
+            )
+            return False
+        self._record_call()
+        self._track_action(device.soc_entity, "number.set_value", float(value))
+        _LOGGER.info(
+            "Peak Guard [SCHEMA]: '%s' laadlimiet → %.0f%% (%s)", device.name, value, reason,
+        )
+        return True
+
+    async def schedule_start(
+        self, device: EVChargerDevice, amps: int, now: datetime,
+    ) -> Optional[str]:
+        """Start het laden voor het laadschema. None = gestart, anders de reden waarom niet."""
+        guard = self.get_guard(device.id)
+        self._log_ctx = {"device": device.name, "cascade": "schedule", "surplus_w": 0.0}
+        sw_entity = device.switch_entity or device.entity_id
+
+        if (
+            guard.scheduled and guard.last_switch_state is True
+            and guard.turned_on_at is not None
+            and (now - guard.turned_on_at).total_seconds() < SCHEDULE_START_CONFIRM_S
+        ):
+            return "wacht op start na turn_on"
+
+        wake_skip = await self._wake_gate(device, guard, now, "SCHEMA")
+        if wake_skip is not None:
+            return wake_skip
+
+        if not self._rate_check(device.name, "turn_on voor laadschema"):
+            return "rate-limiter vol"
+
+        ok, err = await self._turn_on_with_retry(device, sw_entity, "SCHEMA", "laadschema")
+        if not ok:
+            guard.wake_cooldown_until = now + timedelta(seconds=EV_WAKE_COOLDOWN_S)
+            self._warn(
+                "Peak Guard [SCHEMA]: '%s' turn_on mislukt: %s — nieuwe poging over %.0f s",
+                device.name, err, EV_WAKE_COOLDOWN_S,
+            )
+            return "turn_on mislukt"
+
+        self._track_action(sw_entity, "switch.turn_on")
+        guard.state             = EVState.CHARGING
+        guard.scheduled         = True
+        guard.skip_reason       = ""
+        guard.last_switch_state = True
+        guard.turned_on_at      = now
+        guard.turned_off_at     = None
+        guard.turned_off_by_pg  = False
+        self._reset_debounce(guard)
+        _LOGGER.info("Peak Guard [SCHEMA]: → '%s' laden gestart met %d A", device.name, amps)
+        await self.schedule_set_current(device, amps, now)
+        return None
+
+    async def schedule_set_current(
+        self, device: EVChargerDevice, amps: int, now: datetime,
+    ) -> bool:
+        """Zet de laadstroom voor het laadschema; True bij succes."""
+        cur_entity = device.current_entity
+        if not cur_entity:
+            return False
+        guard = self.get_guard(device.id)
+        if not self._rate_check(device.name, f"set_value {amps} A voor laadschema"):
+            return False
+        self._log_ctx = {"device": device.name, "cascade": "schedule", "surplus_w": 0.0}
+        try:
+            await self._svc(
+                "number", "set_value", {"entity_id": cur_entity, "value": float(amps)},
+            )
+        except HomeAssistantError as err:
+            self._record_call()
+            self._warn(
+                "Peak Guard [SCHEMA]: '%s' laadstroom %d A instellen mislukt: %s",
+                device.name, amps, err,
+            )
+            return False
+        self._record_call()
+        self._track_action(cur_entity, "number.set_value", float(amps))
+        guard.last_sent_amps      = float(amps)
+        guard.last_current_update = now
+        return True
+
+    async def schedule_stop(self, device: EVChargerDevice, now: datetime, reason: str) -> bool:
+        """Stop het laden (einde venster of ongeplande lading); True bij succes."""
+        guard = self.get_guard(device.id)
+        sw_entity = device.switch_entity or device.entity_id
+        if not self._rate_check(device.name, f"turn_off ({reason})"):
+            return False
+        self._log_ctx = {"device": device.name, "cascade": "schedule", "surplus_w": 0.0}
+        try:
+            await self._svc("switch", "turn_off", {"entity_id": sw_entity})
+        except HomeAssistantError as err:
+            self._record_call()
+            self._warn(
+                "Peak Guard [SCHEMA]: '%s' turn_off mislukt (%s): %s", device.name, reason, err,
+            )
+            return False
+        self._record_call()
+        self._track_action(sw_entity, "switch.turn_off")
+        self.release_schedule(device)
+        guard.turned_off_at    = now
+        guard.turned_off_by_pg = True
+        _LOGGER.info("Peak Guard [SCHEMA]: '%s' laden gestopt (%s)", device.name, reason)
+        return True
+
+    def release_schedule(self, device: EVChargerDevice) -> None:
+        """Het schema laat de lader los; andere cascades zien hem weer als vrij.
+
+        last_switch_state=None zodat de solar-cascade een laadsessie die
+        daarna start (bv. na een SOC-override) als handmatige start herkent.
+        """
+        guard = self.get_guard(device.id)
+        guard.scheduled         = False
+        guard.state             = EVState.IDLE
+        guard.last_switch_state = None
+        guard.skip_reason       = ""
+        self._reset_debounce(guard)
+
+    # ------------------------------------------------------------------ #
     #  Cascade-actie — dispatcher                                         #
     # ------------------------------------------------------------------ #
 
@@ -972,7 +1333,10 @@ class EVGuard:
                     current_soc = None
 
         snap_key = device.entity_id
-        if snap_key not in snapshots:
+        # Piekpad: een EV die niet laadt, wordt niet afgeschakeld en krijgt dus
+        # geen snapshot. Een 'off'/'unknown'-snapshot in de piek-cascade zou bij
+        # herstel de injectie-tak nemen en de lader uitschakelen.
+        if snap_key not in snapshots and (cascade_type != "peak" or sw_on):
             # Gebruik de effectieve staat: als de status-sensor aangeeft dat de auto
             # laadt terwijl de schakelaar 'unknown' meldt, sla 'on' op zodat restore
             # weet dat de auto al actief was en niet uitgeschakeld moet worden.
@@ -1440,90 +1804,10 @@ class EVGuard:
                 guard.state = EVState.IDLE
 
             if guard.last_switch_state is not True:
-                if guard.wake_cooldown_until is not None and now < guard.wake_cooldown_until:
-                    remaining_s = (guard.wake_cooldown_until - now).total_seconds()
-                    guard.skip_reason     = f"wake-up cooldown ({remaining_s:.0f}s resterend)"
-                    self.last_skip_reason = guard.skip_reason
-                    _LOGGER.debug(
-                        "Peak Guard [SOLAR]: '%s' wake-up OVERGESLAGEN — cooldown actief "
-                        "(%.0f s resterend na mislukte wake-poging)",
-                        device.name, remaining_s,
-                    )
+                wake_skip = await self._wake_gate(device, guard, now, "SOLAR")
+                if wake_skip is not None:
+                    self.last_skip_reason = wake_skip
                     return excess
-
-                if device.wake_button and not self.is_connected(device):
-                    # State-machine wake-up: press once, then poll on subsequent
-                    # loop iterations (triggered early by the status-sensor
-                    # state-change listener).  Never blocks the event loop.
-                    status_entity = device.status_sensor or "(geen sensor)"
-                    status_val    = "onbekend"
-                    if device.status_sensor:
-                        _st = self.hass.states.get(device.status_sensor)
-                        status_val = _st.state if _st else "niet gevonden"
-
-                    if guard.state == EVState.SLEEPING and guard.wake_requested_at is not None:
-                        elapsed = (now - guard.wake_requested_at).total_seconds()
-                        if elapsed <= EV_WAKE_TIMEOUT_S:
-                            guard.skip_reason = (
-                                f"wachten op Tesla wake-up "
-                                f"({elapsed:.0f}s/{EV_WAKE_TIMEOUT_S:.0f}s)"
-                            )
-                            self.last_skip_reason = guard.skip_reason
-                            _LOGGER.debug(
-                                "Peak Guard [SOLAR]: '%s' — wachten op Tesla wake-up "
-                                "(%.0f s verstreken van %.0f s timeout)",
-                                device.name, elapsed, EV_WAKE_TIMEOUT_S,
-                            )
-                            return excess
-                        # Timeout elapsed without the car waking up.
-                        guard.state               = EVState.IDLE
-                        guard.wake_requested_at   = None
-                        guard.wake_cooldown_until = now + timedelta(seconds=EV_WAKE_COOLDOWN_S)
-                        guard.skip_reason = (
-                            f"Tesla niet wakker na wake-up poging "
-                            f"(volgende poging over {EV_WAKE_COOLDOWN_S:.0f}s)"
-                        )
-                        self.last_skip_reason = guard.skip_reason
-                        self._warn(
-                            "Peak Guard [SOLAR]: '%s' — Tesla niet wakker na %.0f s "
-                            "('%s' = '%s') — laden uitgesteld, volgende wake-poging over %.0f s",
-                            device.name, EV_WAKE_TIMEOUT_S, status_entity, status_val,
-                            EV_WAKE_COOLDOWN_S,
-                        )
-                        return excess
-
-                    # First attempt: press wake button and defer to next iteration.
-                    _LOGGER.info(
-                        "Peak Guard [SOLAR]: '%s' — Tesla in slaapstand "
-                        "('%s' = '%s') → wake button '%s' aanroepen",
-                        device.name, status_entity, status_val, device.wake_button,
-                    )
-                    try:
-                        await self._svc(
-                            "button", "press",
-                            {"entity_id": device.wake_button},
-                            blocking=False,
-                        )
-                    except Exception as wake_err:
-                        self._warn(
-                            "Peak Guard [SOLAR]: '%s' — wake-up aanroep mislukt: %s",
-                            device.name, wake_err,
-                        )
-                    guard.state             = EVState.SLEEPING
-                    guard.wake_requested_at = now
-                    guard.skip_reason       = "wake-up verstuurd, wachten op Tesla"
-                    self.last_skip_reason   = guard.skip_reason
-                    return excess
-
-                if guard.state == EVState.SLEEPING:
-                    # Car woke up (is_connected() became True) — reset state.
-                    _LOGGER.info(
-                        "Peak Guard [SOLAR]: '%s' — Tesla nu wakker → laden starten met %d A",
-                        device.name, new_a,
-                    )
-                    guard.state             = EVState.IDLE
-                    guard.wake_requested_at = None
-                    guard.wake_cooldown_until = None
 
                 if not self._rate_check(device.name, "turn_on voor injectiepreventie"):
                     return excess
@@ -1561,29 +1845,9 @@ class EVGuard:
                     await self._set_soc_override(device, override=True)
                     guard.soc_override_active = True
 
-                turn_on_ok = False
-                _last_err: Optional[HomeAssistantError] = None
-                for _attempt in range(EV_CMD_MAX_RETRIES + 1):
-                    if _attempt > 0 and not self._rate_check(
-                        device.name, "turn_on retry voor injectiepreventie"
-                    ):
-                        break
-                    try:
-                        await self._svc("switch", "turn_on", {"entity_id": sw_entity})
-                        self._record_call()
-                        turn_on_ok = True
-                        break
-                    except HomeAssistantError as ha_err:
-                        self._record_call()
-                        _last_err = ha_err
-                        if _attempt < EV_CMD_MAX_RETRIES:
-                            self._warn(
-                                "Peak Guard [SOLAR]: '%s' turn_on mislukt "
-                                "(poging %d/%d): %s — over %.0f s opnieuw proberen",
-                                device.name, _attempt + 1, EV_CMD_MAX_RETRIES + 1,
-                                ha_err, EV_CMD_RETRY_DELAY_S,
-                            )
-                            await asyncio.sleep(EV_CMD_RETRY_DELAY_S)
+                turn_on_ok, _last_err = await self._turn_on_with_retry(
+                    device, sw_entity, "SOLAR", "injectiepreventie"
+                )
 
                 if not turn_on_ok:
                     self._warn(

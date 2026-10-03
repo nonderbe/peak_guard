@@ -109,6 +109,27 @@ DEFAULT_EV_SOLAR_STOP_THRESHOLD_W: float = 0.0
 EV_API_DAILY_BUDGET: int = 10_000 // 30  # = 333
 
 # ------------------------------------------------------------------ #
+#  Laadschema (Planning-tab)                                           #
+# ------------------------------------------------------------------ #
+
+# Laadstroom tijdens een venster enkel verhogen als de winst minstens zoveel
+# ampère is én de vorige aanpassing lang genoeg geleden is (spaart API-calls).
+SCHEDULE_INCREASE_MIN_A: float = 2.0
+SCHEDULE_INCREASE_INTERVAL_S: float = 300.0
+# Een ongeplande lading (buiten venster, zonder overschot) pas na deze tijd
+# stoppen, zodat de solar-cascade een inplug tijdens injectie kan overnemen.
+SCHEDULE_UNPLANNED_GRACE_S: float = 120.0
+# Na een turn_on zo lang wachten op de start vóór een nieuwe poging.
+SCHEDULE_START_CONFIRM_S: float = 180.0
+# De laadlimiet pas opnieuw sturen als ze na deze tijd nog altijd afwijkt.
+SCHEDULE_SOC_RESEND_S: float = 300.0
+# Een tariefsensor die unavailable is, behoudt zo lang zijn laatste staat.
+SCHEDULE_SENSOR_STALE_S: float = 900.0
+# Standaard tariefsensor voor een daltarief-venster (1 = piek, 2 = dal).
+DEFAULT_SCHEDULE_TARIFF_SENSOR = "sensor.p1_meter_tarief"
+DEFAULT_SCHEDULE_TARIFF_STATE = "2"
+
+# ------------------------------------------------------------------ #
 #  Panel / frontend                                                    #
 # ------------------------------------------------------------------ #
 

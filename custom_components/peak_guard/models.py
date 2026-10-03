@@ -86,6 +86,7 @@ class EVDeviceGuard:
     soc_override_active: bool = False
     wake_cooldown_until: Optional[datetime] = None
     last_known_home: Optional[bool] = None  # True/False zodra locatie ooit gekend was; None = nooit gezien
+    scheduled: bool = False  # True zolang het laadschema de lader aanstuurt
 
 
 # ──────────────────────────────────────────────────────────────────────────── #
@@ -454,6 +455,9 @@ class EVChargerDevice(BaseCascadeDevice):
     wake_button:       Optional[str]   = None
     status_sensor:     Optional[str]   = None
     location_tracker:  Optional[str]   = None
+    # Laadstatus (bv. Tesla sensor.*_opladen: starting/charging/stopped/complete/…).
+    # Gebruikt door het laadschema; status_sensor is vaak enkel online/slaap.
+    charge_state_sensor: Optional[str] = None
 
     @classmethod
     def _from_dict(cls, base: dict, d: dict) -> "EVChargerDevice":
@@ -473,6 +477,7 @@ class EVChargerDevice(BaseCascadeDevice):
             wake_button=d.get("wake_button"),
             status_sensor=d.get("status_sensor"),
             location_tracker=d.get("location_tracker"),
+            charge_state_sensor=d.get("charge_state_sensor"),
         )
 
     async def apply(self, excess: float, snapshots: dict, ctx: CascadeContext) -> float:
@@ -497,6 +502,58 @@ class EVChargerDevice(BaseCascadeDevice):
             cascade_type=ctx.cascade_type,
             now=ctx.now,
         )
+
+
+# ──────────────────────────────────────────────────────────────────────────── #
+#  Laadschema (Planning-tab)                                                    #
+# ──────────────────────────────────────────────────────────────────────────── #
+
+SCHEDULE_KIND_TIME   = "time"
+SCHEDULE_KIND_SENSOR = "sensor"
+
+
+@dataclass
+class ScheduleWindow:
+    """Eén tijdsblok van een laadschema.
+
+    kind="time":   actief op de startdagen `days` (0=ma … 6=zo) van `start` tot
+                   `end` (lokale tijd). end <= start loopt door tot de volgende
+                   dag; start == end is een volledige dag van 24 u.
+    kind="sensor": actief zolang `entity_id` de staat `active_state` heeft
+                   (bv. sensor.p1_meter_tarief = 2 → daltarief).
+    """
+    kind:         str = SCHEDULE_KIND_TIME
+    days:         list = field(default_factory=list)
+    start:        str = "00:00"
+    end:          str = "00:00"
+    entity_id:    Optional[str] = None
+    active_state: Optional[str] = None
+    target_soc:   Optional[int] = None   # enkel EV: laden tot dit batterijpercentage
+    enabled:      bool = True
+
+
+@dataclass
+class ScheduleEntry:
+    """Een apparaat met zijn laadschema.
+
+    `device` is een kopie van een cascade-apparaat (zelfde id), zodat de
+    EV-guard gedeeld blijft met de piek- en inject-cascade.
+    """
+    id:              str
+    device:          BaseCascadeDevice
+    enabled:         bool = True
+    windows:         list = field(default_factory=list)
+    max_current:     Optional[float] = None   # EV: max laadstroom tijdens het venster
+    rest_soc:        Optional[int] = None     # EV: laadlimiet buiten de vensters
+    block_unplanned: bool = True              # EV: ongeplande lading buiten vensters stoppen
+
+    @property
+    def entity_id(self) -> str:
+        return self.device.entity_id
+
+    @property
+    def is_ev(self) -> bool:
+        return isinstance(self.device, EVChargerDevice)
 
 
 # ──────────────────────────────────────────────────────────────────────────── #

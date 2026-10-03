@@ -77,6 +77,34 @@ Apparaten die worden **ingeschakeld** bij overtollige zonne-energie.
 | Inschakelen | Schakelaar die extra verbruik opneemt | Originele staat (uit) |
 | Vermogen verminderen | Laadpaal, boiler met `number` entity | Origineel vermogen |
 
+### Planning — laadschema
+
+In de tab **🗓️ Planning** zet je een apparaat uit de piek- of injectie-cascade op een schema
+(de instellingen worden gekopieerd). Per apparaat stel je één of meer vensters in:
+
+- **Daltarief (P1-sensor)** — actief zolang `sensor.p1_meter_tarief` = `2` (daluren: weeknachten,
+  weekend én feestdagen). Aanbevolen voor het Belgische dubbel tarief.
+- **Tijdvenster** — startdagen + van/tot, bv. ma–vr 22:00–06:00. Een eindtijd vóór de starttijd loopt
+  door tot de volgende dag; gelijke tijden = een volledige dag.
+
+Gedrag voor een EV:
+
+- In een venster laadt de wagen tot het **doel-percentage** van dat venster, met een laadstroom die
+  onder de maandpiek blijft. **Piekbeperking heeft voorrang**; injectiepreventie laat de wagen dan met rust.
+- Doel bereikt → bij zonne-overschot laadt de injectie-cascade verder tot de *max SoC* van het apparaat.
+- Einde venster → laden stopt (of gaat over naar zonne-overschot als dat er zonder de wagen zou zijn);
+  de laadlimiet gaat naar de **rust-laadlimiet**.
+- Buiten de vensters wordt laden zonder zonne-overschot (bv. na inpluggen) na 2 minuten gestopt.
+  Zet de bediening van het apparaat op *Manueel* om toch te laden.
+
+Een EV in de planning heeft een batterijniveau-, laadlimiet- en bij voorkeur een **laadstatus-sensor**
+nodig (bv. `sensor.tesla_opladen`: charging / stopped / complete).
+**Schakel het laadschema in de Tesla-app uit** (ook *off-peak charging* en *scheduled departure*),
+anders sturen de app en Peak Guard de wagen tegen elkaar in.
+
+Een schakelaar (bv. boiler) staat aan tijdens het venster als er onder de maandpiek ruimte is,
+en gaat daarna terug naar zijn vorige staat.
+
 ---
 
 ## Visueel overzicht — Dashboard card toevoegen
@@ -194,6 +222,7 @@ custom_components/peak_guard/
 ├── decision_logger.py       # Optionele debug-beslissingslog
 ├── ev_api_logger.py         # Tesla API call JSONL log (Logboek tab)
 ├── utils.py                 # Gedeelde helpers (quarter_start e.a.)
+├── schedule.py              # Laadschema: vensters en (de)serialisatie
 ├── services.yaml            # Service-definitie voor get_dashboard_yaml
 ├── quarter_calculator.py    # 15-min kwartierpiek berekening
 ├── quarter_store.py         # Persistente opslag kwartierpiek-data
@@ -203,6 +232,8 @@ custom_components/peak_guard/
 │   ├── base.py              # BaseDecider: gedeelde cascade helpers
 │   ├── peak_decider.py      # Piekbeperking beslissingen
 │   ├── injection_decider.py # Injectiepreventie beslissingen
+│   ├── schedule_decider.py  # Laadschema (Planning-tab)
+│   ├── dispatch.py          # Volgorde van de deciders per iteratie
 │   └── ev_guard.py          # EV-lader state machine (EVGuard)
 └── frontend/
     └── peak_guard_panel.js  # Cascade-beheer UI (zijbalk)

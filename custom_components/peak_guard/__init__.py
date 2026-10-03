@@ -50,9 +50,17 @@ class PeakGuardCascadeView(HomeAssistantView):
         cascade_type = data.get("type")
         devices = data.get("devices", [])
 
+        if cascade_type == "schedule":
+            entries = data.get("entries", devices)
+            if not isinstance(entries, list):
+                return self.json_message("Ongeldige schema-items", status_code=400)
+            saved = controller.update_schedule(entries)
+            await controller.async_save()
+            return self.json({"status": "ok", "opgeslagen": saved})
+
         if cascade_type not in ("peak", "inject"):
             return self.json_message(
-                "Ongeldig type: gebruik 'peak' of 'inject'", status_code=400
+                "Ongeldig type: gebruik 'peak', 'inject' of 'schedule'", status_code=400
             )
 
         controller.update_cascade(cascade_type, devices)

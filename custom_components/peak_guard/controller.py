@@ -10,7 +10,7 @@ from homeassistant.helpers.storage import Store
 
 from .avoided_peak_tracker import PeakAvoidTracker, SolarShiftTracker
 from .decision_logger import DecisionLogger
-from .deciders import EVGuard, InjectionDecider, PeakDecider
+from .deciders import EVGuard, InjectionDecider, PeakDecider, ScheduleDecider, run_tick
 from .deciders.base import read_power_w, read_sensor
 from .models import (
     BaseCascadeDevice,
@@ -18,6 +18,7 @@ from .models import (
     EVChargerDevice,
     from_dict as cascade_from_dict,
 )
+from .schedule import entry_from_dict as schedule_entry_from_dict
 from .const import (
     STORAGE_KEY,
     STORAGE_VERSION,
@@ -109,6 +110,22 @@ class PeakGuardController:
             cascade=self.inject_cascade,
             snapshots=self._inject_snapshots,
         )
+        self._schedule_decider = ScheduleDecider(
+            hass=hass,
+            config=config,
+            peak_tracker=self.peak_tracker,
+            solar_tracker=self.solar_tracker,
+            ev_guard=self._ev_guard_decider,
+            iteration_actions=self._iteration_actions,
+            save_fn=self.async_save,
+            peak_cascade=self.peak_cascade,
+            inject_cascade=self.inject_cascade,
+            peak_snapshots=self._peak_snapshots,
+            inject_snapshots=self._inject_snapshots,
+        )
+        self._injection_decider.set_skip_fn(self._schedule_decider.is_controlled)
+        self._peak_decider.set_skip_fn(self._schedule_decider.skip_peak_restore)
+        self._ev_guard_decider.set_soc_rest_lookup(self._schedule_decider.soc_rest_for)
         self._decision_logger = DecisionLogger(
             hass=hass,
             config=config,
@@ -143,6 +160,11 @@ class PeakGuardController:
                     self._inject_snapshots[k] = DeviceSnapshot(**v)
                 else:
                     _LOGGER.info("Peak Guard: verouderd inject-snapshot verwijderd voor '%s' (niet meer in cascade)", k)
+            self._schedule_decider.set_entries([
+                e for e in (schedule_entry_from_dict(d) for d in data.get("schedule", []))
+                if e is not None
+            ])
+            self._schedule_decider.load_state(data.get("schedule_state"))
             if self._peak_snapshots:
                 _LOGGER.warning(
                     "Peak Guard: %d apparaat/apparaten nog uitgeschakeld uit vorige sessie — "
@@ -157,6 +179,8 @@ class PeakGuardController:
             "inject": [asdict(d) for d in self.inject_cascade],
             "peak_snapshots":   {k: asdict(v) for k, v in self._peak_snapshots.items()},
             "inject_snapshots": {k: asdict(v) for k, v in self._inject_snapshots.items()},
+            "schedule":         self._schedule_decider.entries_to_list(),
+            "schedule_state":   self._schedule_decider.state_to_dict(),
         })
 
     # ------------------------------------------------------------------ #
@@ -173,6 +197,7 @@ class PeakGuardController:
                 asdict(d)
                 for d in sorted(self.inject_cascade, key=lambda x: x.priority)
             ],
+            "schedule": self._schedule_decider.entries_to_list(),
             "config": {
                 "consumption_sensor": self.config.get(CONF_CONSUMPTION_SENSOR),
                 "peak_sensor":        self.config.get(CONF_PEAK_SENSOR),
@@ -185,6 +210,7 @@ class PeakGuardController:
                 "last_loop_at": self._last_loop_at,
                 "interval_s":   max(float(self.config.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL)), 60.0),
                 **self._ev_guard_decider.status_dict(),
+                "schedule":     self._schedule_decider.status_dict(),
             },
             "simulation": {
                 "active":        self._simulation_consumption is not None,
@@ -218,6 +244,15 @@ class PeakGuardController:
                 cb()
             except Exception:
                 _LOGGER.exception("Peak Guard: entity listener raised an exception")
+
+    def update_schedule(self, entries: list) -> int:
+        """Vervang het laadschema; geeft het aantal geldige items terug."""
+        parsed = [e for e in (schedule_entry_from_dict(d) for d in entries) if e is not None]
+        self._schedule_decider.set_entries(parsed)
+        if self._monitoring:
+            self._setup_ev_listeners()
+        self._wakeup.set()
+        return len(parsed)
 
     def register_entity_listener(self, cb) -> None:
         """Registreer een callback die wordt aangeroepen na elke cascade-update.
@@ -266,9 +301,10 @@ class PeakGuardController:
         op '→ off'-transities reageert: turn_on wordt door PG zelf gestuurd en
         vereist geen onmiddellijke hercheck; turn_off (handmatig of kabel) wel.
         """
-        all_entities: set = set()
+        all_entities: set = set(self._schedule_decider.watched_entities())
         switch_entities: set = set()
-        for device in self.inject_cascade:
+        scheduled = [e.device for e in self._schedule_decider.entries if e.enabled]
+        for device in list(self.inject_cascade) + scheduled:
             if not isinstance(device, EVChargerDevice):
                 continue
             if device.cable_entity:
@@ -399,22 +435,12 @@ class PeakGuardController:
             else "nul",
         )
         await self._check_power_drop(consumption, now)
-        if consumption > 0:
-            await self._peak_decider.check(consumption, now)
-            await self._peak_decider.check_restore(consumption, now)
-            await self._injection_decider.check_restore(consumption, now)
-        elif consumption < 0:
-            _LOGGER.debug(
-                "Peak Guard: zonne-overschot gedetecteerd — sensor=%.0f W "
-                "(export %.0f W) — solar cascade wordt gecontroleerd",
-                consumption, abs(consumption),
-            )
-            await self._injection_decider.check(consumption, now)
-            await self._peak_decider.check_restore(consumption, now)
-            await self._injection_decider.check_restore(consumption, now)
-        else:
-            await self._peak_decider.check_restore(0.0, now)
-            await self._injection_decider.check_restore(0.0, now)
+        await run_tick(
+            consumption, now,
+            peak=self._peak_decider,
+            schedule=self._schedule_decider,
+            injection=self._injection_decider,
+        )
 
     async def _monitor_loop(self):
         interval = self._resolve_interval()
@@ -469,6 +495,13 @@ class PeakGuardController:
                             sensor_id, _sensor_unavailable_count,
                         )
                     self._prev_consumption = None
+                    # Vensters afsluiten en limieten herstellen kan ook zonder verbruik.
+                    await run_tick(
+                        None, now,
+                        peak=self._peak_decider,
+                        schedule=self._schedule_decider,
+                        injection=self._injection_decider,
+                    )
             except Exception:
                 _LOGGER.exception("Peak Guard: fout in monitoring loop")
             try:

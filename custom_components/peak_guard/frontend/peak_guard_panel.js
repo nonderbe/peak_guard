@@ -372,6 +372,9 @@ class PeakGuardPanel extends HTMLElement {
           <button class="tab ${this._activeTab === "inject" ? "active" : ""}" data-tab="inject">
             ☀️ Stroominjectie vermijden
           </button>
+          <button class="tab ${this._activeTab === "schedule" ? "active" : ""}" data-tab="schedule">
+            🗓️ Planning
+          </button>
           <button class="tab ${this._activeTab === "savings" ? "active" : ""}" data-tab="savings">
             💰 Besparingen & Overzicht
           </button>
@@ -384,7 +387,9 @@ class PeakGuardPanel extends HTMLElement {
           ? this._renderSavingsPanel()
           : this._activeTab === "logboek"
             ? this._renderLogboekPanel()
-            : this._renderCascadePanel(this._activeTab)}
+            : this._activeTab === "schedule"
+              ? this._renderSchedulePanel()
+              : this._renderCascadePanel(this._activeTab)}
       </div>
     `;
 
@@ -511,6 +516,430 @@ class PeakGuardPanel extends HTMLElement {
   // ------------------------------------------------------------------ //
   //  Cascade paneel                                                      //
   // ------------------------------------------------------------------ //
+
+  // ------------------------------------------------------------------ //
+  //  Planning tab — laadschema                                           //
+  // ------------------------------------------------------------------ //
+
+  _scheduleDayLabels() { return ["ma", "di", "wo", "do", "vr", "za", "zo"]; }
+
+  _scheduleDaysLabel(days) {
+    const ds = [...new Set(days || [])].sort((a, b) => a - b);
+    if (ds.length === 7) return "elke dag";
+    const L = this._scheduleDayLabels();
+    const parts = [];
+    let i = 0;
+    while (i < ds.length) {
+      let j = i;
+      while (j + 1 < ds.length && ds[j + 1] === ds[j] + 1) j++;
+      if (j - i >= 2) parts.push(`${L[ds[i]]}–${L[ds[j]]}`);
+      else for (let k = i; k <= j; k++) parts.push(L[ds[k]]);
+      i = j + 1;
+    }
+    return parts.join(", ");
+  }
+
+  _scheduleWindowLabel(w) {
+    const target = w.target_soc != null ? ` → ${w.target_soc}%` : "";
+    if (w.kind === "sensor") return `${w.entity_id} = ${w.active_state}${target}`;
+    const range = w.start === w.end ? "hele dag" : `${w.start}–${w.end}`;
+    return `${this._scheduleDaysLabel(w.days)} ${range}${target}`;
+  }
+
+  // Apparaten uit beide cascades die gepland kunnen worden (uniek per entity).
+  _scheduleCandidates() {
+    const out = [];
+    const seen = new Set();
+    for (const [type, label] of [["inject", "injectie"], ["peak", "piek"]]) {
+      for (const d of (this._data?.[type] || [])) {
+        if (!["ev_charger", "switch_on", "switch_off"].includes(d.action_type)) continue;
+        const existing = out.find((c) => c.device.entity_id === d.entity_id);
+        if (existing) { existing.cascades.push(label); continue; }
+        if (seen.has(d.entity_id)) continue;
+        seen.add(d.entity_id);
+        out.push({ device: d, cascades: [label] });
+      }
+    }
+    return out;
+  }
+
+  _renderSchedulePanel() {
+    const entries = this._data?.schedule || [];
+    const status = this._data?.status?.schedule || {};
+    const peakIds = new Set((this._data?.peak || []).map((d) => d.entity_id));
+
+    const card = (e, i) => {
+      const st = status[e.id] || {};
+      const dev = e.device || {};
+      const isEV = dev.action_type === "ev_charger";
+      const chips = (e.windows || []).map((w) =>
+        `<span class="chip ${w.enabled === false ? "disabled" : "chip-sched"}">${this._esc(this._scheduleWindowLabel(w))}</span>`
+      ).join("");
+      const extra = [];
+      if (isEV && e.rest_soc != null) extra.push(`<span class="chip chip-soc-lim" title="Laadlimiet buiten de vensters">rust ${e.rest_soc}%</span>`);
+      if (isEV && e.max_current != null) extra.push(`<span class="chip" title="Maximale laadstroom tijdens een venster">max ${e.max_current} A</span>`);
+      if (isEV && st.battery != null) extra.push(`<span class="chip chip-soc-bat">🔋 ${Math.round(st.battery)}%</span>`);
+      if (isEV && e.block_unplanned) extra.push(`<span class="chip chip-manual" title="Laden buiten een venster zonder zonne-overschot wordt gestopt">ongepland stoppen</span>`);
+      const stateCls = !e.enabled ? "off" : st.active ? (st.fulfilled ? "on" : "busy") : "idle";
+      const stateTxt = !e.enabled ? "Uitgeschakeld"
+        : st.active ? `Actief${st.label ? ` · ${this._esc(st.label)}` : ""}` : "Buiten venster";
+      const warnPeak = isEV && !peakIds.has(dev.entity_id)
+        ? `<div class="ev-location-warning"><span>Deze EV staat niet in de piek-cascade: niets beschermt de maandpiek tijdens het laadvenster.</span></div>`
+        : "";
+      return `
+        <div class="device-card">
+          <div class="device-info">
+            <div class="device-name-row">
+              <span class="device-name">${this._esc(dev.name || dev.entity_id || "?")}</span>
+              <span class="device-status sched-${stateCls}">${stateTxt}</span>
+            </div>
+            <div class="device-entity">${this._esc(dev.entity_id || "")}</div>
+            <div class="chips">${chips || `<span class="chip disabled">geen vensters</span>`}${extra.join("")}</div>
+            ${st.status ? `<div class="sched-status">${this._esc(st.status)}</div>` : ""}
+            ${warnPeak}
+          </div>
+          <div class="device-actions">
+            <button class="btn-icon" data-sched-action="toggle" data-index="${i}" title="${e.enabled ? "Uitschakelen" : "Inschakelen"}">${e.enabled ? "⏸️" : "▶️"}</button>
+            <button class="btn-icon" data-sched-action="edit" data-index="${i}" title="Bewerken">✏️</button>
+            <button class="btn-icon" data-sched-action="delete" data-index="${i}" title="Verwijderen">🗑️</button>
+          </div>
+        </div>`;
+    };
+
+    return `
+      <div class="panel">
+        <div class="panel-header">
+          <div>
+            <div class="panel-title">Laadschema</div>
+            <div class="panel-desc">
+              Tijdens een venster laadt een EV tot het doel-percentage, of staat een schakelaar aan.
+              Het schema gaat vóór injectiepreventie; piekbeperking blijft voorrang hebben.
+              Buiten de vensters laadt de EV enkel op zonne-overschot.
+              Schakel een laadschema in de Tesla-app (ook "off-peak charging" en "scheduled departure") uit.
+            </div>
+          </div>
+          <button class="btn btn-primary" data-sched-action="add">+ Toevoegen</button>
+        </div>
+        <div class="device-list">
+          ${entries.length === 0
+            ? `<div class="empty-state">
+                 <div class="emoji">🗓️</div>
+                 <div>Geen laadschema's.</div>
+                 <div class="sub">Klik op "+ Toevoegen" en kies een apparaat uit de piek- of injectie-cascade.</div>
+               </div>`
+            : entries.map(card).join("")}
+        </div>
+      </div>`;
+  }
+
+  _openScheduleModal(entry) {
+    const candidates = this._scheduleCandidates();
+    if (!entry && candidates.length === 0) {
+      alert("Voeg eerst een EV-lader of schakelaar toe in de piek- of injectie-cascade.");
+      return;
+    }
+    const base = entry
+      ? JSON.parse(JSON.stringify(entry))
+      : {
+          id: null, enabled: true, max_current: null, rest_soc: null, block_unplanned: true,
+          device: candidates[0].device,
+          windows: [{ kind: "sensor", entity_id: "sensor.p1_meter_tarief", active_state: "2", target_soc: 80, enabled: true }],
+        };
+    this._schedDraft = base;
+    this._modalVisible = true;
+    this._evMode = false;
+    if (!this._modalEl) {
+      this._modalEl = document.createElement("div");
+      Object.assign(this._modalEl.style, {
+        position: "fixed", inset: "0", zIndex: "999", background: "rgba(0,0,0,.45)",
+        display: "flex", alignItems: "center", justifyContent: "center", padding: "16px",
+      });
+      this.shadowRoot.appendChild(this._modalEl);
+    } else {
+      if (this._modalEl.parentNode !== this.shadowRoot) this.shadowRoot.appendChild(this._modalEl);
+      this._modalEl.style.display = "flex";
+    }
+    this._renderScheduleModal();
+  }
+
+  _renderScheduleModal() {
+    const d = this._schedDraft;
+    const dev = d.device || {};
+    const isEV = dev.action_type === "ev_charger";
+    const candidates = this._scheduleCandidates();
+    const inList = candidates.some((c) => c.device.entity_id === dev.entity_id);
+    const L = this._scheduleDayLabels();
+
+    const options = candidates.map((c) => `
+      <option value="${this._esc(c.device.entity_id)}" ${c.device.entity_id === dev.entity_id ? "selected" : ""}>
+        ${this._esc(c.device.name)} (${this._esc(c.device.entity_id)}) — ${c.cascades.join(" + ")}
+      </option>`).join("")
+      + (!inList && dev.entity_id
+        ? `<option value="${this._esc(dev.entity_id)}" selected>${this._esc(dev.name)} — bewaarde kopie</option>` : "");
+
+    const windowRow = (w, i) => {
+      const kindSel = `
+        <select data-w="kind" data-i="${i}">
+          <option value="time" ${w.kind !== "sensor" ? "selected" : ""}>Tijdvenster</option>
+          <option value="sensor" ${w.kind === "sensor" ? "selected" : ""}>Tariefsensor</option>
+        </select>`;
+      const body = w.kind === "sensor"
+        ? `<div class="form-row">
+             <div class="form-group"><label>Sensor</label>
+               <input data-w="entity_id" data-i="${i}" type="text" value="${this._esc(w.entity_id || "")}" placeholder="sensor.p1_meter_tarief" list="s-sensor-list" /></div>
+             <div class="form-group"><label>Actief bij staat</label>
+               <input data-w="active_state" data-i="${i}" type="text" value="${this._esc(w.active_state ?? "")}" placeholder="2" /></div>
+           </div>
+           <div class="field-hint">P1-meter: 1 = piekuren, 2 = daluren (ook weekend en feestdagen).</div>`
+        : `<div class="sched-days">
+             ${L.map((lbl, day) => `
+               <label class="sched-day"><input type="checkbox" data-w="day" data-i="${i}" data-day="${day}"
+                 ${(w.days || []).includes(day) ? "checked" : ""} />${lbl}</label>`).join("")}
+           </div>
+           <div class="form-row">
+             <div class="form-group"><label>Van</label>
+               <input data-w="start" data-i="${i}" type="time" value="${this._esc(w.start || "22:00")}" /></div>
+             <div class="form-group"><label>Tot</label>
+               <input data-w="end" data-i="${i}" type="time" value="${this._esc(w.end || "06:00")}" /></div>
+           </div>
+           <div class="field-hint">Een eindtijd vóór de starttijd loopt door tot de volgende dag; gelijke tijden = 24 uur. Dagen zijn startdagen.</div>`;
+      return `
+        <div class="sched-window">
+          <div class="sched-window-head">
+            ${kindSel}
+            <label class="sched-day"><input type="checkbox" data-w="enabled" data-i="${i}" ${w.enabled !== false ? "checked" : ""} />actief</label>
+            ${isEV ? `<label class="sched-target">doel <input data-w="target_soc" data-i="${i}" type="number" min="1" max="100" value="${w.target_soc ?? ""}" />%</label>` : ""}
+            <button class="btn-icon" data-w="remove" data-i="${i}" title="Venster verwijderen">🗑️</button>
+          </div>
+          ${body}
+        </div>`;
+    };
+
+    const evFields = isEV ? `
+      <div class="form-group">
+        <label>Laadstatus-sensor</label>
+        <input id="s-charge-state" type="text" value="${this._esc(dev.charge_state_sensor || "")}" placeholder="sensor.tesla_opladen" list="s-sensor-list" />
+        <div class="field-hint">Sensor met charging / stopped / complete. Nodig om te weten of de wagen echt laadt en zijn doel bereikt heeft.</div>
+      </div>
+      <div class="form-row">
+        <div class="form-group"><label>Max. laadstroom (A)</label>
+          <input id="s-max-current" type="number" min="1" step="1" value="${d.max_current ?? ""}" placeholder="${dev.max_value ?? 32}" />
+          <div class="field-hint">Leeg = maximum van het apparaat. De stroom blijft altijd onder de maandpiek.</div></div>
+        <div class="form-group"><label>Rust-laadlimiet (%)</label>
+          <input id="s-rest-soc" type="number" min="1" max="100" value="${d.rest_soc ?? ""}" placeholder="bv. 50" />
+          <div class="field-hint">Laadlimiet die Peak Guard instelt buiten de vensters. Leeg = niet aanpassen.</div></div>
+      </div>
+      <div class="form-group">
+        <label class="sched-day"><input id="s-block" type="checkbox" ${d.block_unplanned !== false ? "checked" : ""} />
+          Ongeplande lading buiten de vensters stoppen</label>
+        <div class="field-hint">Laadt de wagen buiten een venster zonder zonne-overschot (bv. na inpluggen), dan stopt Peak Guard hem na 2 minuten.
+          Zet de bediening van het apparaat op "Manueel" om toch te laden.</div>
+      </div>
+      ${!dev.battery_entity || !dev.soc_entity
+        ? `<div class="ev-location-warning"><span>Dit apparaat heeft geen batterijniveau- en/of laadlimiet-entiteit. Vul die eerst in via de EV-wizard in de cascade.</span></div>` : ""}
+    ` : `
+      <div class="field-hint">Een schakelaar staat aan tijdens het venster (als er onder de maandpiek ruimte is voor het nominaal vermogen) en gaat daarna terug naar zijn vorige staat.</div>`;
+
+    const sensorIds = Object.keys(this._hass?.states || {}).filter((id) => id.startsWith("sensor.")).sort();
+
+    this._modalEl.innerHTML = `
+      <div class="modal" id="modal-box">
+        <h3>${d.id ? "Laadschema bewerken" : "Laadschema toevoegen"}</h3>
+        <div class="modal-subtitle">Kies een apparaat uit de cascades; de instellingen worden gekopieerd.</div>
+        <datalist id="s-sensor-list">${sensorIds.map((id) => `<option value="${this._esc(id)}"></option>`).join("")}</datalist>
+        <div class="form-group">
+          <label>Apparaat</label>
+          <select id="s-device">${options}</select>
+        </div>
+        <div class="form-group">
+          <label class="sched-day"><input id="s-enabled" type="checkbox" ${d.enabled !== false ? "checked" : ""} />Schema actief</label>
+        </div>
+        <div class="form-group">
+          <label>Vensters</label>
+          ${(d.windows || []).map(windowRow).join("") || `<div class="field-hint">Nog geen vensters.</div>`}
+          <div class="sched-add-row">
+            <button class="btn btn-secondary" id="s-add-sensor">+ Daltarief (P1-sensor)</button>
+            <button class="btn btn-secondary" id="s-add-time">+ Tijdvenster</button>
+          </div>
+        </div>
+        ${evFields}
+        <div class="modal-actions">
+          <div></div>
+          <div class="modal-actions-right">
+            <button class="btn btn-secondary" id="modal-cancel">Annuleren</button>
+            <button class="btn btn-primary" id="modal-save">Opslaan</button>
+          </div>
+        </div>
+      </div>`;
+    this._attachScheduleModalEvents();
+  }
+
+  // Lees het formulier in this._schedDraft (vóór elke her-render en bij opslaan).
+  _readScheduleForm() {
+    const root = this._modalEl;
+    const d = this._schedDraft;
+    const q = (sel) => root.querySelector(sel);
+    d.enabled = !!q("#s-enabled")?.checked;
+    if (q("#s-charge-state")) d.device = { ...d.device, charge_state_sensor: q("#s-charge-state").value.trim() || null };
+    if (q("#s-max-current")) d.max_current = q("#s-max-current").value === "" ? null : parseFloat(q("#s-max-current").value);
+    if (q("#s-rest-soc")) d.rest_soc = q("#s-rest-soc").value === "" ? null : parseInt(q("#s-rest-soc").value);
+    if (q("#s-block")) d.block_unplanned = !!q("#s-block").checked;
+    (d.windows || []).forEach((w, i) => {
+      const f = (name) => root.querySelector(`[data-w="${name}"][data-i="${i}"]`);
+      w.enabled = !!f("enabled")?.checked;
+      const t = f("target_soc");
+      if (t) w.target_soc = t.value === "" ? null : parseInt(t.value);
+      if (w.kind === "sensor") {
+        w.entity_id = f("entity_id")?.value.trim() || "";
+        w.active_state = f("active_state")?.value.trim() || "";
+      } else {
+        w.start = f("start")?.value || w.start;
+        w.end = f("end")?.value || w.end;
+        w.days = [...root.querySelectorAll(`[data-w="day"][data-i="${i}"]`)]
+          .filter((c) => c.checked).map((c) => parseInt(c.dataset.day));
+      }
+    });
+  }
+
+  _attachScheduleModalEvents() {
+    const root = this._modalEl;
+    root.onclick = (e) => { if (e.target === root) this._closeModal(); };
+    root.querySelector("#modal-box")?.addEventListener("click", (e) => e.stopPropagation());
+    root.querySelector("#modal-cancel")?.addEventListener("click", () => this._closeModal());
+
+    root.querySelector("#s-device")?.addEventListener("change", (e) => {
+      this._readScheduleForm();
+      const c = this._scheduleCandidates().find((x) => x.device.entity_id === e.target.value);
+      if (c) this._schedDraft.device = { ...c.device };
+      this._renderScheduleModal();
+    });
+    root.querySelector("#s-add-sensor")?.addEventListener("click", () => {
+      this._readScheduleForm();
+      this._schedDraft.windows.push({ kind: "sensor", entity_id: "sensor.p1_meter_tarief", active_state: "2", target_soc: 80, enabled: true });
+      this._renderScheduleModal();
+    });
+    root.querySelector("#s-add-time")?.addEventListener("click", () => {
+      this._readScheduleForm();
+      this._schedDraft.windows.push({ kind: "time", days: [0, 1, 2, 3, 4], start: "22:00", end: "06:00", target_soc: 80, enabled: true });
+      this._renderScheduleModal();
+    });
+    root.querySelectorAll('[data-w="kind"]').forEach((sel) => sel.addEventListener("change", () => {
+      this._readScheduleForm();
+      const w = this._schedDraft.windows[parseInt(sel.dataset.i)];
+      w.kind = sel.value;
+      if (w.kind === "sensor") { w.entity_id = w.entity_id || "sensor.p1_meter_tarief"; w.active_state = w.active_state || "2"; }
+      else { w.days = w.days?.length ? w.days : [0, 1, 2, 3, 4]; w.start = w.start || "22:00"; w.end = w.end || "06:00"; }
+      this._renderScheduleModal();
+    }));
+    root.querySelectorAll('[data-w="remove"]').forEach((btn) => btn.addEventListener("click", () => {
+      this._readScheduleForm();
+      this._schedDraft.windows.splice(parseInt(btn.dataset.i), 1);
+      this._renderScheduleModal();
+    }));
+    root.querySelector("#modal-save")?.addEventListener("click", () => this._saveScheduleDraft());
+  }
+
+  async _saveScheduleDraft() {
+    this._readScheduleForm();
+    const d = this._schedDraft;
+    const dev = d.device || {};
+    const isEV = dev.action_type === "ev_charger";
+    // Verse kopie van het cascade-apparaat (zelfde id) met de schema-specifieke laadstatus-sensor.
+    const fresh = this._scheduleCandidates().find((c) => c.device.entity_id === dev.entity_id);
+    const device = fresh
+      ? { ...fresh.device, ...(isEV ? { charge_state_sensor: dev.charge_state_sensor || null } : {}) }
+      : dev;
+
+    if (!device.entity_id) { alert("Kies een apparaat."); return; }
+    if (!d.windows.length) { alert("Voeg minstens één venster toe."); return; }
+    for (const w of d.windows) {
+      if (w.kind === "sensor" && (!w.entity_id || !w.active_state)) { alert("Vul sensor en staat in voor elk tariefsensor-venster."); return; }
+      if (w.kind !== "sensor" && !(w.days || []).length) { alert("Kies minstens één dag per tijdvenster."); return; }
+      if (isEV && w.target_soc == null) { alert("Vul een doel-percentage in voor elk venster."); return; }
+    }
+    if (isEV && (!device.battery_entity || !device.soc_entity)) {
+      alert("Deze EV heeft een batterijniveau- en laadlimiet-entiteit nodig. Vul die in via de EV-wizard in de cascade.");
+      return;
+    }
+
+    const entry = {
+      id: d.id || `sch_${Date.now()}`,
+      device,
+      enabled: d.enabled,
+      windows: d.windows,
+      max_current: isEV ? d.max_current : null,
+      rest_soc: isEV ? d.rest_soc : null,
+      block_unplanned: isEV ? d.block_unplanned : false,
+    };
+    const entries = [...(this._data?.schedule || [])];
+    const dup = entries.find((e) => e.id !== entry.id && e.device?.entity_id === device.entity_id);
+    if (dup) { alert(`Er bestaat al een schema voor '${device.name}'.`); return; }
+    const idx = entries.findIndex((e) => e.id === entry.id);
+    if (idx >= 0) entries[idx] = entry; else entries.push(entry);
+    await this._saveSchedule(entries, true);
+  }
+
+  // Een laadschema bewaart een kopie van het apparaat: na bewerken in een
+  // cascade de kopie bijwerken (laadstatus-sensor van het schema behouden).
+  _syncScheduleCopy(device) {
+    const entries = this._data?.schedule || [];
+    if (!entries.some((e) => e.device?.entity_id === device.entity_id)) return Promise.resolve();
+    const updated = entries.map((e) => e.device?.entity_id !== device.entity_id ? e : {
+      ...e,
+      device: {
+        ...device,
+        id: e.device.id,
+        charge_state_sensor: device.charge_state_sensor || e.device.charge_state_sensor || null,
+      },
+    });
+    return this._hass.fetchWithAuth("/api/peak_guard/cascade", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ type: "schedule", entries: updated }),
+    }).catch((e) => console.warn("Peak Guard: schema-kopie bijwerken mislukt", e));
+  }
+
+  async _saveSchedule(entries, closeModal = false) {
+    try {
+      const resp = await this._hass.fetchWithAuth("/api/peak_guard/cascade", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ type: "schedule", entries }),
+      });
+      if (resp.ok) {
+        if (closeModal) this._closeModal();
+        await this._fetchData();
+      } else {
+        alert(`Opslaan mislukt (HTTP ${resp.status}). Probeer opnieuw.`);
+      }
+    } catch (e) {
+      console.error("Peak Guard: schema opslaan mislukt", e);
+      alert("Verbindingsfout bij opslaan. Controleer de integratie.");
+    }
+  }
+
+  _attachScheduleEvents() {
+    this.shadowRoot.querySelectorAll("[data-sched-action]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const action = btn.dataset.schedAction;
+        const entries = [...(this._data?.schedule || [])];
+        const idx = parseInt(btn.dataset.index);
+        if (action === "add") {
+          this._openScheduleModal(null);
+        } else if (action === "edit" && entries[idx]) {
+          this._openScheduleModal(entries[idx]);
+        } else if (action === "toggle" && entries[idx]) {
+          entries[idx] = { ...entries[idx], enabled: !entries[idx].enabled };
+          this._saveSchedule(entries);
+        } else if (action === "delete" && entries[idx]) {
+          if (confirm(`Schema voor '${entries[idx].device?.name}' verwijderen?`)) {
+            entries.splice(idx, 1);
+            this._saveSchedule(entries);
+          }
+        }
+      });
+    });
+  }
 
   _renderCascadePanel(type) {
     const devices = this._data?.[type] || [];
@@ -647,6 +1076,12 @@ class PeakGuardPanel extends HTMLElement {
             <span class="chip action" title="${actionTitles[device.action_type] || ""}">${labels[device.action_type] || device.action_type}</span>
             ${powerChip}
             ${socChips}
+            ${(() => {
+              const se = (this._data?.schedule || []).find((e) => e.enabled && e.device?.entity_id === device.entity_id);
+              if (!se) return "";
+              const active = this._data?.status?.schedule?.[se.id]?.controlled;
+              return `<span class="chip chip-sched" title="Dit apparaat heeft een laadschema (tab Planning). Tijdens een actief venster stuurt het schema het aan.">🗓 Gepland${active ? " · actief" : ""}</span>`;
+            })()}
             ${!device.enabled ? `<span class="chip disabled" title="Dit apparaat is uitgeschakeld en wordt door Peak Guard genegeerd.">Uitgeschakeld</span>` : ""}
           ${device.manual_override ? `<span class="chip chip-manual" title="${type === "peak" ? "Dit apparaat wordt niet beschermd tegen pieken door Peak Guard." : "Dit apparaat wordt niet beheerd door injectiepreventie."}">Manueel</span>` : ""}
           </div>
@@ -1498,6 +1933,20 @@ class PeakGuardPanel extends HTMLElement {
         </div>
 
         <div class="form-group">
+          <label>Laadstatus-sensor <span style="font-weight:400;text-transform:none;">(optioneel, nodig voor Planning)</span></label>
+          <div class="entity-picker">
+            <input id="f-ev-charge-state" type="text"
+              value="${this._esc(d.charge_state_sensor || '')}"
+              placeholder="sensor.tesla_opladen" autocomplete="off" />
+            <div id="ev-charge-state-dropdown" class="entity-dropdown" style="display:none;"></div>
+          </div>
+          <div class="field-hint">
+            Sensor met de laadtoestand (bijv. <em>sensor.tesla_opladen</em>: charging / stopped / complete).
+            Het laadschema gebruikt hem om te zien of de wagen echt laadt en of het doel bereikt is.
+          </div>
+        </div>
+
+        <div class="form-group">
           <label>Status-sensor <span style="font-weight:400;text-transform:none;">(optioneel)</span></label>
           <div class="entity-picker">
             <input id="f-ev-status-sensor" type="text"
@@ -1561,6 +2010,7 @@ class PeakGuardPanel extends HTMLElement {
     this._editDevice   = null;
     this._wizardStep   = 1;
     this._evMode       = false;
+    this._schedDraft   = null;
     if (this._modalEl) {
       this._modalEl.style.display = "none";
     }
@@ -1725,6 +2175,7 @@ class PeakGuardPanel extends HTMLElement {
         makeEntityPicker("#f-ev-battery-entity",    "#ev-battery-entity-dropdown",    (id) => id.startsWith("sensor."));
         makeEntityPicker("#f-ev-location-tracker",  "#ev-location-tracker-dropdown",  (id) => id.startsWith("device_tracker.") || id.startsWith("binary_sensor."));
         makeEntityPicker("#f-ev-status-sensor",     "#ev-status-sensor-dropdown",     (id) => id.startsWith("binary_sensor.") || id.startsWith("sensor."));
+        makeEntityPicker("#f-ev-charge-state",      "#ev-charge-state-dropdown",      (id) => id.startsWith("sensor."));
         makeEntityPicker("#f-ev-wake-button",       "#ev-wake-button-dropdown",       (id) => id.startsWith("button."));
 
         root.querySelector("#wizard-prev")?.addEventListener("click", () => {
@@ -1796,6 +2247,7 @@ class PeakGuardPanel extends HTMLElement {
       const evStatusSensor    = val("#f-ev-status-sensor")    || d.status_sensor    || null;
       const evWakeButton      = val("#f-ev-wake-button")      || d.wake_button      || null;
       const evLocationTracker = val("#f-ev-location-tracker") || d.location_tracker || null;
+      const evChargeState     = val("#f-ev-charge-state")     || d.charge_state_sensor || null;
 
       device = {
         id:               d.id || `dev_${Date.now()}`,
@@ -1818,6 +2270,8 @@ class PeakGuardPanel extends HTMLElement {
         status_sensor:    evStatusSensor,
         wake_button:      evWakeButton,
         location_tracker: evLocationTracker,
+        charge_state_sensor: evChargeState,
+        manual_override:  !!d.manual_override,
       };
 
     } else {
@@ -1855,6 +2309,8 @@ class PeakGuardPanel extends HTMLElement {
       };
     }
 
+    const scheduleSynced = this._syncScheduleCopy(device);
+
     const devices = [...(this._data?.[this._editCascadeType] || [])];
     const existingIdx = devices.findIndex((d) => d.id === device.id);
     if (existingIdx >= 0) {
@@ -1875,7 +2331,11 @@ class PeakGuardPanel extends HTMLElement {
       (d) => d.entity_id === device.entity_id
     );
 
-    const saveMain = () => this._saveDevices(this._editCascadeType, devices, true);
+    // Eerst de schema-kopie bijwerken, zodat de herlaadde data al klopt.
+    const saveMain = async () => {
+      await scheduleSynced;
+      return this._saveDevices(this._editCascadeType, devices, true);
+    };
 
     const saveAll = syncToOther
       ? async () => {
@@ -2047,6 +2507,8 @@ class PeakGuardPanel extends HTMLElement {
           }
         });
       });
+
+    this._attachScheduleEvents();
   }
 
   // ------------------------------------------------------------------ //
@@ -2392,6 +2854,20 @@ class PeakGuardPanel extends HTMLElement {
         .chip.chip-soc-bat    { background: #43a047; }   /* groen: huidig batterijniveau */
         .chip.chip-soc-target { background: #f57c00; }   /* oranje: doel bij zon */
         .chip.chip-manual     { background: #e65100; }   /* oranje-rood: manuele bediening */
+        .chip.chip-sched      { background: #00897b; }   /* teal: laadschema */
+        .sched-status { font-size: .8em; margin-top: 6px; color: var(--secondary-text-color, #757575); }
+        .device-status.sched-busy { background: #00897b; color: #fff; }
+        .device-status.sched-on   { background: #43a047; color: #fff; }
+        .device-status.sched-idle { background: var(--secondary-background-color, #eee); color: var(--secondary-text-color, #757575); }
+        .device-status.sched-off  { background: #9e9e9e; color: #fff; }
+        .sched-window { border: 1px solid var(--divider-color, #e0e0e0); border-radius: 8px; padding: 10px; margin-bottom: 8px; }
+        .sched-window-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+        .sched-window-head select { flex: 1 1 140px; }
+        .sched-days { display: flex; flex-wrap: wrap; gap: 6px 12px; margin-bottom: 8px; }
+        .sched-day { display: inline-flex; align-items: center; gap: 4px; font-weight: 400; text-transform: none; letter-spacing: 0; }
+        .sched-target { display: inline-flex; align-items: center; gap: 4px; font-weight: 400; text-transform: none; letter-spacing: 0; }
+        .sched-target input { width: 64px; }
+        .sched-add-row { display: flex; gap: 8px; flex-wrap: wrap; }
         .device-actions { display: flex; gap: 4px; align-items: center; }
 
         /* Manuele bediening toggle */

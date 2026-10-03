@@ -235,6 +235,11 @@ class MockPeakTracker:
     def start_measurement_on_turnon(self, device_id, device_name, ts):
         self.turn_on_measurements.append(device_id)
 
+    def complete_peak_calculation(self, device_id, now):
+        self.completed = getattr(self, "completed", [])
+        self.completed.append(device_id)
+        return None
+
 
 class MockSolarTracker:
     def __init__(self) -> None:
