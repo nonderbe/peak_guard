@@ -23,6 +23,7 @@ import pytest
 
 from custom_components.peak_guard.models import (
     BaseCascadeDevice,
+    DeviceSnapshot,
     EVChargerDevice,
     EVDeviceGuard,
     EVRateLimiter,
@@ -31,10 +32,12 @@ from custom_components.peak_guard.models import (
     EV_MIN_OFF_DURATION_S,
     EV_MIN_UPDATE_INTERVAL_S,
     EV_HYSTERESIS_AMPS,
+    EV_RATE_LIMIT_MAX_CALLS,
+    EV_RATE_LIMIT_RESERVE,
     EV_VOLTS_1PHASE,
     from_dict as cascade_from_dict,
 )
-from custom_components.peak_guard.deciders.ev_guard import EVGuard
+from custom_components.peak_guard.deciders.ev_guard import EVCallBlocked, EVGuard
 from custom_components.peak_guard.ev_call_budget import EVDailyCallBudget
 from tests.conftest import (
     HomeAssistantError,
@@ -629,6 +632,126 @@ class TestDailyBudgetIntegration:
 
         assert self.hass.services.has_call("turn_on")
         assert budget.calls_today >= 1
+
+
+class TestBudgetReserveAndUnreachable:
+    """Reserve in het dagbudget en back-off bij een onbereikbare wagen (_svc)."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, hass, ev_device, peak_tracker, solar_tracker):
+        self.hass = hass
+        self.device = ev_device
+        self.pt = peak_tracker
+        self.st = solar_tracker
+        self.ev_guard = EVGuard(hass=hass, config={}, iteration_actions=[])
+        self.ev_guard._log_ctx = {"device": "Tesla", "cascade": "solar", "surplus_w": 0.0}
+        self.hass.states.set("number.tesla_charge_current", "10")
+
+    def _budget_with_remaining(self, remaining: int, max_calls: int = 333):
+        budget = make_ev_budget(self.hass, max_calls=max_calls)
+        for _ in range(max_calls - remaining):
+            budget.record()
+        self.ev_guard.set_daily_budget(budget)
+        return budget
+
+    async def test_reserve_blocks_increase_and_start_but_not_reduction(self):
+        budget = self._budget_with_remaining(30)
+        with pytest.raises(EVCallBlocked):
+            await self.ev_guard._svc("switch", "turn_on", {"entity_id": "switch.tesla_charge"})
+        with pytest.raises(EVCallBlocked):
+            await self.ev_guard._svc(
+                "number", "set_value", {"entity_id": "number.tesla_charge_current", "value": 12.0})
+        await self.ev_guard._svc(
+            "number", "set_value", {"entity_id": "number.tesla_charge_current", "value": 8.0})
+        await self.ev_guard._svc("switch", "turn_off", {"entity_id": "switch.tesla_charge"})
+        assert [c["service"] for c in self.hass.services.calls] == ["set_value", "turn_off"]
+        assert budget.calls_today == 333 - 30 + 2, "geblokkeerde calls tellen niet mee"
+        assert self.ev_guard.rate_limiter.calls_in_window == 2
+
+    async def test_reserve_scales_with_small_budget(self):
+        self._budget_with_remaining(5, max_calls=10)    # reserve = 10 // 4 = 2
+        await self.ev_guard._svc("switch", "turn_on", {"entity_id": "switch.tesla_charge"})
+        assert self.hass.services.has_call("turn_on")
+
+    async def test_unreachable_blocks_non_reducing_calls(self):
+        self.hass.services._raise_on.add("turn_on")
+        self.hass.services.error_message = "Command failed: The vehicle is not 'online'."
+        with pytest.raises(HomeAssistantError):
+            await self.ev_guard._svc("switch", "turn_on", {"entity_id": "switch.tesla_charge"})
+        assert self.ev_guard.unreachable_remaining_s("Tesla") > 0
+        with pytest.raises(EVCallBlocked):
+            await self.ev_guard._svc(
+                "number", "set_value", {"entity_id": "number.tesla_charge_current", "value": 12.0})
+        # Verlagen blijft mogelijk; een geslaagde call wist de back-off.
+        await self.ev_guard._svc(
+            "number", "set_value", {"entity_id": "number.tesla_charge_current", "value": 8.0})
+        assert self.ev_guard.unreachable_remaining_s("Tesla") == 0
+        await self.ev_guard._svc(
+            "number", "set_value", {"entity_id": "number.tesla_charge_current", "value": 12.0})
+        assert len(self.hass.services.calls_for("set_value")) == 2
+
+    async def test_other_errors_do_not_mark_unreachable(self):
+        self.hass.services._raise_on.add("set_value")
+        self.hass.services.error_message = "out_of_range"
+        with pytest.raises(HomeAssistantError):
+            await self.ev_guard._svc(
+                "number", "set_value", {"entity_id": "number.tesla_charge_current", "value": 3.0})
+        assert self.ev_guard.unreachable_remaining_s("Tesla") == 0
+
+    async def test_wake_button_success_does_not_clear_unreachable(self):
+        self.hass.services._raise_on.add("turn_on")
+        self.hass.services.error_message = "Command failed: The vehicle is not 'online'."
+        with pytest.raises(HomeAssistantError):
+            await self.ev_guard._svc("switch", "turn_on", {"entity_id": "switch.tesla_charge"})
+        await self.ev_guard._svc("button", "press", {"entity_id": "button.wake"})
+        assert self.ev_guard.unreachable_remaining_s("Tesla") > 0
+
+    async def test_solar_restore_turns_off_inside_budget_reserve(self):
+        # Herstel na injectiepreventie zet eerst de stroom terug (hoger → geblokkeerd
+        # door de reserve); de turn_off moet toch vertrekken.
+        self._budget_with_remaining(10)
+        self.hass.states.set("switch.tesla_charge", "on")
+        self.hass.states.set("number.tesla_charge_current", "6")
+        snap = DeviceSnapshot(entity_id="switch.tesla_charge", original_state="off",
+                              original_current=16.0)
+        ok = await self.ev_guard.restore(self.device, snap, self.pt, self.st, cascade_type="solar")
+        assert ok
+        assert self.hass.services.has_call("turn_off")
+        assert not self.hass.services.calls_for("set_value")
+
+    async def test_rate_limit_reserve_kept_for_reductions(self):
+        for _ in range(EV_RATE_LIMIT_MAX_CALLS - EV_RATE_LIMIT_RESERVE):
+            self.ev_guard.rate_limiter.record()
+        assert not self.ev_guard._rate_check("Tesla", "verhogen")
+        assert self.ev_guard._rate_check("Tesla", "verlagen", reducing=True)
+        with pytest.raises(EVCallBlocked):
+            await self.ev_guard._svc(
+                "number", "set_value", {"entity_id": "number.tesla_charge_current", "value": 12.0})
+        await self.ev_guard._svc(
+            "number", "set_value", {"entity_id": "number.tesla_charge_current", "value": 8.0})
+        assert len(self.hass.services.calls_for("set_value")) == 1
+
+    async def test_peak_reduction_skipped_by_rate_limiter_returns_full_excess(self):
+        for _ in range(EV_RATE_LIMIT_MAX_CALLS):
+            self.ev_guard.rate_limiter.record()
+        self.hass.states.set("switch.tesla_charge", "on")
+        self.hass.states.set("number.tesla_charge_current", "16")
+        left = await self.ev_guard.apply_action(self.device, 1000.0, {}, "peak", self.pt, self.st)
+        assert left == 1000.0, "niet verlaagd → de cascade moet het volgende apparaat proberen"
+        assert not self.hass.services.calls
+
+    @patch("custom_components.peak_guard.deciders.ev_guard.asyncio.sleep", new_callable=AsyncMock)
+    async def test_turn_on_not_retried_when_vehicle_unreachable(self, _mock_sleep):
+        self.hass.services._raise_on.add("turn_on")
+        self.hass.services.error_message = "Command failed: The vehicle is not 'online'."
+        guard = self.ev_guard.get_guard(self.device.id)
+        guard.debounce_start_at = datetime.now(timezone.utc) - timedelta(seconds=25)
+        make_surplus_history(guard, seconds_span=25.0, value_w=5000.0)
+        await self.ev_guard.apply_action(self.device, 5000.0, {}, "solar", self.pt, self.st)
+        assert len(self.hass.services.calls_for("turn_on")) == 1
+        n = len(self.hass.services.calls)
+        await self.ev_guard.apply_action(self.device, 5000.0, {}, "solar", self.pt, self.st)
+        assert len(self.hass.services.calls) == n, "volgende loop: niets naar een onbereikbare wagen"
 
 
 # ═══════════════════════════════════════════════════════════════════════════ #

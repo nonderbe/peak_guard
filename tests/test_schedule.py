@@ -290,12 +290,91 @@ class TestEVInWindow:
         env.hass.states.set(SOC, "65")
         env.hass.states.set(CUR, "6")
         guard = env.ev.get_guard("ev_tesla")
-        guard.last_current_update = MON_23 - timedelta(seconds=60)
+        guard.last_current_update = MON_23 - timedelta(seconds=10)
         await env.tick(2000.0, MON_23)            # ruimte voor 8 A, maar interval nog niet om
         assert not any(e == CUR for _, e, _ in services(env))
-        guard.last_current_update = MON_23 - timedelta(seconds=400)
+        guard.last_current_update = MON_23 - timedelta(seconds=60)
         await env.tick(2000.0, MON_23)
         assert ("set_value", CUR, 8.0) in services(env)
+
+    async def test_charging_increases_in_one_amp_steps(self):
+        # 7 A bij max 8 A met injectie: +1 A is genoeg om te verhogen.
+        env = build([entry_dict([WEEKNIGHT])])
+        env.hass.states.set(SW, "on")
+        env.hass.states.set(CHG, "charging")
+        env.hass.states.set(SOC, "65")
+        env.hass.states.set(CUR, "7")
+        guard = env.ev.get_guard("ev_tesla")
+        guard.last_current_update = MON_23 - timedelta(seconds=10)
+        await env.tick(-350.0, MON_23)
+        assert not any(e == CUR for _, e, _ in services(env))
+        assert "verhoging naar 8 A over" in env.sd.status_dict()["sch1"]["detail"]
+        guard.last_current_update = MON_23 - timedelta(seconds=60)    # één loop later
+        await env.tick(-350.0, MON_23)
+        assert ("set_value", CUR, 8.0) in services(env)
+
+    async def test_charging_detail_explains_room_and_max(self):
+        env = build([entry_dict([WEEKNIGHT])], peak_w=3000.0)
+        env.hass.states.set(SW, "on")
+        env.hass.states.set(CHG, "charging")
+        env.hass.states.set(SOC, "65")
+        env.hass.states.set(CUR, "6")
+        # ruimte = 3000 − 100 − (2800 − 6 A × 230) = 1480 W → 6 A: niets te verhogen
+        await env.tick(2800.0, MON_23)
+        detail = env.sd.status_dict()["sch1"]["detail"]
+        assert "→ 6 A" in detail and "geen ruimte om te verhogen" in detail
+        assert not any(e == CUR for _, e, _ in services(env))
+        env.hass.states.set(CUR, "8")
+        await env.tick(-500.0, MON_23)
+        assert env.sd.status_dict()["sch1"]["detail"] == "maximum 8 A bereikt"
+
+    async def test_charging_no_raise_below_hw_minimum(self):
+        env = build([entry_dict([WEEKNIGHT])], peak_w=2500.0)
+        env.hass.states.set(SW, "on")
+        env.hass.states.set(CHG, "starting")
+        env.hass.states.set(CUR, "0")
+        # ruimte = 2500 − 100 − 1600 = 800 W → 3 A, onder het hardwareminimum
+        await env.tick(1600.0, MON_23)
+        assert not any(e == CUR for _, e, _ in services(env))
+        assert "minimum laadstroom" in env.sd.status_dict()["sch1"]["detail"]
+
+    async def test_failed_raise_waits_interval(self):
+        env = build([entry_dict([WEEKNIGHT])])
+        env.hass.states.set(SW, "on")
+        env.hass.states.set(CHG, "charging")
+        env.hass.states.set(SOC, "65")
+        env.hass.states.set(CUR, "6")
+        env.ev.schedule_set_current = AsyncMock(return_value=False)
+        await env.tick(-500.0, MON_23)
+        await env.tick(-500.0, MON_23 + timedelta(minutes=1))   # volgende loop
+        assert env.ev.schedule_set_current.await_count == 1
+        assert "nieuwe poging over 240 s" in env.sd.status_dict()["sch1"]["detail"]
+        await env.tick(-500.0, MON_23 + timedelta(minutes=5))   # na de pauze
+        assert env.ev.schedule_set_current.await_count == 2
+
+    async def test_raise_waits_after_peak_change_on_other_copy(self):
+        env = build([entry_dict([WEEKNIGHT])], peak=False)
+        env.sd._peak_cascade.append(tesla("ev_peak_copy"))
+        env.hass.states.set(SW, "on")
+        env.hass.states.set(CHG, "charging")
+        env.hass.states.set(SOC, "65")
+        env.hass.states.set(CUR, "6")
+        env.ev.get_guard("ev_peak_copy").last_current_update = MON_23 - timedelta(seconds=5)
+        await env.tick(-500.0, MON_23)
+        assert not any(e == CUR for _, e, _ in services(env))
+
+    async def test_restart_waits_min_off_after_peak_stop(self):
+        # Piekbeperking zette de EV uit (andere kopie): het schema herstart pas
+        # na de min-OFF-tijd, ook al is er meteen weer ruimte.
+        env = build([entry_dict([WEEKNIGHT])], peak=False)
+        env.sd._peak_cascade.append(tesla("ev_peak_copy"))
+        pg = env.ev.get_guard("ev_peak_copy")
+        pg.turned_off_at, pg.turned_off_by_pg = MON_23 - timedelta(seconds=120), True
+        await env.tick(500.0, MON_23)
+        assert not any(s == "turn_on" for s, _, _ in services(env))
+        assert "herstart over 180 s" in env.sd.status_dict()["sch1"]["detail"]
+        await env.tick(500.0, MON_23 + timedelta(seconds=181))
+        assert any(s == "turn_on" for s, _, _ in services(env))
 
     async def test_fulfilled_releases_device(self):
         env = build([entry_dict([WEEKNIGHT])])

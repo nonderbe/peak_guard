@@ -596,6 +596,7 @@ class PeakGuardPanel extends HTMLElement {
             <div class="device-entity">${this._esc(dev.entity_id || "")}</div>
             <div class="chips">${chips || `<span class="chip disabled">geen vensters</span>`}${extra.join("")}</div>
             ${st.status ? `<div class="sched-status">${this._esc(st.status)}</div>` : ""}
+            ${st.detail ? `<div class="sched-status" style="opacity:.75;font-size:.9em;">${this._esc(st.detail)}</div>` : ""}
             ${warnPeak}
           </div>
           <div class="device-actions">
@@ -1215,9 +1216,27 @@ class PeakGuardPanel extends HTMLElement {
 
     // EV evaluatie-checklist (enkel solar-cascade, enkel EV)
     const guard = this._data?.status?.ev_guards?.[device.id];
-    const evalChecklist = (isEV && !isPeak)
-      ? this._evEvalChecklist(device, guard)
-      : "";
+
+    // Laadschema dat dit apparaat nu aanstuurt: dan beslist het schema, niet de cascade.
+    const schedEntry = (this._data?.schedule || []).find(
+      (e) => e.enabled && e.device?.entity_id === device.entity_id
+        && this._data?.status?.schedule?.[e.id]?.controlled);
+    const schedSt = schedEntry ? this._data.status.schedule[schedEntry.id] : null;
+    const scheduleBox = schedSt ? `
+      <div class="info-restore-box" style="margin-top:14px;">
+        <div class="info-restore-title">🗓 Laadschema actief${schedSt.label ? ` · ${this._esc(schedSt.label)}` : ""}</div>
+        <div class="info-restore-text">
+          <b>${this._esc(schedSt.status || "")}</b>${schedSt.battery != null ? ` · batterij ${schedSt.battery}%` : ""}
+          ${schedSt.detail ? `<br>${this._esc(schedSt.detail)}` : ""}
+          <br><span style="color:var(--secondary-text-color,#888);">${isEV
+            ? "Tijdens een venster stuurt het laadschema de laadstroom op basis van de piekruimte; de zonne-overschotlogica wacht tot het doel bereikt is of het venster eindigt."
+            : "Tijdens een venster houdt het laadschema dit apparaat aan zolang er piekruimte is; de cascades laten het met rust."}</span>
+        </div>
+      </div>` : "";
+
+    const evalChecklist = schedSt
+      ? scheduleBox
+      : (isEV && !isPeak) ? this._evEvalChecklist(device, guard) : "";
 
     const activeLabel = snap
       ? `<span class="info-active-badge">Ingreep actief</span>`

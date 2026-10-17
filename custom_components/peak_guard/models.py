@@ -40,13 +40,15 @@ EV_HYSTERESIS_AMPS: float = 1.0
 EV_MIN_UPDATE_INTERVAL_S: float = 20.0
 EV_DEBOUNCE_STABLE_S: float = 20.0
 EV_FLOOR_PERCENTILE: int = 10
-EV_MIN_ON_DURATION_S: float = 360.0
 EV_MIN_OFF_DURATION_S: float = 300.0
 EV_WAKE_TIMEOUT_S: float = 15.0
 EV_CMD_MAX_RETRIES: int = 2
 EV_CMD_RETRY_DELAY_S: float = 3.0
 EV_RATE_LIMIT_MAX_CALLS: int = 12
 EV_RATE_LIMIT_WINDOW_S: float = 600.0
+# Zoveel plaatsen van het korte venster blijven voor commando's die het
+# verbruik verlagen (piekbeperking, stoppen), zodat verhogen ze niet verdringt.
+EV_RATE_LIMIT_RESERVE: int = 2
 EV_SENSOR_STALE_S: float = 180.0
 EV_WAKE_COOLDOWN_S: float = 900.0
 

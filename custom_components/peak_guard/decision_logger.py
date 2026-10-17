@@ -31,7 +31,6 @@ from .models import (
     DeviceSnapshot,
     EV_DEBOUNCE_STABLE_S,
     EV_MIN_OFF_DURATION_S,
-    EV_MIN_ON_DURATION_S,
     EV_RATE_LIMIT_MAX_CALLS,
     EV_RATE_LIMIT_WINDOW_S,
     EVState,
@@ -315,12 +314,7 @@ class DecisionLogger:
         now_utc = datetime.now(timezone.utc)
         if guard.turned_on_at is not None and guard.state == EVState.CHARGING:
             on_secs = (now_utc - guard.turned_on_at).total_seconds()
-            min_on_rem = max(0.0, EV_MIN_ON_DURATION_S - on_secs)
-            lines.append(
-                f"       EV draait: {on_secs:.0f}s"
-                + (f" | Min ON nog: {min_on_rem:.0f}s"
-                   if min_on_rem > 0 else " | Min ON verstreken ✓")
-            )
+            lines.append(f"       EV draait: {on_secs:.0f}s")
         if guard.turned_off_at is not None and guard.turned_off_by_pg:
             off_secs = (now_utc - guard.turned_off_at).total_seconds()
             min_off_rem = max(0.0, EV_MIN_OFF_DURATION_S - off_secs)

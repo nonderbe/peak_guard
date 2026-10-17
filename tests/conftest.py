@@ -195,6 +195,8 @@ class MockServiceRegistry:
     def __init__(self, raise_on: set[str] | None = None) -> None:
         self.calls: list[dict] = []
         self._raise_on: set[str] = raise_on or set()
+        # Optionele foutmelding (bv. "The vehicle is not 'online'") i.p.v. de standaard.
+        self.error_message: str | None = None
 
     async def async_call(
         self,
@@ -205,7 +207,7 @@ class MockServiceRegistry:
     ) -> None:
         self.calls.append({"domain": domain, "service": service, "data": data})
         if service in self._raise_on:
-            raise HomeAssistantError(f"Gesimuleerde fout: {service}")
+            raise HomeAssistantError(self.error_message or f"Gesimuleerde fout: {service}")
 
     def calls_for(self, service: str) -> list[dict]:
         return [c for c in self.calls if c["service"] == service]

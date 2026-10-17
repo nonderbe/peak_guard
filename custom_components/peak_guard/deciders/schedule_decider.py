@@ -36,14 +36,14 @@ from ..const import (
     CONF_PEAK_SENSOR,
     DEFAULT_BUFFER_WATTS,
     DEFAULT_EV_MAX_AMPERE,
-    SCHEDULE_INCREASE_INTERVAL_S,
-    SCHEDULE_INCREASE_MIN_A,
     SCHEDULE_SENSOR_STALE_S,
     SCHEDULE_SOC_RESEND_S,
     SCHEDULE_START_CONFIRM_S,
     SCHEDULE_UNPLANNED_GRACE_S,
 )
 from ..models import (
+    EV_MIN_OFF_DURATION_S,
+    EV_MIN_UPDATE_INTERVAL_S,
     BaseCascadeDevice,
     DeviceSnapshot,
     EVState,
@@ -76,10 +76,13 @@ def _parse_dt(value) -> Optional[datetime]:
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
 
 
-_DT_FIELDS = ("started_at", "soc_sent_at", "unplanned_since", "retry_after")
+_DT_FIELDS = ("started_at", "soc_sent_at", "unplanned_since", "retry_after", "current_retry_after")
 # Na zoveel turn_on's zonder dat de EV echt begint te laden: pauze.
 SCHEDULE_MAX_START_ATTEMPTS = 3
 SCHEDULE_START_BACKOFF_S = 1800.0
+# Na een mislukte stroomaanpassing (bv. out_of_range) zo lang niet opnieuw.
+# Een onbereikbare wagen vangt EVGuard zelf op (EV_UNREACHABLE_BACKOFF_S).
+SCHEDULE_CURRENT_RETRY_S = 300.0
 
 
 @dataclass
@@ -99,7 +102,9 @@ class ScheduleRunState:
     unplanned_since:     Optional[datetime] = None
     start_attempts:      int = 0
     retry_after:         Optional[datetime] = None
+    current_retry_after: Optional[datetime] = None
     status:              str = ""
+    detail:              str = ""
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -321,6 +326,7 @@ class ScheduleDecider(BaseDecider):
                 "target_soc": rs.target_soc,
                 "fulfilled":  rs.fulfilled,
                 "status":     rs.status or ("buiten venster" if not rs.active else ""),
+                "detail":     rs.detail if rs.active else "",
                 "battery":    battery,
                 "started_at": _iso(rs.started_at),
                 "controlled": self.is_controlled(e.device),
@@ -535,6 +541,7 @@ class ScheduleDecider(BaseDecider):
         ev = self.ev_guard
         guard = ev.get_guard(dev.id)
         changed = False
+        rs.detail = ""
 
         if not rs.fulfilled and self._reached(entry, rs, target, now):
             rs.fulfilled = True
@@ -604,14 +611,9 @@ class ScheduleDecider(BaseDecider):
             current = ev.read_current_a(dev)
             if current is None:
                 current = guard.last_sent_amps
-            if amps_allowed is not None and current is not None:
-                if current > max_a + 0.5:
-                    await ev.schedule_set_current(dev, int(max_a), now)
-                elif amps_allowed >= current + SCHEDULE_INCREASE_MIN_A and (
-                    guard.last_current_update is None
-                    or (now - guard.last_current_update).total_seconds() >= SCHEDULE_INCREASE_INTERVAL_S
-                ):
-                    await ev.schedule_set_current(dev, amps_allowed, now)
+            rs.detail = await self._adjust_current(
+                entry, rs, guard, current, amps_allowed, allowance, max_a, consumption, now,
+            )
             shown = guard.last_sent_amps if guard.last_sent_amps is not None else current
             rs.status = f"laden{f' {shown:.0f} A' if shown is not None else ''} tot {target}%"
             return changed
@@ -621,6 +623,19 @@ class ScheduleDecider(BaseDecider):
             return changed
         if amps_allowed < hw_min:
             rs.status = "wacht op piekruimte"
+            rs.detail = (
+                f"ruimte {allowance:.0f} W → {amps_allowed} A, "
+                f"minimum laadstroom is {hw_min:.0f} A"
+            )
+            return changed
+
+        off_rem = self._min_off_remaining_s(entry, now)
+        if off_rem > 0:
+            rs.status = "wacht na vorige stop"
+            rs.detail = (
+                f"herstart over {off_rem:.0f} s — minstens "
+                f"{EV_MIN_OFF_DURATION_S / 60:.0f} min uit om de schakelaar te sparen"
+            )
             return changed
 
         if rs.retry_after is not None and now < rs.retry_after:
@@ -646,6 +661,90 @@ class ScheduleDecider(BaseDecider):
         else:
             rs.status = skip
         return changed
+
+    async def _adjust_current(
+        self, entry: ScheduleEntry, rs: ScheduleRunState, guard, current: Optional[float],
+        amps_allowed: Optional[int], allowance: Optional[float], max_a: float,
+        consumption: Optional[float], now: datetime,
+    ) -> str:
+        """Verhoog de laadstroom waar mogelijk; geeft de uitleg voor het info-venster terug.
+
+        Verhogen per hele ampère, met dezelfde minimale tussentijd als de
+        solar- en piekregeling (EV_MIN_UPDATE_INTERVAL_S), zodat de stroom de
+        piekruimte zo nauw mogelijk volgt. Verlagen doet de piekbeperking.
+        """
+        dev = entry.device
+        ev = self.ev_guard
+        if amps_allowed is None or current is None:
+            return "stroom ongewijzigd — geen verbruik-, piek- of laadstroommeting"
+        cur = int(round(current))
+        unreachable = ev.unreachable_remaining_s(dev.name)
+        if unreachable > 0:
+            return f"wagen onbereikbaar (slaapt, offline of update) — nieuwe poging over {unreachable:.0f} s"
+        if rs.current_retry_after is not None and now < rs.current_retry_after:
+            wait = (rs.current_retry_after - now).total_seconds()
+            return f"vorige stroomaanpassing mislukt — nieuwe poging over {wait:.0f} s"
+        if current > max_a + 0.5:
+            if await ev.schedule_set_current(dev, int(max_a), now):
+                return f"verlaagd naar max {max_a:.0f} A"
+            rs.current_retry_after = now + timedelta(seconds=SCHEDULE_CURRENT_RETRY_S)
+            return f"verlagen naar max {max_a:.0f} A uitgesteld (API-limiet of fout)"
+        if cur >= max_a:
+            return f"maximum {max_a:.0f} A bereikt"
+
+        own_w = ev.charging_draw_w(dev)
+        room = (
+            f"ruimte {allowance:.0f} W (piekgrens − buffer − huisverbruik "
+            f"{consumption - own_w:.0f} W) → {amps_allowed} A"
+        )
+        hw_min = ev.hw_min_amps(dev)
+        if amps_allowed < hw_min:
+            return f"{room}; minimum laadstroom is {hw_min:.0f} A — niet verhoogd"
+        if amps_allowed <= cur:
+            if amps_allowed < cur:
+                return f"{room}; verlagen laat het schema over aan de piekbeperking"
+            return f"{room}; geen ruimte om te verhogen"
+        # De piek-cascade kan de stroom via een kopie met een ander id verlaagd
+        # hebben: de laatste aanpassing over alle kopieën telt voor het interval.
+        last = self._last_current_update(entry)
+        if last is not None:
+            wait = EV_MIN_UPDATE_INTERVAL_S - (now - last).total_seconds()
+            if wait > 0:
+                return f"{room}; verhoging naar {amps_allowed} A over {wait:.0f} s"
+        if await ev.schedule_set_current(dev, amps_allowed, now):
+            _LOGGER.info(
+                "Peak Guard [SCHEMA]: '%s' laadstroom %d → %d A (ruimte %.0f W)",
+                dev.name, cur, amps_allowed, allowance,
+            )
+            return f"verhoogd van {cur} naar {amps_allowed} A ({room})"
+        rs.current_retry_after = now + timedelta(seconds=SCHEDULE_CURRENT_RETRY_S)
+        return f"{room}; verhoging naar {amps_allowed} A mislukt (API-limiet of fout) — nieuwe poging later"
+
+    def _copy_guards(self, entry: ScheduleEntry) -> list:
+        """Guards van dit apparaat: het schema en elke cascade-kopie (mogelijk ander id)."""
+        ids = {entry.device.id} | {
+            d.id for d in list(self._peak_cascade) + list(self._inject_cascade)
+            if d.entity_id == entry.entity_id
+        }
+        return [self.ev_guard.get_guard(i) for i in ids]
+
+    def _last_current_update(self, entry: ScheduleEntry) -> Optional[datetime]:
+        """Laatste stroomaanpassing over alle kopieën van dit apparaat."""
+        stamps = [
+            g.last_current_update for g in self._copy_guards(entry)
+            if g.last_current_update is not None
+        ]
+        return max(stamps) if stamps else None
+
+    def _min_off_remaining_s(self, entry: ScheduleEntry, now: datetime) -> float:
+        """Resterende min-OFF-tijd (schakelaar sparen) na een stop door Peak Guard."""
+        stops = [
+            g.turned_off_at for g in self._copy_guards(entry)
+            if g.turned_off_by_pg and g.turned_off_at is not None
+        ]
+        if not stops:
+            return 0.0
+        return max(0.0, EV_MIN_OFF_DURATION_S - (now - max(stops)).total_seconds())
 
     def _handover_to_solar(self, entry: ScheduleEntry, now: datetime, draw_w: float) -> None:
         """Lopende lading overdragen aan de solar-cascade (die stopt hem zodra het overschot weg is)."""

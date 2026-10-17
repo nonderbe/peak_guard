@@ -27,6 +27,9 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 
 from ..const import (
+    EV_API_BUDGET_RESERVE,
+    EV_UNREACHABLE_BACKOFF_S,
+    EV_UNREACHABLE_ERRORS,
     DEFAULT_EV_MAX_AMPERE,
     DEFAULT_EV_MIN_AMPERE,
     DEFAULT_EV_SOLAR_START_THRESHOLD_W,
@@ -45,6 +48,7 @@ from ..models import (
     EV_MIN_OFF_DURATION_S,
     EV_MIN_UPDATE_INTERVAL_S,
     EV_RATE_LIMIT_MAX_CALLS,
+    EV_RATE_LIMIT_RESERVE,
     EV_RATE_LIMIT_WINDOW_S,
     EV_CMD_MAX_RETRIES,
     EV_CMD_RETRY_DELAY_S,
@@ -59,6 +63,10 @@ if TYPE_CHECKING:
     from ..avoided_peak_tracker import PeakAvoidTracker, SolarShiftTracker
 
 _LOGGER = logging.getLogger(__name__)
+
+
+class EVCallBlocked(HomeAssistantError):
+    """_svc() weigerde de call vóór er iets vertrok (budget, reserve, onbereikbaar)."""
 
 
 class EVGuard:
@@ -93,6 +101,11 @@ class EVGuard:
         # het een SOC-override opheft (doel van het actieve venster of de
         # rust-laadlimiet). None = geen schema → originele limiet herstellen.
         self._soc_rest_lookup = None
+        # Wagen onbereikbaar (slaapt/offline/update): device-naam → tot wanneer
+        # enkel verlagende commando's doorgaan. Gezet en gewist door _svc().
+        self._unreachable_until: Dict[str, datetime] = {}
+        # Dag (UTC) waarop de reserve-waarschuwing al gegeven werd.
+        self._reserve_warned_day: Optional[str] = None
 
     # ------------------------------------------------------------------ #
     #  Properties voor controller.to_dict()                               #
@@ -153,6 +166,11 @@ class EVGuard:
                 }
                 if self._daily_budget is not None else None
             ),
+            "ev_budget_reserve": self.budget_reserve,
+            "ev_unreachable": {
+                name: round((until - now).total_seconds())
+                for name, until in self._unreachable_until.items() if until > now
+            },
             "warnings": list(self._recent_warnings),
         }
 
@@ -173,7 +191,7 @@ class EVGuard:
         guard.debounce_remaining_s = 0.0
         guard.debounce_floor_w     = 0.0
 
-    def _rate_check(self, device_name: str, reason: str) -> bool:
+    def _rate_check(self, device_name: str, reason: str, *, reducing: bool = False) -> bool:
         """
         Geeft True als een EV service call is toegestaan.
         Logt een warning en geeft False als de korte-termijn rate-limiter of
@@ -182,7 +200,8 @@ class EVGuard:
         het dagbudget hoe dan ook nog eens hard, als vangnet voor
         call sites die deze pre-check niet aanroepen (bv. de wake-button).
         """
-        if not self._rate_limiter.is_allowed():
+        floor = 0 if reducing else EV_RATE_LIMIT_RESERVE
+        if self._rate_limiter.remaining <= floor:
             self._warn(
                 "Peak Guard EV '%s': service call OVERGESLAGEN wegens globale rate-limiter "
                 "(%d/%d calls in %.0f s). Reden: %s",
@@ -206,8 +225,92 @@ class EVGuard:
         return True
 
     def _record_call(self) -> None:
-        """Registreer dat we zojuist een EV service call hebben gemaakt."""
+        """Registreer één echte EV service call (enkel vanuit _svc())."""
         self._rate_limiter.record()
+
+    def _reduces_draw(self, domain: str, service: str, data: dict) -> bool:
+        """True voor een commando dat het EV-verbruik verlaagt: turn_off, of een
+        lagere waarde op een number (laadstroom of laadlimiet)."""
+        if domain == "switch" and service == "turn_off":
+            return True
+        if domain == "number" and service == "set_value":
+            st = self.hass.states.get(data.get("entity_id", ""))
+            try:
+                return float(data.get("value")) < float(st.state)
+            except (AttributeError, TypeError, ValueError):
+                return False
+        return False
+
+    @property
+    def budget_reserve(self) -> int:
+        """Gereserveerde calls; hooguit een kwart van het dagbudget (kleine budgetten)."""
+        if self._daily_budget is None:
+            return 0
+        return min(EV_API_BUDGET_RESERVE, self._daily_budget.max_calls // 4)
+
+    def unreachable_remaining_s(self, device_name: str, now: Optional[datetime] = None) -> float:
+        until = self._unreachable_until.get(device_name)
+        if until is None:
+            return 0.0
+        return max(0.0, (until - (now or datetime.now(timezone.utc))).total_seconds())
+
+    def _blocked_reason(self, domain: str, service: str, data: dict) -> Optional[str]:
+        """Waarom _svc() deze call niet mag sturen, of None."""
+        if self._daily_budget is not None and not self._daily_budget.is_allowed():
+            return (
+                f"dagelijks API-budget bereikt ({self._daily_budget.calls_today}/"
+                f"{self._daily_budget.max_calls} calls vandaag)"
+            )
+        if self._reduces_draw(domain, service, data):
+            return None
+        reserve = self.budget_reserve
+        if self._daily_budget is not None and self._daily_budget.remaining <= reserve:
+            day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            if self._reserve_warned_day != day:
+                self._reserve_warned_day = day
+                self._warn(
+                    "Peak Guard EV: nog %d calls in het dagbudget — de laatste %d zijn "
+                    "voorbehouden voor verlagen en stoppen; starten en verhogen "
+                    "gebeurt vandaag niet meer",
+                    self._daily_budget.remaining, reserve,
+                )
+            return f"dagbudget-reserve ({self._daily_budget.remaining} calls over)"
+        if self._rate_limiter.remaining <= EV_RATE_LIMIT_RESERVE:
+            return (
+                f"rate-limiter: laatste {EV_RATE_LIMIT_RESERVE} plaatsen voorbehouden "
+                f"voor verlagen ({self._rate_limiter.calls_in_window}/"
+                f"{EV_RATE_LIMIT_MAX_CALLS} in {EV_RATE_LIMIT_WINDOW_S:.0f} s)"
+            )
+        if domain == "button":
+            return None   # wake-knop: eigen cooldown in _wake_gate
+        device = self._log_ctx.get("device", "")
+        rem = self.unreachable_remaining_s(device)
+        if rem > 0:
+            return f"wagen onbereikbaar — nieuwe poging over {rem:.0f} s"
+        return None
+
+    def _note_result(self, domain: str, error: Optional[str]) -> None:
+        """Houd per wagen bij of hij bereikbaar is, op basis van het call-resultaat.
+
+        Een geslaagde wake-knop (blocking=False) zegt niets over de wagen en
+        wist de markering dus niet.
+        """
+        device = self._log_ctx.get("device", "")
+        if error is None:
+            if domain != "button":
+                self._unreachable_until.pop(device, None)
+            return
+        if not any(frag in error.lower() for frag in EV_UNREACHABLE_ERRORS):
+            return
+        first = self.unreachable_remaining_s(device) == 0
+        self._unreachable_until[device] = (
+            datetime.now(timezone.utc) + timedelta(seconds=EV_UNREACHABLE_BACKOFF_S)
+        )
+        if first:
+            self._warn(
+                "Peak Guard EV: '%s' onbereikbaar (%s) — %.0f min enkel nog verlagen/stoppen",
+                device, error, EV_UNREACHABLE_BACKOFF_S / 60,
+            )
 
     def _track_action(self, entity_id: str, action: str, value=None) -> None:
         track_action(self.config, self._iteration_actions, entity_id, action, value)
@@ -286,20 +389,25 @@ class EVGuard:
         het dagelijkse EV-API-budget handhaaft.
 
         Dit is het ENIGE punt waar echte EV-service-calls (dus echte Tesla
-        API-aanroepen) vertrekken, dus het dagbudget wordt hier hard
-        gehandhaafd — onafhankelijk van of de aanroeper zelf _rate_check()/
-        _record_call() correct gebruikt. Zie v1.8.12: die per-call-site
-        boekhouding bleek eerder foutgevoelig (retries die niet meetelden).
+        API-aanroepen) vertrekken, dus hier worden ze ook geteld (rate-limiter
+        én dagbudget) en geblokkeerd — onafhankelijk van de aanroeper. Zie
+        v1.8.12: per-call-site boekhouding bleek foutgevoelig.
+
+        Geblokkeerd (EVCallBlocked, er vertrekt niets en er wordt niets geteld):
+        dagbudget op; binnen de reserve of bij een onbereikbare wagen alles
+        behalve commando's die het verbruik verlagen.
         """
-        if self._daily_budget is not None and not self._daily_budget.is_allowed():
-            self._warn(
-                "Peak Guard EV: %s.%s OVERGESLAGEN — dagelijks API-budget bereikt "
-                "(%d/%d calls vandaag, entity '%s')",
-                domain, service,
-                self._daily_budget.calls_today, self._daily_budget.max_calls,
-                data.get("entity_id", ""),
+        reason = self._blocked_reason(domain, service, data)
+        if reason is not None:
+            msg = (
+                f"Peak Guard EV: {domain}.{service} OVERGESLAGEN — {reason} "
+                f"(entity '{data.get('entity_id', '')}')"
             )
-            raise HomeAssistantError("Peak Guard: dagelijks EV API-budget bereikt")
+            if reason.startswith("dagelijks"):
+                self._warn(msg)
+            else:
+                _LOGGER.debug(msg)
+            raise EVCallBlocked(f"Peak Guard: {reason}")
 
         start = monotonic()
         error_str: Optional[str] = None
@@ -311,6 +419,8 @@ class EVGuard:
             error_str = str(err)
             raise
         finally:
+            self._record_call()
+            self._note_result(domain, error_str)
             if self._daily_budget is not None:
                 self._daily_budget.record()
                 self.hass.async_create_task(self._daily_budget.async_save())
@@ -670,11 +780,11 @@ class EVGuard:
                 break
             try:
                 await self._svc("switch", "turn_on", {"entity_id": sw_entity})
-                self._record_call()
                 return True, None
             except HomeAssistantError as ha_err:
-                self._record_call()
                 last_err = ha_err
+                if isinstance(ha_err, EVCallBlocked) or self.unreachable_remaining_s(device.name) > 0:
+                    break   # opnieuw proberen helpt niet (geblokkeerd of wagen onbereikbaar)
                 if attempt < EV_CMD_MAX_RETRIES:
                     self._warn(
                         "Peak Guard [%s]: '%s' turn_on mislukt "
@@ -867,15 +977,23 @@ class EVGuard:
                             if snapshot.original_current is not None
                             else (device.min_value or DEFAULT_EV_MIN_AMPERE)
                         )
-                        await self._svc(
-                            "number", "set_value",
-                            {"entity_id": cur_entity, "value": round(restore_a, 1)},
-                        )
-                        _LOGGER.info(
-                            "Peak Guard EV solar: '%s' laadstroom hersteld naar %.1f A "
-                            "(reden: herstel na injectiepreventie)",
-                            device.name, restore_a,
-                        )
+                        # De stroom terugzetten is bijzaak: een geblokkeerde of
+                        # mislukte call mag de turn_off hieronder niet tegenhouden.
+                        try:
+                            await self._svc(
+                                "number", "set_value",
+                                {"entity_id": cur_entity, "value": round(restore_a, 1)},
+                            )
+                            _LOGGER.info(
+                                "Peak Guard EV solar: '%s' laadstroom hersteld naar %.1f A "
+                                "(reden: herstel na injectiepreventie)",
+                                device.name, restore_a,
+                            )
+                        except HomeAssistantError as err:
+                            _LOGGER.debug(
+                                "Peak Guard EV solar: '%s' laadstroom niet hersteld (%s) "
+                                "— laden toch stoppen", device.name, err,
+                            )
 
                     await self._svc("switch", "turn_off", {"entity_id": sw_entity})
                     _LOGGER.info(
@@ -1025,7 +1143,7 @@ class EVGuard:
                 return True  # interval nog actief: wacht, stop EV niet
 
         # GATE: global rate limiter
-        if not self._rate_check(device.name, f"throttle_down {int(current_a)} → {new_a} A"):
+        if not self._rate_check(device.name, f"throttle_down {int(current_a)} → {new_a} A", reducing=True):
             return True  # rate-limiter vol: probeer volgende cyclus, stop EV niet
 
         try:
@@ -1040,7 +1158,6 @@ class EVGuard:
             )
             return False
 
-        self._record_call()
         self._track_action(cur_entity, "number.set_value", float(new_a))
         guard.last_sent_amps      = float(new_a)
         guard.last_current_update = now
@@ -1144,13 +1261,11 @@ class EVGuard:
                 {"entity_id": device.soc_entity, "value": float(value)},
             )
         except HomeAssistantError as err:
-            self._record_call()
             self._warn(
                 "Peak Guard [SCHEMA]: '%s' laadlimiet %.0f%% instellen mislukt: %s",
                 device.name, value, err,
             )
             return False
-        self._record_call()
         self._track_action(device.soc_entity, "number.set_value", float(value))
         _LOGGER.info(
             "Peak Guard [SCHEMA]: '%s' laadlimiet → %.0f%% (%s)", device.name, value, reason,
@@ -1217,13 +1332,11 @@ class EVGuard:
                 "number", "set_value", {"entity_id": cur_entity, "value": float(amps)},
             )
         except HomeAssistantError as err:
-            self._record_call()
             self._warn(
                 "Peak Guard [SCHEMA]: '%s' laadstroom %d A instellen mislukt: %s",
                 device.name, amps, err,
             )
             return False
-        self._record_call()
         self._track_action(cur_entity, "number.set_value", float(amps))
         guard.last_sent_amps      = float(amps)
         guard.last_current_update = now
@@ -1233,18 +1346,16 @@ class EVGuard:
         """Stop het laden (einde venster of ongeplande lading); True bij succes."""
         guard = self.get_guard(device.id)
         sw_entity = device.switch_entity or device.entity_id
-        if not self._rate_check(device.name, f"turn_off ({reason})"):
+        if not self._rate_check(device.name, f"turn_off ({reason})", reducing=True):
             return False
         self._log_ctx = {"device": device.name, "cascade": "schedule", "surplus_w": 0.0}
         try:
             await self._svc("switch", "turn_off", {"entity_id": sw_entity})
         except HomeAssistantError as err:
-            self._record_call()
             self._warn(
                 "Peak Guard [SCHEMA]: '%s' turn_off mislukt (%s): %s", device.name, reason, err,
             )
             return False
-        self._record_call()
         self._track_action(sw_entity, "switch.turn_off")
         self.release_schedule(device)
         guard.turned_off_at    = now
@@ -1366,7 +1477,6 @@ class EVGuard:
         if device.max_soc is not None and not guard.soc_override_active:
             if self._rate_check(device.name, "SOC-override activeren"):
                 await self._set_soc_override(device, override=True)
-                self._record_call()
                 guard.soc_override_active = True
 
         current_a = self._effective_current_amps(device, guard, cur_state, now, current_a)
@@ -1426,24 +1536,24 @@ class EVGuard:
                 )
                 return excess - current_w
 
-            if not self._rate_check(device.name, "turn_off voor piekbeperking"):
+            if not self._rate_check(device.name, "turn_off voor piekbeperking", reducing=True):
                 return excess
 
             turn_off_ok = False
             _last_err: Optional[HomeAssistantError] = None
             for _attempt in range(EV_CMD_MAX_RETRIES + 1):
                 if _attempt > 0 and not self._rate_check(
-                    device.name, "turn_off retry voor piekbeperking"
+                    device.name, "turn_off retry voor piekbeperking", reducing=True
                 ):
                     break
                 try:
                     await self._svc("switch", "turn_off", {"entity_id": sw_entity})
-                    self._record_call()
                     turn_off_ok = True
                     break
                 except HomeAssistantError as ha_err:
-                    self._record_call()
                     _last_err = ha_err
+                    if isinstance(ha_err, EVCallBlocked) or self.unreachable_remaining_s(device.name) > 0:
+                        break   # onbereikbaar: hooguit één poging per loop
                     if _attempt < EV_CMD_MAX_RETRIES:
                         self._warn(
                             "Peak Guard EV peak: '%s' turn_off mislukt "
@@ -1470,7 +1580,6 @@ class EVGuard:
                             "number", "set_value",
                             {"entity_id": cur_entity, "value": min_a},
                         )
-                        self._record_call()
                         self._track_action(cur_entity, "number.set_value", min_a)
                     except HomeAssistantError as err:
                         self._warn(
@@ -1538,9 +1647,9 @@ class EVGuard:
                 return excess - actual_reduction_w
 
         if not self._rate_check(
-            device.name, f"set_value peak {int(eff_current_a)} → {new_a} A"
+            device.name, f"set_value peak {int(eff_current_a)} → {new_a} A", reducing=True
         ):
-            return excess - actual_reduction_w
+            return excess   # niet verlaagd: de cascade moet verder naar het volgende apparaat
 
         try:
             await self._svc(
@@ -1552,9 +1661,8 @@ class EVGuard:
                 "Peak Guard EV peak: '%s' set_value %d A mislukt: %s",
                 device.name, new_a, err,
             )
-            return excess - actual_reduction_w
+            return excess   # niet verlaagd: de cascade moet verder naar het volgende apparaat
 
-        self._record_call()
         self._track_action(cur_entity, "number.set_value", float(new_a))
         _LOGGER.info(
             "Peak Guard EV peak: '%s' laadstroom %d → %d A "
@@ -1623,10 +1731,9 @@ class EVGuard:
                     device.name, cable_entity,
                     _cable_st.state if _cable_st else "??",
                 )
-                if self._rate_check(device.name, "turn_off kabel ontkoppeld"):
+                if self._rate_check(device.name, "turn_off kabel ontkoppeld", reducing=True):
                     try:
                         await self._svc("switch", "turn_off", {"entity_id": sw_entity})
-                        self._record_call()
                         self._track_action(sw_entity, "switch.turn_off")
                     except HomeAssistantError as err:
                         self._warn(
@@ -1875,7 +1982,6 @@ class EVGuard:
                                 "number", "set_value",
                                 {"entity_id": cur_entity, "value": float(new_a)},
                             )
-                            self._record_call()
                             self._track_action(cur_entity, "number.set_value", float(new_a))
                             guard.last_sent_amps      = float(new_a)
                             guard.last_current_update = now
@@ -1970,7 +2076,6 @@ class EVGuard:
             )
             return excess - actual_consumption_w
 
-        self._record_call()
         self._track_action(cur_entity, "number.set_value", float(new_a))
         _LOGGER.info(
             "Peak Guard [SOLAR]: '%s' laadstroom %d → %d A "

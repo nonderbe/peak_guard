@@ -107,15 +107,24 @@ DEFAULT_EV_SOLAR_STOP_THRESHOLD_W: float = 0.0
 # — pas aan op basis van het werkelijke maandquotum en de waargenomen
 # achtergrondbelasting.
 EV_API_DAILY_BUDGET: int = 10_000 // 30  # = 333
+# Laatste calls van het dagbudget enkel voor commando's die het EV-verbruik
+# verlagen (turn_off, lagere laadstroom/laadlimiet): een budget dat opraakt
+# door verhogen of starten mag de piekbescherming nooit blokkeren.
+EV_API_BUDGET_RESERVE: int = 35
+# Na een fout waaruit blijkt dat de wagen onbereikbaar is (slaapt, offline,
+# software-update) zo lang geen andere commando's meer naar die wagen dan
+# verlagen/stoppen (en de wake-knop, die heeft een eigen cooldown).
+EV_UNREACHABLE_BACKOFF_S: float = 900.0
+# Tekstfragmenten (kleine letters) in de foutmelding die op een onbereikbare wagen wijzen.
+EV_UNREACHABLE_ERRORS: tuple = (
+    "not 'online'", "not online", "offline", "asleep",
+    "software_update_in_progress", "vehicle unavailable",
+)
 
 # ------------------------------------------------------------------ #
 #  Laadschema (Planning-tab)                                           #
 # ------------------------------------------------------------------ #
 
-# Laadstroom tijdens een venster enkel verhogen als de winst minstens zoveel
-# ampère is én de vorige aanpassing lang genoeg geleden is (spaart API-calls).
-SCHEDULE_INCREASE_MIN_A: float = 2.0
-SCHEDULE_INCREASE_INTERVAL_S: float = 300.0
 # Een ongeplande lading (buiten venster, zonder overschot) pas na deze tijd
 # stoppen, zodat de solar-cascade een inplug tijdens injectie kan overnemen.
 SCHEDULE_UNPLANNED_GRACE_S: float = 120.0
