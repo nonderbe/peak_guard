@@ -115,6 +115,10 @@ EV_API_BUDGET_RESERVE: int = 35
 # software-update) zo lang geen andere commando's meer naar die wagen dan
 # verlagen/stoppen (en de wake-knop, die heeft een eigen cooldown).
 EV_UNREACHABLE_BACKOFF_S: float = 900.0
+# Herstart na piekbeperking op een lagere stroom: zo lang wachten tot de wagen
+# laadt. Laadt hij dan nog niet (vol, kabel uit), dan vervalt het snapshot,
+# zodat niet elke cyclus opnieuw turn_on/set_value naar de wagen gaat.
+PEAK_RESTART_CONFIRM_S: float = 180.0
 # Tekstfragmenten (kleine letters) in de foutmelding die op een onbereikbare wagen wijzen.
 EV_UNREACHABLE_ERRORS: tuple = (
     "not 'online'", "not online", "offline", "asleep",

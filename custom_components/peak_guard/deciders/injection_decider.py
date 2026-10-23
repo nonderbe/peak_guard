@@ -64,6 +64,10 @@ class InjectionDecider(BaseDecider):
     def set_skip_fn(self, skip_fn: Optional[Callable[[BaseCascadeDevice], bool]]) -> None:
         self._skip_fn = skip_fn
 
+    @property
+    def snapshots(self) -> Dict[str, DeviceSnapshot]:
+        return self._snapshots
+
     # ------------------------------------------------------------------ #
     #  Publieke interface                                                  #
     # ------------------------------------------------------------------ #
@@ -125,21 +129,32 @@ class InjectionDecider(BaseDecider):
         )
         if not snapshots_to_restore:
             return
-        # Herstel één apparaat per cyclus (laagste prioriteit eerst)
-        device, snapshot = snapshots_to_restore[0]
-
-        # EV-lader: verlaag eerst de laadstroom vóór een volledige stop.
-        # Zo blijft de wagen laden bij een tijdelijk dalend solar-overschot.
+        # Herstel één apparaat per cyclus (laagste prioriteit eerst).
+        # Een EV-lader verlaagt eerst zijn laadstroom vóór een volledige stop en
+        # blijft laden zolang de zon nog een deel dekt. Dan is het volgende
+        # apparaat aan de beurt: een schakelaar uitzetten verlaagt de netafname
+        # zonder dat de EV moet stoppen (die vangt een eventueel overschot op).
         # consumption >= 0 (not > 0): ook bij exact nul-verbruik moet throttle_down_solar
         # beslissen of de EV mag blijven lopen — anders stopt de EV onnodig wanneer
         # EV-verbruik en zonne-opbrengst elkaar precies opheffen.
-        if device.action_type == ACTION_EV_CHARGER and consumption >= 0:
-            throttled = await self.ev_guard.throttle_down_solar(device, consumption, now=now)
-            if throttled:
-                return  # stroom verlaagd — EV blijft laden, geen verdere actie
-
-        restored = await self._restore_device(device, snapshot, cascade_type="solar", now=now)
-        if restored:
-            del self._snapshots[device.entity_id]
-            _LOGGER.info("Peak Guard: '%s' hersteld", device.name)
-            await self._save_fn()
+        for index, (device, snapshot) in enumerate(snapshots_to_restore):
+            if device.action_type == ACTION_EV_CHARGER and consumption >= 0:
+                throttled = await self.ev_guard.throttle_down_solar(device, consumption, now=now)
+                if throttled:
+                    hold = self.ev_guard.hold_for(device.id) or {}
+                    if hold.get("code") == "solar_share":
+                        continue  # EV laadt door zonder ingreep: volgende apparaat
+                    return        # stroom verlaagd of verlaging volgt: één ingreep per cyclus
+            for waiting, _snap in snapshots_to_restore[index + 1:]:
+                self.ev_guard.set_hold(
+                    waiting.id, "restore_queue",
+                    f"Blijft aan ondanks netafname ({consumption:.0f} W): uitschakelen gebeurt "
+                    f"één apparaat per cyclus, laagste prioriteit eerst. '{device.name}' is "
+                    f"eerst aan de beurt.",
+                )
+            restored = await self._restore_device(device, snapshot, cascade_type="solar", now=now)
+            if restored:
+                del self._snapshots[device.entity_id]
+                _LOGGER.info("Peak Guard: '%s' hersteld", device.name)
+                await self._save_fn()
+            return

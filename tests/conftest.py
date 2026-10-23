@@ -234,7 +234,7 @@ class MockPeakTracker:
     def record_pending_avoid(self, device_id, device_name, nominal_kw, ts):
         self.pending_avoids.append({"id": device_id, "kw": nominal_kw})
 
-    def start_measurement_on_turnon(self, device_id, device_name, ts):
+    def start_measurement_on_turnon(self, device_id, device_name, ts, max_kw=None):
         self.turn_on_measurements.append(device_id)
 
     def complete_peak_calculation(self, device_id, now):

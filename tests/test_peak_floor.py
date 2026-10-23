@@ -171,9 +171,11 @@ class TestSavingsFloor:
 
     def _cycle(self, tracker, nominal_kw, device_id="dev1", avoid_ts=Q):
         tracker.record_pending_avoid(device_id, "Oven", nominal_kw, ts=avoid_ts)
-        tracker.start_measurement_on_turnon(device_id, "Oven", ts=avoid_ts)
+        tracker.start_measurement_on_turnon(
+            device_id, "Oven", ts=avoid_ts + timedelta(minutes=30)
+        )
         return tracker.complete_peak_calculation(
-            device_id, now=avoid_ts + timedelta(minutes=15)
+            device_id, now=avoid_ts + timedelta(minutes=45)
         )
 
     def test_avoided_peak_entirely_below_floor_saves_nothing(self):

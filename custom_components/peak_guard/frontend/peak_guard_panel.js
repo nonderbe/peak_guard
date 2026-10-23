@@ -1169,6 +1169,11 @@ class PeakGuardPanel extends HTMLElement {
     if (!snap) {
       restoreDesc = "Peak Guard heeft dit apparaat nog niet aangepast. "
         + "Er is geen actieve ingreep.";
+    } else if (isPeak && isEV) {
+      restoreDesc = `De laadstroom werd verlaagd of het laden gestopt omdat het verbruik de maandpiek dreigde te overschrijden. `
+        + `Zodra er ruimte is onder de piekgrens verhoogt Peak Guard de laadstroom stapsgewijs (per ampère `
+        + `${this._evVoltage(device.phases || 1)} W) tot de originele waarde. Na een stop wacht de lader minstens 5 min `
+        + `voor hij herstart, om de schakelaar te sparen.`;
     } else if (isPeak) {
       restoreDesc = `Dit apparaat werd uitgeschakeld omdat het verbruik de maandpiek dreigde te overschrijden. `
         + `Het wordt automatisch terug ingeschakeld zodra het verbruik voldoende onder de piekgrens daalt `
@@ -1176,10 +1181,11 @@ class PeakGuardPanel extends HTMLElement {
     } else {
       if (isEV) {
         restoreDesc = `De EV-lader werd gestart op zonne-overschot. `
-          + `Het laden stopt automatisch wanneer het zonne-overschot wegvalt `
-          + `(netto verbruik ≥ 0 W) of wanneer het surplus lager wordt dan het EV-verbruik.`;
+          + `Valt het overschot weg, dan verlaagt Peak Guard eerst de laadstroom. Op het minimum `
+          + `blijft de lader laden zolang de zon nog een deel van het laadvermogen dekt (stoppen zou `
+          + `dan weer injectie geven); hij stopt pas als de zon niets meer bijdraagt.`;
       } else {
-        restoreDesc = `Dit apparaat werd ingeschakeld op zonne-overschot. `
+        restoreDesc = `Dit apparaat werd ingeschakeld op zonne-overschot (pas als het overschot het volledige vermogen dekt). `
           + `Het wordt automatisch uitgeschakeld zodra het netto verbruik niet meer negatief is `
           + `(geen export naar het net meer).`;
       }
@@ -1238,6 +1244,16 @@ class PeakGuardPanel extends HTMLElement {
       ? scheduleBox
       : (isEV && !isPeak) ? this._evEvalChecklist(device, guard) : "";
 
+    // Verklaring van de backend voor een toestand die op het eerste zicht onlogisch lijkt.
+    const hold = this._data?.status?.holds?.[device.id];
+    const holdBox = hold ? `
+      <div class="info-restore-box info-hold-box" style="margin-top:14px;">
+        <div class="info-restore-title">💡 Waarom deze toestand?</div>
+        <div class="info-restore-text">${this._esc(hold.text)}${hold.remaining_s != null && hold.remaining_s > 0
+          ? ` <span style="color:var(--secondary-text-color,#888);">(nog ±${Math.ceil(hold.remaining_s)} s)</span>`
+          : ""}</div>
+      </div>` : "";
+
     const activeLabel = snap
       ? `<span class="info-active-badge">Ingreep actief</span>`
       : `<span class="info-inactive-badge">Geen ingreep</span>`;
@@ -1275,6 +1291,7 @@ class PeakGuardPanel extends HTMLElement {
           </thead>
           <tbody>${rows}</tbody>
         </table>
+        ${holdBox}
         ${evalChecklist}
         <div class="info-restore-box" style="margin-top:14px;">
           <div class="info-restore-title">↩ Wanneer wordt hersteld?</div>
@@ -1464,8 +1481,11 @@ class PeakGuardPanel extends HTMLElement {
       const rem = Math.ceil(guard.min_off_remaining_s ?? 0);
       return { label: `⏱️ Even afkoelen na de vorige stop… nog ${rem}s`, pct: null };
     }
-    if (skip.includes("start-drempel") || skip.includes("surplus")) {
+    if (skip.includes("start-drempel") || skip.includes("geen injectie")) {
       return { label: "⏳ Wachten op genoeg zon… overschot is nog te klein", pct: null };
+    }
+    if (skip.includes("uitgesteld") || skip.includes("mislukt")) {
+      return { label: `⚠️ ${skip}`, pct: null };
     }
     if (skip.includes("niet wakker")) {
       return { label: "💤 Tesla reageert niet — volgende cyclus opnieuw proberen", pct: null };
@@ -1492,7 +1512,7 @@ class PeakGuardPanel extends HTMLElement {
 
     const state  = guard.state ?? "idle";
     const skip   = guard.skip_reason ?? "";
-    const startThr = parseFloat(device.start_threshold_w ?? 230);
+    const startThr = parseFloat(device.start_threshold_w ?? 0);
 
     // Bepaal welke stap momenteel blokkeert
     let blockingStep = null;
@@ -1501,7 +1521,10 @@ class PeakGuardPanel extends HTMLElement {
       blockingStep = "done_all";
     } else if (state === "cable_disconnected" || skip.includes("kabel")) {
       blockingStep = "cable"; blockingMode = "blocked";
-    } else if (skip.includes("start-drempel") || skip.includes("surplus")) {
+    } else if (state === "waiting_for_stable_surplus") {
+      // Vóór de surplus-match: de debounce-reden bevat ook het woord "surplus".
+      blockingStep = "debounce"; blockingMode = "active";
+    } else if (skip.includes("start-drempel") || skip.includes("geen injectie")) {
       blockingStep = "surplus"; blockingMode = "blocked";
     } else if (skip.includes("niet thuis") || skip.includes("EV niet thuis")) {
       blockingStep = "location"; blockingMode = "blocked";
@@ -1513,6 +1536,8 @@ class PeakGuardPanel extends HTMLElement {
       blockingStep = "wake"; blockingMode = "active";
     } else if (skip.includes("niet wakker")) {
       blockingStep = "wake"; blockingMode = "blocked";
+    } else if (skip.includes("uitgesteld") || skip.includes("mislukt")) {
+      blockingStep = "start"; blockingMode = "blocked";
     } else if (surplus_w <= 0) {
       blockingStep = "surplus"; blockingMode = "blocked";
     }
@@ -1565,7 +1590,9 @@ class PeakGuardPanel extends HTMLElement {
     // Stap: surplus
     const surplusDetail = surplus_w > 0
       ? `${surplus_w.toFixed(0)} W ≥ drempel ${startThr.toFixed(0)} W`
-      : `geen overschot (drempel: ${startThr.toFixed(0)} W)`;
+      : state === "charging"
+        ? `nu geen overschot meer (netafname ${Math.max(0, consumption).toFixed(0)} W) — laadt door, zie "Waarom deze toestand?"`
+        : `geen overschot (drempel: ${startThr.toFixed(0)} W)`;
     html += step("surplus", "Voldoende zonne-overschot", surplusDetail);
 
     // Stap: locatie (alleen als geconfigureerd)
@@ -1609,7 +1636,7 @@ class PeakGuardPanel extends HTMLElement {
     // Stap: laden starten
     const startDet = state === "charging"
       ? (guard.last_sent_amps != null ? `${guard.last_sent_amps} A` : "")
-      : "";
+      : (blockingStep === "start" ? this._esc(skip) : "");
     html += step("start", "Laden starten", startDet);
 
     html += `</div>`;
@@ -2638,6 +2665,7 @@ class PeakGuardPanel extends HTMLElement {
           background: var(--secondary-background-color,#f5f5f5);
           border-radius: 10px; padding: 12px 14px; margin-top: 4px;
         }
+        .info-hold-box { border-left: 4px solid #f57c00; }
         .info-restore-title {
           font-size: .8em; font-weight: 700; text-transform: uppercase;
           letter-spacing: .05em; color: var(--secondary-text-color,#757575);
@@ -3436,7 +3464,7 @@ class PeakGuardPanel extends HTMLElement {
                 <th>Modus</th>
                 <th>Apparaat</th>
                 <th>Duur · Resultaat</th>
-                <th>Hypo. piek</th>
+                <th title="Hoogste kwartierwaarde die er zonder Peak Guard zou zijn geweest in de kwartieren van dit event">Hypo. piek</th>
                 <th>Besparing</th>
               </tr>
             </thead>
@@ -3444,6 +3472,12 @@ class PeakGuardPanel extends HTMLElement {
               ${eventsRows}
             </tbody>
           </table>
+        </div>
+        <div class="field-hint" style="margin-top:8px;">
+          Per piek-event: <b>Hypo. piek</b> is de hoogste kwartierwaarde zonder Peak Guard in de
+          kwartieren van dat event; resultaat en besparing zijn wat dat event uitspaart tegenover de
+          huidige maandpiek. Ze worden bijgewerkt tot de maand afsluit. Events in hetzelfde kwartier
+          overlappen, dus de som van de rijen is niet het maandtotaal (dat staat bovenaan).
         </div>
 
       </div>

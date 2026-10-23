@@ -20,19 +20,20 @@ python3 -m venv .venv && .venv/bin/python -m pip install -r requirements-test.tx
 
 `requirements-test.txt` (pytest, pytest-asyncio) is test tooling only — the integration itself still has no third-party dependencies.
 
-The test suite uses stub modules in `tests/conftest.py` to avoid a live HA install; the stubbed `homeassistant.util.dt.as_local` uses a fixed Europe/Brussels time zone. Twelve test files:
+The test suite uses stub modules in `tests/conftest.py` to avoid a live HA install; the stubbed `homeassistant.util.dt.as_local` uses a fixed Europe/Brussels time zone. Thirteen test files:
 - `tests/test_ev_guard.py` — 57 tests covering the EV state machine, rate limiter and its reserve, daily-budget reserve, unreachable-vehicle back-off, debounce, and Tesla-specific paths
-- `tests/test_tracker.py` — 21 tests covering the financial calculations in `PeakAvoidTracker` and `SolarShiftTracker`
+- `tests/test_tracker.py` — 32 tests covering the financial calculations in `PeakAvoidTracker` and `SolarShiftTracker`, incl. per-event and per-device hypothetical peaks, shift bookkeeping and measurement lifecycle
 - `tests/test_peak_floor.py` — 24 tests covering the 2.5 kW capacity-tariff floor (decider, savings, billed peak, decision log)
 - `tests/test_month_rollover.py` — 4 tests covering the month/year rollover order in `SharedCapacityState`
 - `tests/test_power_units.py` — 10 tests covering kW → W conversion of the consumption and peak sensors
 - `tests/test_local_month.py` — 16 tests covering month/year boundaries in local time (quarter store, rollover, event-table timestamps)
-- `tests/test_startup_restore.py` — 11 tests covering the startup restore of the year total and the finalisation of months missed while HA was down
+- `tests/test_startup_restore.py` — 15 tests covering the startup restore of the year total, the finalisation of months missed while HA was down, and the per-device floor in a month that began on a pre-v1.9.2 version
 - `tests/test_monthly_peak_history.py` — 33 tests covering the 36-month monthly-peak records in `QuarterStore` (recording, pruning, persistence, upgrade seeding, history queries, rejection of implausible quarters and invalid records)
 - `tests/test_quarter_calculator.py` — 10 tests covering `QuarterCalculator` when the meter reading drops and recovers or yields an impossible value, and non-finite sensor states
 - `tests/test_energy_units.py` — 7 tests covering Wh/MWh → kWh conversion of the energy sensor
 - `tests/test_peak_verification.py` — 16 tests covering the automatic removal of quarters and monthly records that contradict the P1 meter's monthly peak
 - `tests/test_schedule.py` — 69 tests covering the charging schedule: window logic (midnight, DST, overlap, tariff sensor), serialisation, `ScheduleDecider`, and the peak > schedule > injection interplay through `deciders/dispatch.run_tick`
+- `tests/test_status_holds.py` — 25 tests covering the status explanations (`holds`) and the control fixes found with them: inject switch start rule, inject restore past a held EV, peak restore without `break`, stepwise EV restore after a peak, min-OFF on peak restore (also with a stale charge state), giving up a capped restart that never charges, headroom reservation for a restarted EV, and the hand-over of a peak-limited EV to the solar cascade
 
 `controller.py` and the frontend panel are not importable in this harness and are not covered.
 
@@ -53,7 +54,7 @@ The integration lives entirely in `custom_components/peak_guard/`.
 
 3. **Cascade execution**: Devices in each cascade are stored as `_BaseCascadeDevice` subclass instances in priority order. The controller iterates them, calls `device.apply(excess, snapshots, ctx)` polymorphically, and records events in the appropriate tracker. `CascadeContext` bundles `hass`, trackers, `ev_guard`, and callbacks into a single dependency-injection object threaded through the loop.
 
-4. **Trackers** (`avoided_peak_tracker.py`, and the solar equivalent): Record avoidance/shift events through a 3-phase lifecycle (pending → active → completed), compute kW impact on the quarterly history, and calculate EUR savings using Fluvius 2026 tariffs from `const.py`.
+4. **Trackers** (`avoided_peak_tracker.py`, and the solar equivalent): Record avoidance/shift events through a 3-phase lifecycle (pending → active → completed), compute kW impact on the quarterly history, and calculate EUR savings using Fluvius 2026 tariffs from `const.py`. See "Peak savings calculation" below.
 
 5. **Sensor updates** (`sensor.py`): 16+ read-only sensors are updated each monitoring cycle and also on a 1-minute interval. `SharedCapacityState` derives the quarterly average from the cumulative kWh sensor via `QuarterCalculator` on that timer. The sensors expose quarter kW, monthly peak, capacity costs, savings, shifted kWh, etc.
 
@@ -134,6 +135,27 @@ EV chargers are significantly more complex than simple switches. All logic lives
 - `DEFAULT_UPDATE_INTERVAL = 5` — configured monitoring loop interval in seconds; the controller enforces a 60 s minimum, so the effective default is 60 s
 - `DEFAULT_POWER_DETECTION_TOLERANCE_PERCENT = 10` — tolerance for "natural stop" detection
 - `DEFAULT_SOLAR_NETTO_EUR_PER_KWH = 0.25` — assumed injection savings in €/kWh
+
+### Peak savings calculation
+
+`PeakAvoidTracker` keeps, per device, the net shifted power per quarter (`extra_by_device`): `+` in the quarters from `avoid_ts` (where the energy would have fallen without Peak Guard), `−` in the quarters from `turnon_ts` (where it actually fell, already inside the measured quarter). A shift within one quarter therefore avoids nothing. `_recalc()` (on every `set_context`, i.e. every sensor update) derives from it:
+
+- **Month**: hypothetical peak = max over quarters of `actual + Σ shifts` (never below 0); savings as in the floor section. A quarter wiped by the P1 check or a later higher actual peak flows through automatically.
+- **Per device** (`get_device_monthly_savings`): actual + only that device's shift. Not additive across devices.
+- **Per event** (savings-tab rows): hypothetical peak = max over the event's `avoid_quarters` of `actual + Σ shifts`; avoided kW and € against the current month peak. Recomputed until month end; rows overlap and don't sum to the month total. Events from before v1.9.2 (no `avoid_quarters`) keep their stored values. In a month that began on an older version, the last stored per-device record is a floor for that device (`device_hypo_floor_this_month`, seeded by `sensor.seed_device_hypo_floor`), just like the legacy list is for the month total.
+
+`extra_by_device`, `device_names` and each event's `avoid_quarters` are persisted in the peak month state. `hypothetical_peaks_this_month` is only a legacy floor read from a pre-v1.9.2 month state. The open quarter enters the context as energy-so-far ÷ 15 min (a lower bound that grows to the final value), not the extrapolated running average. Measurement lifecycle: a re-shed while a measurement is active completes it first and a re-shed while pending keeps the original `avoid_ts`; a measurement whose natural stop is never detected is completed after 15 min (`complete_expired`). An EV restarted at a lower current after a peak shifts only what it draws (`start_measurement_on_turnon(max_kw=...)`). Throttle and EV current reductions are not tracked as avoided peaks.
+
+### Status explanations (`holds`)
+
+`EVGuard` also keeps a per-device (`device.id`) explanation of states that look illogical: `set_hold(device_id, code, text, until)`, cleared together with every guard's `skip_reason` by `begin_tick()` at the start of `run_tick`, exposed as `status.holds` (`code`, `text`, `remaining_s`) and shown as "Waarom deze toestand?" in the device info popup. Codes: `solar_share` (EV at minimum keeps charging because the sun still covers part of it; stopping would inject), `throttled`, `update_interval`, `rate_limit`, `max_current`, `surplus_too_small` (inject switch), `restore_queue` (inject restore is one device per cycle), `peak_no_headroom`, `peak_headroom`, `peak_stepwise`, `min_off`, `restore_failed`. There is still no min-ON time: the "keeps charging without surplus" case is the solar-share rule.
+
+Control rules that came with it:
+- An inject switch (`SwitchOnDevice`) only turns on when the surplus covers its `power_watts`; otherwise it would draw from the grid and be switched off again next cycle.
+- Inject restore: an EV that holds on `solar_share` without acting is skipped, so the next device (e.g. a boiler) is switched off instead. Still one action per cycle.
+- `_apply_solar` for a running EV returns `excess − (new_a − current_a) × V` (only the extra it claims), so later inject devices still see the remaining surplus.
+- Peak restore uses `continue`: a device that doesn't fit doesn't block smaller ones. EV need is `peak_restore_need_w` (start minimum when stopped, difference to the original current when reduced). A reduced EV is raised stepwise (`peak_raise_current`, whole amps that fit in the headroom, `EV_MIN_UPDATE_INTERVAL_S`), a stopped EV waits for min-OFF and restarts at the current that fits while keeping the snapshot for the further steps. "Stopped" is `EVGuard.peak_is_off`: stopped by Peak Guard and not restarted (`last_switch_state is False`), else not charging — a Tesla charge state lags after `turn_off`, which must not bypass min-OFF. A stopped EV reserves its original current (or `power_watts`) when restored in full. After a capped restart the EV's current stays reserved while the car doesn't charge yet; if it still doesn't charge after `PEAK_RESTART_CONFIRM_S` (3 min; full or unplugged), the snapshot is dropped instead of sending `turn_on`/`set_value` every loop. `restore()` records the current it sends in `last_sent_amps`/`last_current_update`, so a stale current sensor can't make the next step lower the current.
+- Hand-over to solar: when the inject cascade takes an EV that still has a peak snapshot (injection after a peak limitation), `PeakDecider.hand_over_to_solar()` (called in `run_tick` right after `injection.check`) drops the peak snapshot and copies its `original_state`/`original_current` into the inject snapshot. Otherwise the peak restore would reset the current to the original value in the same cycle (lower than the surplus allows, or higher so the solar path lowers it again), and after the surplus the charge returns to its pre-peak state instead of the reduced current or off.
 
 ### 2.5 kW capacity floor
 

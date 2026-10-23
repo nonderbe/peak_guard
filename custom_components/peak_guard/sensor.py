@@ -102,8 +102,13 @@ def restore_peak_tracker(
             and peak_state.get("month") == month):
         peak_tracker.avoided_kw_this_month   = float(peak_state.get("avoided_kw_this_month", 0.0))
         peak_tracker.savings_euro_this_month = float(peak_state.get("savings_euro_this_month", 0.0))
-        # Herstel lijst van hypothetische pieken — zorgt dat _recalc_hypo() na herstart
-        # de hoogste bekende hypo als vloer gebruikt (in plaats van 0).
+        peak_tracker.device_names_this_month = dict(peak_state.get("device_names", {}))
+        if "extra_by_device" in peak_state:
+            # Verschuiving per apparaat per kwartier: de hypothetische pieken
+            # worden er bij elke update opnieuw uit berekend.
+            peak_tracker.extra_from_dict(peak_state["extra_by_device"])
+        # Staat van vóór v1.9.2 heeft enkel de vastgevroren hypo-pieken: gebruik
+        # die als vloer tot de maandwissel (ook naast nieuwere data in dezelfde maand).
         peak_tracker.hypothetical_peaks_this_month = [
             float(v) for v in peak_state.get("hypothetical_peaks_this_month", [])
         ]
@@ -121,6 +126,9 @@ def restore_peak_tracker(
                     avoided_peak_kw=float(ev_dict["avoided_peak_kw"]),
                     savings_euro=float(ev_dict["savings_euro"]),
                     hypothetical_peak_kw=float(ev_dict.get("hypothetical_peak_kw", 0.0)),
+                    avoid_quarters=[
+                        datetime.fromisoformat(q) for q in ev_dict.get("avoid_quarters", [])
+                    ],
                 )
                 peak_tracker.events.append(ev)
             except (KeyError, ValueError):
@@ -135,6 +143,33 @@ def restore_peak_tracker(
     peak_tracker._savings_euro_year_base = round(
         max(0.0, peak_tracker.savings_euro_this_year - peak_tracker.savings_euro_this_month), 4
     )
+
+
+def seed_device_hypo_floor(
+    peak_tracker: PeakAvoidTracker,
+    device_savings_store: MonthlyDeviceSavingsStore,
+    year: int,
+    month: int,
+) -> None:
+    """
+    Een maand die met een versie van vóór v1.9.2 begon, heeft geen
+    verschuiving per apparaat: zonder vloer zou de eerste nieuwe upsert de
+    maandrecord van een apparaat verlagen. Enkel in zo'n maand (er is dan een
+    legacy-vloer voor het maandtotaal); geen herberekening hier, die volgt bij
+    de eerste set_context.
+    """
+    if not peak_tracker.hypothetical_peaks_this_month:
+        return
+    for rec in device_savings_store.get_month(year, month):
+        if rec.get("finalized"):
+            continue
+        device_id = rec["device_id"]
+        peak_tracker.device_hypo_floor_this_month[device_id] = float(
+            rec.get("hypothetical_peak_kw", 0.0)
+        )
+        peak_tracker.device_names_this_month.setdefault(
+            device_id, rec.get("device_name", device_id)
+        )
 
 
 async def async_setup_entry(
@@ -198,6 +233,7 @@ async def async_setup_entry(
             "maanden alsnog bevroren (maandwissel gemist terwijl HA uit stond)",
             closed,
         )
+    seed_device_hypo_floor(peak_tracker, device_savings_store, current_year, current_month)
 
     # Laad persistente events en maandstatistieken — solar
     solar_state_store = Store(hass, _STORAGE_VERSION_STATE, _STORAGE_KEY_SOLAR_STATE)
@@ -341,7 +377,7 @@ class SharedCapacityState:
         self._device_savings_store = device_savings_store
         self._last_persisted_peak_savings:       float = 0.0
         self._last_persisted_solar_savings:      float = 0.0
-        self._last_peak_events_count:            int   = -1
+        self._last_peak_events_count:            object = -1
         self._last_solar_events_count:           int   = -1
         self._last_persisted_peak_month_savings: float = -1.0
         self._last_persisted_solar_month_savings:float = -1.0
@@ -468,16 +504,23 @@ class SharedCapacityState:
                 for e in self.store.get_all_entries()
                 if self._entry_in_current_month(e, now)
             }
-            # Voeg ook het lopende open kwartier toe. Zonder deze stap berekent
-            # _recalc_hypo() de hypothetische piek als enkel extra_dict (de
-            # vermeden energie) zonder de basisbelasting van dat kwartier —
-            # waardoor hypo < actual_peak en besparing altijd 0 blijft.
+            # Voeg ook het lopende open kwartier toe, anders mist de
+            # hypothetische piek van dat kwartier de basisbelasting. Niet het
+            # geëxtrapoleerde gemiddelde (dat schiet vroeg in een kwartier alle
+            # kanten op) maar de energie tot nu als kwartiergemiddelde: een
+            # ondergrens die naar de eindwaarde groeit.
+            actual_peak = self.store.get_current_month_peak() or 0.0
             q_start = self.calculator._current_quarter_start
             if q_start is not None:
-                actual_quarters.setdefault(q_start, self.current_quarter_kw)
+                elapsed = (now - q_start).total_seconds() / (15 * 60)
+                open_kw = round(self.current_quarter_kw * min(1.0, max(0.0, elapsed)), 4)
+                actual_quarters.setdefault(q_start, open_kw)
+                actual_peak = max(actual_peak, open_kw)
+            # Metingen waarvan de natuurlijke stop niet gezien werd, na een kwartier afronden.
+            self._peak_tracker.complete_expired(now)
             self._peak_tracker.set_context(
                 actual_quarters=actual_quarters,
-                actual_monthly_peak=self.monthly_peak_kw or 0.0,
+                actual_monthly_peak=actual_peak,
             )
 
         # Persist piek-jaarbesparingen bij wijziging
@@ -500,7 +543,9 @@ class SharedCapacityState:
 
         # Persist piek-events en maandstatistieken bij wijziging
         if self._peak_tracker and self._peak_state_store:
-            n   = len(self._peak_tracker.events)
+            # Ook bij een volle log (100 events) moet een nieuw event opgeslagen worden.
+            last = self._peak_tracker.events[-1] if self._peak_tracker.events else None
+            n   = (len(self._peak_tracker.events), last.natural_stop_ts if last else None)
             msv = self._peak_tracker.savings_euro_this_month
             if n != self._last_peak_events_count or msv != self._last_persisted_peak_month_savings:
                 events_data = [
@@ -516,6 +561,7 @@ class SharedCapacityState:
                         "avoided_peak_kw":      e.avoided_peak_kw,
                         "savings_euro":         e.savings_euro,
                         "hypothetical_peak_kw": e.hypothetical_peak_kw,
+                        "avoid_quarters":       [q.isoformat() for q in e.avoid_quarters],
                     }
                     for e in self._peak_tracker.events
                 ]
@@ -525,6 +571,8 @@ class SharedCapacityState:
                     "avoided_kw_this_month": self._peak_tracker.avoided_kw_this_month,
                     "savings_euro_this_month": msv,
                     "hypothetical_peaks_this_month": list(self._peak_tracker.hypothetical_peaks_this_month),
+                    "extra_by_device":       self._peak_tracker.extra_to_dict(),
+                    "device_names":          dict(self._peak_tracker.device_names_this_month),
                     "events":                events_data,
                 })
                 self._last_peak_events_count            = n

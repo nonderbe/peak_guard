@@ -30,6 +30,8 @@ async def run_tick(
     - consumption=None (verbruiksensor onbeschikbaar): enkel het schema loopt,
       om vensters af te sluiten en limieten te herstellen.
     """
+    # Verklaringen in de status-popup gelden voor deze iteratie.
+    peak.ev_guard.begin_tick()
     if consumption is None:
         await schedule.check(None, now)
         return
@@ -41,6 +43,7 @@ async def run_tick(
     elif consumption < 0:
         await schedule.check(consumption, now)
         await injection.check(consumption, now)
+        peak.hand_over_to_solar(injection.snapshots, now)
         await peak.check_restore(consumption, now)
         await injection.check_restore(consumption, now)
     else:

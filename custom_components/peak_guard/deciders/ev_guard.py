@@ -106,6 +106,12 @@ class EVGuard:
         self._unreachable_until: Dict[str, datetime] = {}
         # Dag (UTC) waarop de reserve-waarschuwing al gegeven werd.
         self._reserve_warned_day: Optional[str] = None
+        # Verklaring per apparaat (device.id) waarom het in een toestand blijft
+        # die op het eerste zicht onlogisch lijkt. Elke loop opnieuw opgebouwd
+        # (begin_tick), zodat er nooit een verouderde reden blijft staan.
+        self._holds: Dict[str, dict] = {}
+        # Waarom de laatste _rate_check() weigerde (voor de verklaring).
+        self.last_rate_block: str = ""
 
     # ------------------------------------------------------------------ #
     #  Properties voor controller.to_dict()                               #
@@ -167,6 +173,17 @@ class EVGuard:
                 if self._daily_budget is not None else None
             ),
             "ev_budget_reserve": self.budget_reserve,
+            "holds": {
+                device_id: {
+                    "code": h["code"],
+                    "text": h["text"],
+                    "remaining_s": (
+                        max(0.0, round((h["until"] - now).total_seconds()))
+                        if h.get("until") else None
+                    ),
+                }
+                for device_id, h in self._holds.items()
+            },
             "ev_unreachable": {
                 name: round((until - now).total_seconds())
                 for name, until in self._unreachable_until.items() if until > now
@@ -183,6 +200,27 @@ class EVGuard:
         if device_id not in self._guards:
             self._guards[device_id] = EVDeviceGuard()
         return self._guards[device_id]
+
+    def begin_tick(self) -> None:
+        """Start van een loop-iteratie: verklaringen en skip-redenen opnieuw opbouwen."""
+        self._holds.clear()
+        for guard in self._guards.values():
+            guard.skip_reason = ""
+
+    def set_hold(self, device_id: str, code: str, text: str,
+                 until: Optional[datetime] = None) -> None:
+        """Leg vast waarom een apparaat (nog) in zijn toestand blijft."""
+        self._holds[device_id] = {"code": code, "text": text, "until": until}
+
+    def hold_for(self, device_id: str) -> Optional[dict]:
+        return self._holds.get(device_id)
+
+    def min_off_remaining_s(self, device: EVChargerDevice, now: datetime) -> float:
+        """Resterende min-OFF-tijd na een stop door Peak Guard (0 = mag weer aan)."""
+        guard = self._guards.get(device.id)
+        if guard is None or guard.turned_off_at is None or not guard.turned_off_by_pg:
+            return 0.0
+        return max(0.0, EV_MIN_OFF_DURATION_S - (now - guard.turned_off_at).total_seconds())
 
     def _reset_debounce(self, guard: EVDeviceGuard) -> None:
         """Wis de surplus-geschiedenis en reset de wallclock debounce-timer."""
@@ -202,6 +240,12 @@ class EVGuard:
         """
         floor = 0 if reducing else EV_RATE_LIMIT_RESERVE
         if self._rate_limiter.remaining <= floor:
+            self.last_rate_block = (
+                f"API-limiet bereikt ({self._rate_limiter.calls_in_window}/"
+                f"{EV_RATE_LIMIT_MAX_CALLS} calls in {EV_RATE_LIMIT_WINDOW_S / 60:.0f} min"
+                + ("" if reducing else f"; de laatste {EV_RATE_LIMIT_RESERVE} zijn voorbehouden aan verlagen")
+                + ") — volgende cyclus opnieuw"
+            )
             self._warn(
                 "Peak Guard EV '%s': service call OVERGESLAGEN wegens globale rate-limiter "
                 "(%d/%d calls in %.0f s). Reden: %s",
@@ -213,6 +257,10 @@ class EVGuard:
             )
             return False
         if self._daily_budget is not None and not self._daily_budget.is_allowed():
+            self.last_rate_block = (
+                f"dagelijks API-budget op ({self._daily_budget.calls_today}/"
+                f"{self._daily_budget.max_calls} calls vandaag)"
+            )
             self._warn(
                 "Peak Guard EV '%s': service call OVERGESLAGEN wegens dagelijks "
                 "API-budget (%d/%d calls vandaag). Reden: %s",
@@ -905,23 +953,34 @@ class EVGuard:
                         device.name,
                     )
 
+                restored_kw: Optional[float] = None
                 if cur_entity and snapshot.original_current is not None:
                     max_a = float(
                         device.max_value if device.max_value is not None
                         else DEFAULT_EV_MAX_AMPERE
                     )
                     orig_a = min(snapshot.original_current, max_a)
+                    restored_kw = orig_a * self.voltage(device) / 1000.0
                     cur_state = self.hass.states.get(cur_entity)
                     if cur_state is not None:
                         try:
                             cur_val = float(cur_state.state)
                         except (ValueError, TypeError):
                             cur_val = None
+                        guard = self.get_guard(device.id)
+                        if cur_val is not None:
+                            # Een verouderde sensor kan nog de stroom van vóór de
+                            # verlaging tonen; vergelijk met wat laatst gestuurd is.
+                            cur_val = self._effective_current_amps(
+                                device, guard, cur_state, now, cur_val
+                            )
                         if cur_val is None or round(cur_val, 0) != round(orig_a, 0):
                             await self._svc(
                                 "number", "set_value",
                                 {"entity_id": cur_entity, "value": round(orig_a, 1)},
                             )
+                            guard.last_sent_amps      = float(orig_a)
+                            guard.last_current_update = now
                             _LOGGER.info(
                                 "Peak Guard EV peak: '%s' laadstroom hersteld naar %.1f A "
                                 "(reden: herstel na piekbeperking, gecapped aan max %.1f A)",
@@ -933,6 +992,7 @@ class EVGuard:
                         device_id=device.id,
                         device_name=device.name,
                         ts=now,
+                        max_kw=restored_kw,
                     )
                     guard = self.get_guard(device.id)
                     guard.state = EVState.CHARGING
@@ -1061,6 +1121,126 @@ class EVGuard:
         return False
 
     # ------------------------------------------------------------------ #
+    #  Herstel na piekbeperking: stapsgewijs                               #
+    # ------------------------------------------------------------------ #
+
+    def peak_is_off(self, device: EVChargerDevice) -> bool:
+        """Staat de lader uit voor het herstel na piekbeperking?"""
+        guard = self._guards.get(device.id)
+        if guard is not None and guard.last_switch_state is False and guard.turned_off_by_pg:
+            # Door Peak Guard gestopt en niet herstart: de laadstatus van een
+            # Tesla meldt na turn_off vaak nog een of meer cycli 'charging'.
+            return True
+        # Laadstatus i.p.v. de schakelaar: die van een Tesla blijft vaak 'unknown'.
+        return not self.is_charging(device)
+
+    def peak_restore_need_w(
+        self, device: EVChargerDevice, snapshot: DeviceSnapshot,
+        now: Optional[datetime] = None,
+    ) -> float:
+        """
+        Extra vermogen (W) dat een volledig herstel na piekbeperking vraagt.
+
+        Uitgeschakeld: wat de lader na het herstel trekt (de originele stroom,
+        anders power_watts, anders het startminimum). Aan maar beperkt: het
+        verschil tot de originele laadstroom.
+        """
+        voltage = self.voltage(device)
+        max_a = float(device.max_value if device.max_value is not None else DEFAULT_EV_MAX_AMPERE)
+        orig_a = min(snapshot.original_current, max_a) if snapshot.original_current is not None else max_a
+        if self.peak_is_off(device):
+            if device.current_entity and snapshot.original_current is not None:
+                return orig_a * voltage
+            if device.power_watts:
+                return float(device.power_watts)
+            return self.hw_min_amps(device) * voltage
+        current_a = self.read_current_a(device)
+        if current_a is None:
+            return 0.0
+        current_a = self._effective_current_amps(
+            device, self.get_guard(device.id), self.hass.states.get(device.current_entity),
+            now or datetime.now(timezone.utc), current_a,
+        )
+        return max(0.0, orig_a - current_a) * voltage
+
+    async def peak_raise_current(
+        self,
+        device: EVChargerDevice,
+        snapshot: DeviceSnapshot,
+        headroom_w: float,
+        now: datetime,
+    ) -> float:
+        """
+        Verhoog de laadstroom na piekbeperking met wat de piekruimte toelaat,
+        in hele ampères en nooit boven de originele stroom. Zo springt de lader
+        niet in één keer terug naar de originele stroom, wat de piek opnieuw
+        zou overschrijden en de volgende cyclus weer verlaagd zou worden.
+
+        Returns: het extra vermogen (W) dat de lader nu opeist (0 = niets gedaan).
+        """
+        self._log_ctx = {"device": device.name, "cascade": "peak", "surplus_w": 0.0}
+        cur_entity = device.current_entity
+        current_a = self.read_current_a(device)
+        if not cur_entity or current_a is None:
+            return 0.0
+        voltage = self.voltage(device)
+        max_a = float(device.max_value if device.max_value is not None else DEFAULT_EV_MAX_AMPERE)
+        orig_a = min(snapshot.original_current, max_a) if snapshot.original_current is not None else max_a
+        guard = self.get_guard(device.id)
+        current_a = self._effective_current_amps(
+            device, guard, self.hass.states.get(cur_entity), now, current_a
+        )
+        step_a = math.floor(max(0.0, headroom_w) / voltage)
+        new_a = min(int(orig_a), int(current_a) + step_a)
+        if step_a < 1 or new_a <= int(current_a):
+            self.set_hold(
+                device.id, "peak_headroom",
+                f"Laadstroom blijft op {int(current_a)} A (origineel {int(orig_a)} A): er is "
+                f"{max(0.0, headroom_w):.0f} W ruimte onder de piekgrens, 1 A extra vraagt "
+                f"{voltage:.0f} W.",
+            )
+            return 0.0
+        if guard.last_current_update is not None:
+            elapsed = (now - guard.last_current_update).total_seconds()
+            if elapsed < EV_MIN_UPDATE_INTERVAL_S:
+                self.set_hold(
+                    device.id, "update_interval",
+                    f"Na piekbeperking terug naar {int(orig_a)} A: volgende stap "
+                    f"({int(current_a)} → {new_a} A) na {EV_MIN_UPDATE_INTERVAL_S:.0f} s "
+                    f"tussen stroomwijzigingen.",
+                    until=guard.last_current_update + timedelta(seconds=EV_MIN_UPDATE_INTERVAL_S),
+                )
+                return (new_a - current_a) * voltage
+        if not self._rate_check(device.name, f"set_value herstel piek {int(current_a)} → {new_a} A"):
+            self.set_hold(
+                device.id, "rate_limit",
+                f"Verhogen naar {new_a} A na piekbeperking uitgesteld: {self.last_rate_block}.",
+            )
+            return 0.0
+        try:
+            await self._svc("number", "set_value", {"entity_id": cur_entity, "value": float(new_a)})
+        except HomeAssistantError as err:
+            self._warn(
+                "Peak Guard EV peak: '%s' laadstroom verhogen naar %d A mislukt: %s",
+                device.name, new_a, err,
+            )
+            return 0.0
+        self._track_action(cur_entity, "number.set_value", float(new_a))
+        guard.last_sent_amps      = float(new_a)
+        guard.last_current_update = now
+        _LOGGER.info(
+            "Peak Guard EV peak: '%s' laadstroom stapsgewijs hersteld %d → %d A "
+            "(origineel %d A, piekruimte %.0f W)",
+            device.name, int(current_a), new_a, int(orig_a), headroom_w,
+        )
+        self.set_hold(
+            device.id, "peak_stepwise",
+            f"Na piekbeperking stapsgewijs terug naar {int(orig_a)} A: nu {new_a} A, "
+            f"zoveel als de piekruimte ({headroom_w:.0f} W) toelaat.",
+        )
+        return (new_a - current_a) * voltage
+
+    # ------------------------------------------------------------------ #
     #  Zachte stop: laadstroom verlagen vóór volledige stop               #
     # ------------------------------------------------------------------ #
 
@@ -1105,6 +1285,13 @@ class EVGuard:
         )
         max_a = float(device.max_value if device.max_value is not None else DEFAULT_EV_MAX_AMPERE)
 
+        guard = self.get_guard(device.id)
+        if now is None:
+            now = datetime.now(timezone.utc)
+        # Een Tesla meldt de nieuwe laadstroom vaak pas na een tijd: beslis op
+        # de laatst verstuurde waarde zolang de sensor nog achterloopt.
+        current_a = self._effective_current_amps(device, guard, cur_state, now, current_a)
+
         # Hoeveel ampère moeten we reduceren?
         # apply_action gebruikt ceil() bij het verhogen → EV mag tot 1 A meer trekken
         # dan het surplus dekt (bij 230 V is dat max ±230 W netimport).
@@ -1113,6 +1300,7 @@ class EVGuard:
         # EV niet oscilleert tussen twee waarden die elk 20 s duren.
         reduction_a = max(0, math.ceil((consumption - voltage) / voltage))
         new_a = max(int(hw_min_a), min(int(max_a), int(current_a) - reduction_a))
+        ev_draw_w = current_a * voltage
 
         if new_a >= int(current_a):
             # No meaningful reduction possible (solar still covers most of EV draw).
@@ -1120,16 +1308,24 @@ class EVGuard:
             # Rule: stop only when solar contributes nothing to the EV draw, i.e. when
             # consumption >= ev_draw_w — at that point even switching off the EV would
             # not create injection (the house alone already consumes at least ev_draw_w).
-            ev_draw_w = current_a * voltage
             if consumption < ev_draw_w:
+                solar_w = ev_draw_w - consumption
+                if int(current_a) <= int(hw_min_a):
+                    text = (
+                        f"Laadt door ondanks netafname ({consumption:.0f} W): de zon dekt nog "
+                        f"{solar_w:.0f} W van de {ev_draw_w:.0f} W laadvermogen "
+                        f"({solar_w / ev_draw_w * 100:.0f}%). De lader staat al op het minimum "
+                        f"({hw_min_a:.0f} A); stoppen zou {solar_w:.0f} W injectie geven. "
+                        f"Hij stopt pas als de zon niets meer bijdraagt."
+                    )
+                else:
+                    text = (
+                        f"Laadt door: netafname {consumption:.0f} W valt binnen de marge van 1 A "
+                        f"die ook bij het verhogen gebruikt wordt (afronding naar boven)."
+                    )
+                self.set_hold(device.id, "solar_share", text)
                 return True   # solar still covers part of EV draw: keep charging
             return False      # solar gone entirely: allow restore to stop the EV
-
-        guard = self.get_guard(device.id)
-        if now is None:
-            now = datetime.now(timezone.utc)
-
-        current_a = self._effective_current_amps(device, guard, cur_state, now, current_a)
 
         # GATE: minimum update-interval — geef vorige commando tijd om effect te hebben.
         if guard.last_current_update is not None:
@@ -1140,10 +1336,21 @@ class EVGuard:
                     "update-interval (%.0f s geleden, minimum %.0f s) — EV blijft voorlopig laden",
                     device.name, elapsed, EV_MIN_UPDATE_INTERVAL_S,
                 )
+                self.set_hold(
+                    device.id, "update_interval",
+                    f"Laadstroom werd {elapsed:.0f} s geleden aangepast; de volgende verlaging "
+                    f"({int(current_a)} → {new_a} A) volgt na {EV_MIN_UPDATE_INTERVAL_S:.0f} s, "
+                    f"zodat de lader de vorige wijziging eerst kan uitvoeren.",
+                    until=guard.last_current_update + timedelta(seconds=EV_MIN_UPDATE_INTERVAL_S),
+                )
                 return True  # interval nog actief: wacht, stop EV niet
 
         # GATE: global rate limiter
         if not self._rate_check(device.name, f"throttle_down {int(current_a)} → {new_a} A", reducing=True):
+            self.set_hold(
+                device.id, "rate_limit",
+                f"Verlagen naar {new_a} A uitgesteld: {self.last_rate_block}.",
+            )
             return True  # rate-limiter vol: probeer volgende cyclus, stop EV niet
 
         try:
@@ -1162,6 +1369,12 @@ class EVGuard:
         guard.last_sent_amps      = float(new_a)
         guard.last_current_update = now
         guard.state               = EVState.CHARGING
+        self.set_hold(
+            device.id, "throttled",
+            f"Zonne-overschot gedaald: laadstroom verlaagd van {int(current_a)} naar {new_a} A "
+            f"in plaats van te stoppen. Stoppen gebeurt pas als ook het minimum "
+            f"({hw_min_a:.0f} A) niet meer deels door de zon gedekt wordt.",
+        )
 
         _LOGGER.info(
             "Peak Guard [SOLAR]: '%s' laadstroom verlaagd %d → %d A "
@@ -1917,6 +2130,8 @@ class EVGuard:
                     return excess
 
                 if not self._rate_check(device.name, "turn_on voor injectiepreventie"):
+                    guard.skip_reason = f"starten uitgesteld: {self.last_rate_block}"
+                    self.last_skip_reason = guard.skip_reason
                     return excess
 
                 # If Tesla was asleep when the snapshot was made (original_soc=None),
@@ -1957,6 +2172,8 @@ class EVGuard:
                 )
 
                 if not turn_on_ok:
+                    guard.skip_reason = f"inschakelen mislukt: {_last_err}"
+                    self.last_skip_reason = guard.skip_reason
                     self._warn(
                         "Peak Guard [SOLAR]: '%s' turn_on definitief mislukt na %d pogingen: %s "
                         "— SOC herstellen naar originele waarde en volgende cyclus opnieuw proberen",
@@ -2028,13 +2245,24 @@ class EVGuard:
         if cur_entity is None or current_a is None:
             return excess - actual_consumption_w
 
+        # Wat de EV bovenop zijn huidige verbruik opeist; de rest van het
+        # overschot blijft voor de volgende apparaten in de cascade. Ook als de
+        # aanpassing hieronder (nog) wordt overgeslagen: de EV neemt ze straks.
+        remaining = excess - max(0.0, new_a - current_a) * voltage
+        if new_a >= int(max_a) and current_a >= int(max_a):
+            self.set_hold(
+                device.id, "max_current",
+                f"Laadt op de maximale laadstroom ({int(max_a)} A); het resterende "
+                f"overschot gaat naar de volgende apparaten of het net.",
+            )
+
         if new_a == math.ceil(current_a):
             _LOGGER.debug(
                 "Peak Guard [SOLAR]: '%s' set_value OVERGESLAGEN — "
                 "laadstroom al op %d A (redundant call vermeden)",
                 device.name, new_a,
             )
-            return excess - actual_consumption_w
+            return remaining
 
         if (
             guard.last_sent_amps is not None
@@ -2046,7 +2274,7 @@ class EVGuard:
                 device.name, int(guard.last_sent_amps), new_a,
                 abs(new_a - guard.last_sent_amps), EV_HYSTERESIS_AMPS,
             )
-            return excess - actual_consumption_w
+            return remaining
 
         if guard.last_current_update is not None:
             elapsed = (now - guard.last_current_update).total_seconds()
@@ -2056,12 +2284,22 @@ class EVGuard:
                     "(%.0f s geleden, minimum %.0f s)",
                     device.name, elapsed, EV_MIN_UPDATE_INTERVAL_S,
                 )
-                return excess - actual_consumption_w
+                self.set_hold(
+                    device.id, "update_interval",
+                    f"Laadstroom werd {elapsed:.0f} s geleden aangepast; de volgende stap "
+                    f"({int(current_a)} → {new_a} A) volgt na {EV_MIN_UPDATE_INTERVAL_S:.0f} s.",
+                    until=guard.last_current_update + timedelta(seconds=EV_MIN_UPDATE_INTERVAL_S),
+                )
+                return remaining
 
         if not self._rate_check(
             device.name, f"set_value solar {int(current_a)} → {new_a} A"
         ):
-            return excess - actual_consumption_w
+            self.set_hold(
+                device.id, "rate_limit",
+                f"Verhogen naar {new_a} A uitgesteld: {self.last_rate_block}.",
+            )
+            return remaining
 
         try:
             await self._svc(
@@ -2074,7 +2312,7 @@ class EVGuard:
                 "— stroomaanpassing volgende cyclus opnieuw",
                 device.name, new_a, err,
             )
-            return excess - actual_consumption_w
+            return remaining
 
         self._track_action(cur_entity, "number.set_value", float(new_a))
         _LOGGER.info(
@@ -2089,4 +2327,4 @@ class EVGuard:
         guard.last_sent_amps      = float(new_a)
         guard.last_current_update = now
         guard.state               = EVState.CHARGING
-        return excess - actual_consumption_w
+        return remaining

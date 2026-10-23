@@ -66,8 +66,9 @@ def _shared(device_store: FakeDeviceSavingsStore):
 
 def _avoid(peak: PeakAvoidTracker, nominal_kw: float, ts: datetime) -> None:
     peak.record_pending_avoid("boiler", "Boiler", nominal_kw, ts=ts)
-    peak.start_measurement_on_turnon("boiler", "Boiler", ts=ts)
-    peak.complete_peak_calculation("boiler", now=ts + timedelta(minutes=15))
+    # Pas een half uur later terug aan: de verschoven energie valt in andere kwartieren.
+    peak.start_measurement_on_turnon("boiler", "Boiler", ts=ts + timedelta(minutes=30))
+    peak.complete_peak_calculation("boiler", now=ts + timedelta(minutes=45))
 
 
 class TestYearRollover:

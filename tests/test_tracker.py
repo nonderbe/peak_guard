@@ -117,8 +117,9 @@ class TestPeakAvoidTracker:
         avoid_ts: datetime = Q,
     ):
         """Record pending → turn on → complete cycle; returns the event."""
-        turnon_ts    = avoid_ts
-        stop_ts      = avoid_ts + timedelta(minutes=duration_min)
+        # Terug aan een half uur later: de energie valt dan in andere kwartieren.
+        turnon_ts    = avoid_ts + timedelta(minutes=30)
+        stop_ts      = turnon_ts + timedelta(minutes=duration_min)
         tracker.record_pending_avoid("dev1", "Oven", nominal_kw, ts=avoid_ts)
         tracker.start_measurement_on_turnon("dev1", "Oven", ts=turnon_ts)
         return tracker.complete_peak_calculation("dev1", now=stop_ts)
@@ -219,15 +220,8 @@ class TestDeviceMonthlySavings:
     device, the highest hypothetical monthly peak it avoided vs. the actual
     monthly peak — the basis for the monthly_device_savings_store history.
 
-    Note: hypothetical_monthly_peak_kw is a single value shared across all
-    devices in the cascade (it's the max over every quarter's extra_dict,
-    which any device can contribute to) and is monotonically non-decreasing
-    within a month. So a device's recorded max only reflects the combined
-    hypo *as of that device's own last completed event* — if a different
-    device later pushes the combined hypo higher, only that later device's
-    entry picks up the new value. This mirrors the exact behaviour verified
-    against production data (boiler's later event absorbed the month's peak
-    hypo; Tesla's earlier, smaller one kept its own lower snapshot).
+    Each device's hypo is the actual quarters plus only that device's own
+    shift, so a device is never credited for what another device avoided.
     """
 
     def _tracker(self, tarief: float = TARIEF) -> PeakAvoidTracker:
@@ -237,9 +231,10 @@ class TestDeviceMonthlySavings:
 
     def _cycle(self, tracker: PeakAvoidTracker, device_id: str, device_name: str,
                nominal_kw: float, avoid_ts: datetime, duration_min: float = 15.0):
-        stop_ts = avoid_ts + timedelta(minutes=duration_min)
+        turnon_ts = avoid_ts + timedelta(minutes=30)
+        stop_ts = turnon_ts + timedelta(minutes=duration_min)
         tracker.record_pending_avoid(device_id, device_name, nominal_kw, ts=avoid_ts)
-        tracker.start_measurement_on_turnon(device_id, device_name, ts=avoid_ts)
+        tracker.start_measurement_on_turnon(device_id, device_name, ts=turnon_ts)
         return tracker.complete_peak_calculation(device_id, now=stop_ts)
 
     def test_no_events_returns_empty_list(self):
@@ -295,3 +290,132 @@ class TestDeviceMonthlySavings:
         assert t.get_device_monthly_savings() == []
         assert t.device_max_hypo_this_month == {}
         assert t.device_names_this_month == {}
+
+
+# ═══════════════════════════════════════════════════════════════════════════ #
+#  Per-event hypothetical peak and shift bookkeeping                          #
+# ═══════════════════════════════════════════════════════════════════════════ #
+
+class TestPerEventValues:
+
+    def _tracker(self) -> PeakAvoidTracker:
+        t = PeakAvoidTracker()
+        t.set_tarief(TARIEF)
+        return t
+
+    def _cycle(self, t, device_id, nominal_kw, avoid_ts, turnon_delay_min=30.0,
+               duration_min=15.0):
+        turnon = avoid_ts + timedelta(minutes=turnon_delay_min)
+        t.record_pending_avoid(device_id, device_id, nominal_kw, ts=avoid_ts)
+        t.start_measurement_on_turnon(device_id, device_id, ts=turnon)
+        return t.complete_peak_calculation(
+            device_id, now=turnon + timedelta(minutes=duration_min))
+
+    def test_each_event_has_its_own_hypothetical_peak(self):
+        """The reported bug: every row showed the month-wide maximum."""
+        t = self._tracker()
+        q2 = Q + timedelta(hours=2)
+        t.set_context(actual_quarters={Q: 3.0, q2: 1.0}, actual_monthly_peak=3.0)
+        boiler = self._cycle(t, "boiler", 2.0, Q)
+        pump = self._cycle(t, "pump", 0.5, q2)
+        assert boiler.hypothetical_peak_kw == pytest.approx(5.0)
+        assert pump.hypothetical_peak_kw == pytest.approx(1.5)
+        assert boiler.avoided_peak_kw == pytest.approx(2.0)
+        assert pump.avoided_peak_kw == 0.0
+        assert t.hypothetical_monthly_peak_kw == pytest.approx(5.0)
+
+    def test_lower_restart_draw_caps_the_shifted_power(self):
+        """EV herstart na de piek op 8 A i.p.v. 16 A: verschuif enkel wat hij trekt."""
+        t = self._tracker()
+        t.record_pending_avoid("ev", "EV", 3.68, ts=Q)
+        t.start_measurement_on_turnon("ev", "EV", ts=Q + timedelta(minutes=30), max_kw=1.84)
+        assert t.get_active_nominal_kw("ev") == pytest.approx(1.84)
+
+    def test_device_savings_are_not_credited_with_other_devices_shift(self):
+        t = self._tracker()
+        q2 = Q + timedelta(hours=2)
+        t.set_context(actual_quarters={Q: 3.0, q2: 1.0}, actual_monthly_peak=3.0)
+        self._cycle(t, "boiler", 2.0, Q)
+        self._cycle(t, "pump", 0.5, q2)
+        by_device = {d["device_id"]: d for d in t.get_device_monthly_savings()}
+        assert by_device["boiler"]["avoided_kw"] == pytest.approx(2.0)
+        assert by_device["pump"]["hypothetical_peak_kw"] == pytest.approx(3.0)
+        assert by_device["pump"]["avoided_kw"] == 0.0
+
+    def test_two_devices_in_same_quarter_add_up_in_event_hypo(self):
+        t = self._tracker()
+        t.set_context(actual_quarters={Q: 3.0}, actual_monthly_peak=3.0)
+        first = self._cycle(t, "boiler", 2.0, Q)
+        self._cycle(t, "oven", 1.0, Q)
+        assert first.hypothetical_peak_kw == pytest.approx(6.0)
+        by_device = {d["device_id"]: d for d in t.get_device_monthly_savings()}
+        assert by_device["boiler"]["hypothetical_peak_kw"] == pytest.approx(5.0)
+        assert by_device["oven"]["hypothetical_peak_kw"] == pytest.approx(4.0)
+
+    def test_shift_within_the_same_quarter_avoids_nothing(self):
+        """Off at 10:02, on at 10:05, stop at 10:12: the energy stays in the quarter."""
+        t = self._tracker()
+        t.set_context(actual_quarters={Q: 3.0}, actual_monthly_peak=3.0)
+        event = self._cycle(t, "boiler", 4.0, Q + timedelta(minutes=2),
+                            turnon_delay_min=3.0, duration_min=7.0)
+        assert event.hypothetical_peak_kw == pytest.approx(3.0)
+        assert event.avoided_peak_kw == 0.0
+        assert t.avoided_kw_this_month == 0.0
+
+    def test_event_values_follow_a_later_higher_actual_peak(self):
+        t = self._tracker()
+        t.set_context(actual_quarters={Q: 3.0}, actual_monthly_peak=3.0)
+        event = self._cycle(t, "boiler", 2.0, Q)
+        assert event.savings_euro == pytest.approx(20.0)
+        t.set_context(actual_quarters={Q: 3.0, Q + timedelta(days=1): 4.5},
+                      actual_monthly_peak=4.5)
+        assert event.avoided_peak_kw == pytest.approx(0.5)
+        assert event.savings_euro == pytest.approx(5.0)
+
+    def test_removed_phantom_quarter_lowers_the_hypo(self):
+        """A quarter wiped by the P1 check no longer props up the hypo."""
+        t = self._tracker()
+        t.set_context(actual_quarters={Q: 11.0}, actual_monthly_peak=11.0)
+        self._cycle(t, "boiler", 2.0, Q)
+        assert t.hypothetical_monthly_peak_kw == pytest.approx(13.0)
+        t.set_context(actual_quarters={Q: 3.0}, actual_monthly_peak=3.0)
+        assert t.hypothetical_monthly_peak_kw == pytest.approx(5.0)
+
+    def test_reshed_completes_the_running_measurement(self):
+        t = self._tracker()
+        t.record_pending_avoid("boiler", "Boiler", 2.0, ts=Q)
+        t.start_measurement_on_turnon("boiler", "Boiler", ts=Q + timedelta(minutes=30))
+        t.record_pending_avoid("boiler", "Boiler", 2.0, ts=Q + timedelta(minutes=40))
+        assert len(t.events) == 1
+        assert t.events[0].measured_duration_min == pytest.approx(10.0)
+        assert t.get_pending_ids() == ["boiler"]
+
+    def test_repeated_shed_keeps_the_original_avoid_time(self):
+        t = self._tracker()
+        t.record_pending_avoid("ev", "EV", 4.0, ts=Q)
+        t.record_pending_avoid("ev", "EV", 4.0, ts=Q + timedelta(minutes=5))
+        t.start_measurement_on_turnon("ev", "EV", ts=Q + timedelta(minutes=30))
+        event = t.complete_peak_calculation("ev", now=Q + timedelta(minutes=45))
+        assert event.avoid_ts == Q
+
+    def test_measurement_without_detected_stop_completes_after_a_quarter(self):
+        t = self._tracker()
+        t.record_pending_avoid("boiler", "Boiler", 2.0, ts=Q)
+        t.start_measurement_on_turnon("boiler", "Boiler", ts=Q + timedelta(minutes=30))
+        assert t.complete_expired(Q + timedelta(minutes=40)) == []
+        (event,) = t.complete_expired(Q + timedelta(minutes=50))
+        assert event.measured_duration_min == pytest.approx(15.0)
+        assert t.get_active_ids() == []
+
+    def test_shift_survives_a_restart(self):
+        t = self._tracker()
+        t.set_context(actual_quarters={Q: 3.0}, actual_monthly_peak=3.0)
+        self._cycle(t, "boiler", 2.0, Q)
+        saved = t.extra_to_dict()
+
+        t2 = self._tracker()
+        t2.extra_from_dict(saved)
+        t2.set_context(actual_quarters={Q: 3.0}, actual_monthly_peak=3.0)
+        assert t2.hypothetical_monthly_peak_kw == pytest.approx(5.0)
+        assert t2.avoided_kw_this_month == pytest.approx(2.0)
+        assert t2.device_max_hypo_this_month["boiler"] == pytest.approx(5.0)

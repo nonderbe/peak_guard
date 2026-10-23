@@ -299,6 +299,21 @@ class SwitchOnDevice(BaseCascadeDevice):
             )
             return excess
         if state.state == "off":
+            # Pas inschakelen als het overschot het apparaat volledig dekt.
+            # Anders trekt het meteen stroom van het net, schakelt het herstel
+            # het de volgende cyclus weer uit (verbruik ≥ 0) en klappert het
+            # elke cyclus aan/uit.
+            if self.power_watts and excess < self.power_watts:
+                ctx.last_skip_reason = (
+                    f"overschot {excess:.0f} W < vermogen {self.power_watts:.0f} W"
+                )
+                ctx.ev_guard.set_hold(
+                    self.id, "surplus_too_small",
+                    f"Blijft uit: het zonne-overschot ({excess:.0f} W) dekt het vermogen van "
+                    f"dit apparaat ({self.power_watts:.0f} W) nog niet. Inschakelen zou "
+                    f"stroom van het net halen en het apparaat na één cyclus weer uitschakelen.",
+                )
+                return excess
             if self.entity_id not in snapshots:
                 snapshots[self.entity_id] = DeviceSnapshot(
                     entity_id=self.entity_id, original_state=state.state)

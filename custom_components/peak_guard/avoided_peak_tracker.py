@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import logging
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional
 
@@ -61,7 +61,16 @@ class ActivePeakMeasurement:
 
 @dataclass
 class PeakEvent:
-    """Afgerond piek-vermijdings-event."""
+    """
+    Afgerond piek-vermijdings-event.
+
+    hypothetical_peak_kw, avoided_peak_kw en savings_euro gelden voor dít
+    event: de hoogste kwartierwaarde zonder Peak Guard in de kwartieren waar
+    de uitgestelde energie anders zou zijn gevallen, en wat dat ten opzichte
+    van de werkelijke maandpiek uitspaart. Ze worden herberekend zolang de
+    maand loopt (open kwartier, latere hogere piek, P1-correctie). Events
+    overlappen: hun besparingen zijn niet optelbaar tot het maandtotaal.
+    """
     device_id:             str
     device_name:           str
     nominal_kw:            float
@@ -73,6 +82,9 @@ class PeakEvent:
     avoided_peak_kw:       float
     savings_euro:          float
     hypothetical_peak_kw:  float = 0.0
+    # Kwartieren waar de uitgestelde energie zonder Peak Guard was gevallen.
+    # Leeg bij events van vóór v1.9.2: die houden hun opgeslagen waarden.
+    avoid_quarters:        List[datetime] = field(default_factory=list)
 
 
 @dataclass
@@ -107,10 +119,15 @@ class PeakAvoidTracker:
         self._pending: Dict[str, PendingAvoid] = {}
         self._active:  Dict[str, ActivePeakMeasurement] = {}
 
-        # Hypothetische extra kW per kwartierstart
+        # Netto verschoven vermogen (kW) per apparaat per kwartierstart:
+        # + waar de energie zonder Peak Guard zou zijn gevallen (vanaf avoid_ts),
+        # − waar ze na het herinschakelen werkelijk viel (vanaf turnon_ts, en
+        # dus al in de gemeten kwartierwaarde zit). Wordt gepersisteerd.
+        self.extra_by_device: Dict[str, Dict[datetime, float]] = {}
+        # Som over alle apparaten (afgeleid, bijgewerkt door _recalc)
         self.extra_dict: Dict[datetime, float] = {}
 
-        # Events log (max 50, FIFO)
+        # Events log (max 100, FIFO)
         self.events: deque[PeakEvent] = deque(maxlen=MAX_EVENTS)
 
         # Maand-cumulatieven (holistisch herberekend, niet per event opgeteld)
@@ -122,17 +139,18 @@ class PeakAvoidTracker:
 
         # Hypothetische maandpiek
         self.hypothetical_monthly_peak_kw: Optional[float] = None
-        # Lijst van alle berekende hypothetische pieken deze maand (één per event).
-        # Wordt gepersisteerd zodat de hoogste waarde na een herstart beschikbaar blijft.
+        # Vloer uit een opgeslagen maandstaat van vóór v1.9.2 (zonder
+        # extra_by_device). Wordt niet meer aangevuld; vervalt bij de maandwissel.
         self.hypothetical_peaks_this_month: List[float] = []
 
-        # Per-apparaat hoogste hypothetische maandpiek deze maand — laat toe
-        # de besparing te isoleren per apparaat (bv. "wat heeft de boiler
-        # alleen bijgedragen aan de capaciteitstarief-besparing"), met
-        # dezelfde methodologie als de globale maandbesparing: enkel het
-        # hoogste moment telt, niet de som van alle events.
+        # Per-apparaat hypothetische maandpiek: de werkelijke kwartieren plus
+        # enkel de verschuiving van dát apparaat — "wat had dit apparaat
+        # alleen gekost". Afgeleid uit extra_by_device door _recalc.
         self.device_max_hypo_this_month: Dict[str, float] = {}
         self.device_names_this_month:    Dict[str, str] = {}
+        # Vloer per apparaat in een maand die met een oudere versie begon: de
+        # laatst opgeslagen maandrecord per apparaat (zie hypothetical_peaks_this_month).
+        self.device_hypo_floor_this_month: Dict[str, float] = {}
 
         # Context (bijgewerkt door SharedCapacityState)
         self._actual_quarters:     Dict[datetime, float] = {}
@@ -145,12 +163,10 @@ class PeakAvoidTracker:
                     actual_monthly_peak: float) -> None:
         self._actual_quarters     = actual_quarters
         self._actual_monthly_peak = actual_monthly_peak
-        # Herbereken hypothetische piek met de nieuwste kwartierdata, daarna besparing.
-        # Zonder deze recalc-stap was de hypothetische piek verouderd: complete_peak_calculation
-        # vuurde terwijl het kwartier nog niet afgesloten was (_actual_quarters leeg),
-        # waardoor hypo = enkel extra_dict (zonder basisbelasting) → te laag → besparing = 0.
-        self._recalc_hypo()
-        self._recalc_month_savings()
+        # Herbereken met de nieuwste kwartierdata: een kwartier dat afsluit,
+        # een latere hogere piek of een door de P1-meter gewist kwartier
+        # werken zo door in maandtotaal, per-apparaat- en per-event-waarden.
+        self._recalc()
         _LOGGER.debug(
             "PeakAvoidTracker.set_context: %d kwartieren, maandpiek=%.3f kW, "
             "besparing=€%.4f",
@@ -159,7 +175,7 @@ class PeakAvoidTracker:
 
     def set_tarief(self, tarief: float) -> None:
         self._tarief = tarief
-        self._recalc_month_savings()
+        self._recalc()
         _LOGGER.debug("PeakAvoidTracker.set_tarief: %.4f €/kW/jaar", tarief)
 
     def reset_month(self) -> None:
@@ -182,6 +198,7 @@ class PeakAvoidTracker:
             )
         self._pending.clear()
         self._active.clear()
+        self.extra_by_device.clear()
         self.extra_dict.clear()
         self.events.clear()
         self.avoided_kw_this_month  = 0.0
@@ -190,6 +207,7 @@ class PeakAvoidTracker:
         self.hypothetical_peaks_this_month.clear()
         self.device_max_hypo_this_month.clear()
         self.device_names_this_month.clear()
+        self.device_hypo_floor_this_month.clear()
         _LOGGER.info("PeakAvoidTracker: maanddata gereset")
 
     def reset_year(self) -> None:
@@ -204,28 +222,56 @@ class PeakAvoidTracker:
                               ts: Optional[datetime] = None) -> None:
         if ts is None:
             ts = datetime.now(timezone.utc)
+        # Opnieuw afgeschakeld terwijl de vorige meting nog liep: rond die
+        # eerst af, anders gaat de eerdere vermijding verloren.
+        if device_id in self._active:
+            self.complete_peak_calculation(device_id, now=ts)
+        # Nog altijd uit sinds de vorige afschakeling: het oorspronkelijke
+        # uitstelmoment blijft gelden.
+        if device_id in self._pending:
+            _LOGGER.debug("PeakAvoidTracker: '%s' al pending sinds %s",
+                          device_name, self._pending[device_id].avoid_ts.isoformat())
+            return
         self._pending[device_id] = PendingAvoid(
             device_id=device_id, device_name=device_name,
             nominal_kw=nominal_kw, avoid_ts=ts,
         )
-        self._active.pop(device_id, None)
         _LOGGER.debug("PeakAvoidTracker: pending '%s' @ %s", device_name, ts.isoformat())
 
     # ── Hook 2: cascade schakelt terug IN ────────────────────────── #
 
     def start_measurement_on_turnon(self, device_id: str, device_name: str,
-                                     ts: Optional[datetime] = None) -> None:
+                                     ts: Optional[datetime] = None,
+                                     max_kw: Optional[float] = None) -> None:
+        """max_kw: het apparaat trekt na herstel minder (bv. EV op lagere stroom)."""
         if device_id not in self._pending:
             return
         if ts is None:
             ts = datetime.now(timezone.utc)
         p = self._pending.pop(device_id)   # verwijder uit pending bij overgang → active
+        nominal_kw = p.nominal_kw if max_kw is None else min(p.nominal_kw, max_kw)
         self._active[device_id] = ActivePeakMeasurement(
             device_id=device_id, device_name=device_name,
-            nominal_kw=p.nominal_kw, avoid_ts=p.avoid_ts, turnon_ts=ts,
+            nominal_kw=nominal_kw, avoid_ts=p.avoid_ts, turnon_ts=ts,
         )
         _LOGGER.debug("PeakAvoidTracker: meting gestart '%s' turnon @ %s",
                       device_name, ts.isoformat())
+
+    def complete_expired(self, now: datetime) -> List[PeakEvent]:
+        """
+        Rond metingen af die al een kwartier lopen. De duur wordt toch op
+        15 min begrensd; zonder deze stap blijft een meting waarvan de
+        natuurlijke stop niet gedetecteerd wordt (modulerend verbruik,
+        gelijktijdig ander verbruik) tot de maandwissel hangen.
+        """
+        done: List[PeakEvent] = []
+        limit = timedelta(minutes=_QUARTER_MIN)
+        for device_id, meas in list(self._active.items()):
+            if now - meas.turnon_ts >= limit:
+                event = self.complete_peak_calculation(device_id, now=meas.turnon_ts + limit)
+                if event is not None:
+                    done.append(event)
+        return done
 
     # ── Hook 3: natuurlijke stop → bereken kW-impact ─────────────── #
 
@@ -249,38 +295,15 @@ class PeakAvoidTracker:
 
         added_kwh = (duration_min / 60.0) * meas.nominal_kw
 
-        # Snapshot maandbesparing vóór dit event (voor marginale bijdrage)
-        savings_before = self.savings_euro_this_month
-        avoided_before = self.avoided_kw_this_month
-
-        # Verdeel energie over kwartierblokken vanaf avoid_ts
-        for q, kwh in self._distribute(meas.avoid_ts, duration_min, added_kwh).items():
-            self.extra_dict[q] = self.extra_dict.get(q, 0.0) + kwh / _QUARTER_H
-
-        self._recalc_hypo()
-        if self.hypothetical_monthly_peak_kw is not None:
-            self.hypothetical_peaks_this_month.append(self.hypothetical_monthly_peak_kw)
-        # Herbereken maandtotalen holistisch: niet accumuleren maar opnieuw berekenen
-        self._recalc_month_savings()
-
-        hypo    = self.hypothetical_monthly_peak_kw or 0.0
-
-        # Houd per apparaat de hoogste hypothetische maandpiek bij die het
-        # ooit heeft vermeden — de basis voor per-apparaat besparingsattributie.
-        if hypo > self.device_max_hypo_this_month.get(device_id, 0.0):
-            self.device_max_hypo_this_month[device_id] = hypo
+        # Zonder Peak Guard was deze energie vanaf avoid_ts verbruikt; nu viel
+        # ze vanaf turnon_ts en zit ze al in de gemeten kwartieren.
+        dev_extra = self.extra_by_device.setdefault(device_id, {})
+        avoid_parts = self._distribute(meas.avoid_ts, duration_min, added_kwh)
+        for q, kwh in avoid_parts.items():
+            dev_extra[q] = dev_extra.get(q, 0.0) + kwh / _QUARTER_H
+        for q, kwh in self._distribute(meas.turnon_ts, duration_min, added_kwh).items():
+            dev_extra[q] = dev_extra.get(q, 0.0) - kwh / _QUARTER_H
         self.device_names_this_month[device_id] = meas.device_name
-        # Marginale bijdrage van dit event aan de maandbesparing
-        event_avoided = round(max(0.0, self.avoided_kw_this_month - avoided_before), 4)
-        event_savings = round(max(0.0, self.savings_euro_this_month - savings_before), 4)
-
-        _LOGGER.debug(
-            "PeakAvoidTracker.complete_peak_calculation '%s': "
-            "hypo=%.3f kW, actual=%.3f kW, maand_vermeden=%.4f kW, "
-            "event_vermeden=%.4f kW, maand_besparing=€%.4f",
-            meas.device_name, hypo, self._actual_monthly_peak,
-            self.avoided_kw_this_month, event_avoided, self.savings_euro_this_month,
-        )
 
         event = PeakEvent(
             device_id=device_id, device_name=meas.device_name,
@@ -289,15 +312,19 @@ class PeakAvoidTracker:
             natural_stop_ts=now,
             measured_duration_min=round(duration_min, 2),
             added_energy_kwh=round(added_kwh, 4),
-            avoided_peak_kw=event_avoided,
-            savings_euro=event_savings,
-            hypothetical_peak_kw=round(hypo, 4),
+            avoided_peak_kw=0.0,
+            savings_euro=0.0,
+            avoid_quarters=sorted(avoid_parts),
         )
         self.events.append(event)
+        self._recalc()
+
         _LOGGER.info(
-            "PeakAvoidTracker: '%s' duur=%.1fmin event_vermeden=%.3fkW €%.4f "
-            "| maand totaal: vermeden=%.3fkW €%.4f",
-            meas.device_name, duration_min, event_avoided, event_savings,
+            "PeakAvoidTracker: '%s' duur=%.1fmin hypo=%.3fkW event_vermeden=%.3fkW €%.4f "
+            "| maand totaal: hypo=%.3fkW vermeden=%.3fkW €%.4f",
+            meas.device_name, duration_min, event.hypothetical_peak_kw,
+            event.avoided_peak_kw, event.savings_euro,
+            self.hypothetical_monthly_peak_kw or 0.0,
             self.avoided_kw_this_month, self.savings_euro_this_month,
         )
         return event
@@ -319,12 +346,13 @@ class PeakAvoidTracker:
         """
         Isoleert de besparing per apparaat voor de lopende maand.
 
-        Voor elk apparaat dat dit maand minstens één piek-vermijdend event
-        voltooide: vergelijk de hoogste hypothetische piek die dát apparaat
-        alleen heeft vermeden met de werkelijke maandpiek — dezelfde
+        Voor elk apparaat dat deze maand minstens één piek-vermijdend event
+        voltooide: de hoogste kwartierwaarde met enkel de verschuiving van
+        dát apparaat erbij, vergeleken met de werkelijke maandpiek — dezelfde
         (hypo − actual) × tarief/12-methodologie als de globale maandbesparing
-        (inclusief de 2,5 kW-ondergrens, zie _avoided_kw), maar per apparaat
-        toegepast in plaats van gesommeerd over events.
+        (inclusief de 2,5 kW-ondergrens, zie _avoided_kw). Wat andere
+        apparaten in hetzelfde kwartier uitstelden, telt hier niet mee; de
+        som over apparaten is dus geen maandtotaal.
 
         Retourneert een lijst dicts, één per apparaat:
         device_id, device_name, hypothetical_peak_kw, actual_monthly_peak_kw,
@@ -344,6 +372,28 @@ class PeakAvoidTracker:
             })
         return result
 
+    # ── persistentie ──────────────────────────────────────────────── #
+
+    def extra_to_dict(self) -> Dict[str, Dict[str, float]]:
+        return {
+            device_id: {q.isoformat(): round(kw, 4) for q, kw in quarters.items()}
+            for device_id, quarters in self.extra_by_device.items()
+        }
+
+    def extra_from_dict(self, data: Dict[str, Dict[str, float]]) -> None:
+        self.extra_by_device = {}
+        for device_id, quarters in (data or {}).items():
+            try:
+                self.extra_by_device[device_id] = {
+                    datetime.fromisoformat(q): float(kw) for q, kw in quarters.items()
+                }
+            except (AttributeError, TypeError, ValueError):
+                _LOGGER.warning("PeakAvoidTracker: ongeldige verschuivingsdata voor '%s' genegeerd",
+                                device_id)
+        # Geen herberekening hier: bij het herstel moeten de opgeslagen maand-
+        # en jaarbesparing blijven staan tot de jaarbasis gezet is. De eerste
+        # set_context() rekent alles opnieuw uit.
+
     # ── interne helpers ───────────────────────────────────────────── #
 
     def _distribute(self, start_ts: datetime, duration_min: float,
@@ -359,19 +409,47 @@ class PeakAvoidTracker:
             q = q_end
         return result
 
-    def _recalc_hypo(self) -> None:
-        all_q = set(self._actual_quarters) | set(self.extra_dict)
-        if all_q:
-            vals = [self._actual_quarters.get(q, 0.0) + self.extra_dict.get(q, 0.0)
-                    for q in all_q]
-            live = round(max(vals), 4)
-        else:
-            live = 0.0
-        # Neem de hoogste eerder berekende hypo van deze maand mee als vloer.
-        # Na een herstart is extra_dict leeg, maar de lijst overleeft via persistentie.
+    def _hypo_quarter(self, q: datetime, extra: Dict[datetime, float]) -> float:
+        """Kwartierwaarde zonder (die) verschuiving(en), nooit onder 0."""
+        return max(0.0, self._actual_quarters.get(q, 0.0) + extra.get(q, 0.0))
+
+    def _max_hypo(self, extra: Dict[datetime, float]) -> float:
+        quarters = set(self._actual_quarters) | set(extra)
+        if not quarters:
+            return 0.0
+        return round(max(self._hypo_quarter(q, extra) for q in quarters), 4)
+
+    def _recalc(self) -> None:
+        totals: Dict[datetime, float] = {}
+        for quarters in self.extra_by_device.values():
+            for q, kw in quarters.items():
+                totals[q] = totals.get(q, 0.0) + kw
+        self.extra_dict = totals
+
+        # Maandpiek zonder Peak Guard. De vloer bestaat enkel in een maand die
+        # met een oudere versie begon (daar ging de verschuiving bij elke
+        # herstart verloren).
+        live = self._max_hypo(totals)
         floor = max(self.hypothetical_peaks_this_month) if self.hypothetical_peaks_this_month else 0.0
         combined = max(live, floor)
         self.hypothetical_monthly_peak_kw = combined if combined > 0 else None
+
+        device_hypo = dict(self.device_hypo_floor_this_month)
+        for device_id, quarters in self.extra_by_device.items():
+            device_hypo[device_id] = max(
+                self._max_hypo(quarters), device_hypo.get(device_id, 0.0)
+            )
+        self.device_max_hypo_this_month = device_hypo
+
+        for event in self.events:
+            if not event.avoid_quarters:
+                continue   # event van vóór v1.9.2: opgeslagen waarden behouden
+            hypo = max(self._hypo_quarter(q, totals) for q in event.avoid_quarters)
+            event.hypothetical_peak_kw = round(hypo, 4)
+            event.avoided_peak_kw = self._avoided_kw(hypo)
+            event.savings_euro = round(event.avoided_peak_kw * self._tarief / 12.0, 4)
+
+        self._recalc_month_savings()
 
     def _avoided_kw(self, hypo_kw: float) -> float:
         """
