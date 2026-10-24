@@ -436,6 +436,8 @@ class ScheduleDecider(BaseDecider):
             return False
         try:
             self.peak_tracker.complete_peak_calculation(device_id=entry.device.id, now=now)
+            # Een EV die door de piek stilstond tot het einde van het venster.
+            self.peak_tracker.complete_deferral(entry.device.id, now)
         except Exception:
             _LOGGER.exception("Peak Guard schema: piek-event afronden mislukt voor '%s'", entry.device.name)
         return True
@@ -585,10 +587,9 @@ class ScheduleDecider(BaseDecider):
                 self._peak_snapshots.pop(dev.entity_id, None)
                 changed = True
             elif amps_allowed is not None and amps_allowed >= hw_min:
+                # De uitgestelde lading wordt afgerond wanneer het schema de
+                # EV werkelijk herstart (na min-OFF), niet bij het vrijgeven.
                 self._peak_snapshots.pop(dev.entity_id, None)
-                self.peak_tracker.start_measurement_on_turnon(
-                    device_id=dev.id, device_name=dev.name, ts=now,
-                )
                 _LOGGER.info(
                     "Peak Guard [SCHEMA]: '%s' piekbeperking opgeheven — weer ruimte voor %d A",
                     dev.name, amps_allowed,
@@ -644,6 +645,9 @@ class ScheduleDecider(BaseDecider):
         await self._ensure_soc(entry, rs, target, now, "doel laadvenster")
         skip = await ev.schedule_start(dev, max(int(hw_min), amps_allowed), now)
         if skip is None:
+            self.peak_tracker.start_measurement_on_turnon(
+                device_id=dev.id, device_name=dev.name, ts=now,
+            )
             rs.started_by_schedule = True
             rs.start_attempts += 1
             rs.status = f"laden gestart tot {target}%"

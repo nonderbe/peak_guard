@@ -7,6 +7,8 @@ en moet de per-apparaat-besparing van de gemiste maand alsnog bevroren worden.
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import pytest
 
 from custom_components.peak_guard.avoided_peak_tracker import PeakAvoidTracker
@@ -40,7 +42,8 @@ class TestRestorePeakTracker:
         )
         assert t.savings_euro_this_year == pytest.approx(40.0)
         assert t.savings_euro_this_month == pytest.approx(15.0)
-        assert t.hypothetical_peaks_this_month == [4.0]
+        # De vloer van vóór v1.9.2 (dubbel geteld) wordt niet overgenomen.
+        assert t.hypothetical_peaks_this_month == []
         # Jaarbasis = jaar − lopende maand: een herberekening zonder besparing
         # deze maand laat de vorige maanden (€25) staan.
         t._recalc_month_savings()
@@ -201,18 +204,41 @@ def _rec(device_id, hypo, year=2026, month=10, finalized=False):
 class TestLegacyDeviceFloor:
     """Een maand die met een versie van vóór v1.9.2 begon."""
 
-    def test_device_record_is_not_lowered_by_the_first_new_event(self):
+    def test_legacy_floor_is_replaced_by_rebuilt_events(self):
+        """
+        Vóór v1.9.2 telde een verschuiving binnen één kwartier dubbel (+ bij het
+        uitstel, nooit − bij het herinschakelen). De vloer valt weg en de events
+        worden met de nieuwe regel herbouwd: een uitstel binnen hetzelfde
+        kwartier spaart niets uit.
+        """
         t = _tracker()
         restore_peak_tracker(
             t, saved_year=None,
-            peak_state={"year": 2026, "month": 10, "hypothetical_peaks_this_month": [5.0]},
+            peak_state={
+                "year": 2026, "month": 10, "hypothetical_peaks_this_month": [5.13],
+                "events": [{
+                    "device_id": "boiler", "device_name": "Boiler", "nominal_kw": 2.0,
+                    "avoid_ts": "2026-10-04T16:12:00+00:00",
+                    "turnon_ts": "2026-10-04T16:15:00+00:00",
+                    "natural_stop_ts": "2026-10-04T16:20:00+00:00",
+                    "measured_duration_min": 5.0, "added_energy_kwh": 0.1667,
+                    "avoided_peak_kw": 1.0, "savings_euro": 10.0,
+                    "hypothetical_peak_kw": 5.13,
+                }],
+            },
             year=2026, month=10,
         )
-        seed_device_hypo_floor(t, _device_store(_rec("boiler", 5.0)), 2026, 10)
-        t.set_context(actual_quarters={}, actual_monthly_peak=3.0)
+        seed_device_hypo_floor(t, _device_store(_rec("boiler", 5.13)), 2026, 10)
+        assert t.device_hypo_floor_this_month == {}
+        q = lambda m: datetime(2026, 10, 4, 16, m, tzinfo=timezone.utc)
+        t.set_context(actual_quarters={q(0): 1.9, q(15): 3.0}, actual_monthly_peak=3.0)
+        # + 16:12–16:17: +0.4 kW in kwartier 16:00, +0.267 kW in 16:15;
+        # − 16:15–16:20: −0.667 kW in 16:15 → 16:00 = 2.3, 16:15 = 2.6 kW.
+        assert t.hypothetical_monthly_peak_kw == pytest.approx(2.6, abs=0.001)
         (boiler,) = t.get_device_monthly_savings()
-        assert boiler["hypothetical_peak_kw"] == pytest.approx(5.0)
-        assert boiler["avoided_kw"] == pytest.approx(2.0)
+        assert boiler["avoided_kw"] == pytest.approx(0.0)
+        (ev,) = t.events
+        assert ev.avoid_quarters == [q(0), q(15)]
 
     def test_no_floor_in_a_month_with_new_state(self):
         t = _tracker()

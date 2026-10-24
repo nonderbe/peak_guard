@@ -1820,6 +1820,7 @@ class EVGuard:
                 device_name=device.name,
                 nominal_kw=current_w / 1000.0,
                 ts=now,
+                deferred=True,
             )
             return excess - current_w
 

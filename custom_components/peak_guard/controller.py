@@ -270,6 +270,20 @@ class PeakGuardController:
         """Wek de monitoring loop onmiddellijk op, zonder te wachten op het interval."""
         self._wakeup.set()
 
+    def set_quarter_baseline_fn(self, fn) -> None:
+        """
+        Kwartierbegin voor de piekbeperking op het kwartierbudget (zie
+        quarter_budget.py), aangeleverd door de sensor-setup. In simulatie
+        valt de piek-beslisser terug op het momentane verbruik: de echte
+        meterstand hoort niet bij het gesimuleerde verbruik.
+        """
+        if fn is None:
+            self._peak_decider.set_quarter_baseline_fn(None)
+            return
+        self._peak_decider.set_quarter_baseline_fn(
+            lambda: None if self._simulation_consumption is not None else fn()
+        )
+
     def set_simulation(self, consumption_w: Optional[float]) -> None:
         """Activeer of deactiveer de simulatiemodus.
 

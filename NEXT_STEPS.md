@@ -144,7 +144,7 @@ CLAUDE.md under "Known limitations".
 | Energy sensor that is not strictly increasing loses each quarter in which it dips (no epsilon) | ⏳ accepted |
 | Unrecognised energy units (GWh, unitless Wh) are read as kWh without a warning | ⏳ accepted |
 | Last quarter of each month is not verified against the P1 meter | ⏳ accepted |
-| Too-low monthly records are not raised to the P1 meter's value | ⏳ accepted |
+| Too-low monthly records are not raised to the P1 meter's value | ✅ v1.9.3 (current month raised to the meter) |
 | `controller.py` and the panel have no automated tests | ⏳ accepted |
 
 ---

@@ -181,7 +181,8 @@ class BaseDecider:
         cascade_type: str = "peak",
         now: Optional[datetime] = None,
         skip_fn: Optional[Callable[[BaseCascadeDevice], bool]] = None,
-    ) -> None:
+    ) -> float:
+        """Doorloop de cascade; geeft het onverwerkte overschot (W) terug."""
         if now is None:
             now = datetime.now(timezone.utc)
         sorted_devices = sorted(
@@ -243,6 +244,7 @@ class BaseDecider:
                 "Peak Guard [%s cascade]: klaar — overschot volledig verwerkt ✓", label)
 
         await self._save_fn()
+        return remaining
 
     # ------------------------------------------------------------------ #
     #  Apparaat herstel                                                    #

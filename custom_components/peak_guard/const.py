@@ -119,6 +119,21 @@ EV_UNREACHABLE_BACKOFF_S: float = 900.0
 # laadt. Laadt hij dan nog niet (vol, kabel uit), dan vervalt het snapshot,
 # zodat niet elke cyclus opnieuw turn_on/set_value naar de wagen gaat.
 PEAK_RESTART_CONFIRM_S: float = 180.0
+
+# Piekbeperking op het kwartierbudget (zie quarter_budget.py).
+# Het toegelaten vermogen voor de rest van het kwartier wordt nooit hoger dan
+# dit veelvoud van de piekgrens: een apparaat dat op het einde van een kwartier
+# aan blijft, loopt het volgende kwartier binnen.
+PEAK_ALLOWANCE_CAP_FACTOR: float = 1.5
+# Vermogensgemiddelde uit de energiesensor over minstens zo veel seconden.
+PEAK_AVG_MIN_WINDOW_S: float = 45.0
+PEAK_AVG_MAX_WINDOW_S: float = 300.0
+# Na een afschakeling door de piek-cascade zo lang niets bijkomends afschakelen:
+# een wake-up direct na de eigen turn_off leest nog het oude verbruik.
+PEAK_SETTLE_S: float = 20.0
+# Een schakelaar die de piek-cascade uitzette, blijft minstens zo lang uit
+# (geen aan/uit-pendelen op een wisselende huislast).
+PEAK_SWITCH_MIN_OFF_S: float = 300.0
 # Tekstfragmenten (kleine letters) in de foutmelding die op een onbereikbare wagen wijzen.
 EV_UNREACHABLE_ERRORS: tuple = (
     "not 'online'", "not online", "offline", "asleep",
@@ -160,6 +175,9 @@ STORAGE_VERSION = 1
 
 STORAGE_KEY_QUARTERS = f"{DOMAIN}.quarters"
 STORAGE_VERSION_QUARTERS = 1
+
+STORAGE_KEY_QUARTER_CALC = f"{DOMAIN}.quarter_calc"
+STORAGE_VERSION_QUARTER_CALC = 1
 
 STORAGE_KEY_SAVINGS = f"{DOMAIN}.savings"
 STORAGE_VERSION_SAVINGS = 1

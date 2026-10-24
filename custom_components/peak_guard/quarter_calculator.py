@@ -18,7 +18,8 @@ in de geschiedenis (QUARTER_HISTORY_DAYS × 96 kwartieren).
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+import math
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from .const import MAX_PLAUSIBLE_QUARTER_KW
@@ -29,6 +30,11 @@ _LOGGER = logging.getLogger(__name__)
 # Zolang een kwartier korter dan dit loopt, kan één stap van een grove sensor
 # het lopende gemiddelde nog boven MAX_PLAUSIBLE_QUARTER_KW duwen.
 _SETTLE_MINUTES = 1.0
+
+# Een eerste meting tot zoveel seconden na de grens geldt als de stand op de grens.
+_EXACT_START_S = 5.0
+# Langer gat rond de grens: niet interpoleren, het kwartier is niet betrouwbaar.
+_MAX_INTERPOLATION_GAP_S = 180.0
 
 
 class QuarterCalculator:
@@ -41,19 +47,36 @@ class QuarterCalculator:
         current_kw = calc.update(energy_kwh, now)
         if calc.quarter_just_finished:
             store(calc.last_finished_quarter)
+
+    De meterstand op de kwartiergrens wordt lineair geïnterpoleerd tussen de
+    laatste meting vóór en de eerste meting na de grens. Zonder interpolatie
+    ging de energie tussen de grens en de eerste meting (tot een minuut, want
+    de timer loopt per minuut op een willekeurige seconde) verloren en lag
+    elk kwartier tot 6 % te laag.
+
+    Een kwartier waarvan het begin niet gemeten werd (eerste meting na een
+    herstart zonder bruikbare opgeslagen toestand, of een te lang gat rond de
+    grens) is onvolledig: het wordt niet afgesloten, want de waarde is enkel
+    een ondergrens.
     """
 
     def __init__(self) -> None:
         self._quarter_start_energy: Optional[float] = None
         self._current_quarter_start: Optional[datetime] = None
+        # Tijdstip waarop _quarter_start_energy geldt: de kwartiergrens zelf
+        # (volledig kwartier) of een latere eerste meting (onvolledig).
+        self._measure_start: Optional[datetime] = None
         self._current_kw: float = 0.0
         self._last_finished_value: Optional[float] = None
         self._last_finished_ts: Optional[datetime] = None
         self._quarter_just_finished: bool = False
-        # True zodra de meterstand in het lopende kwartier terugsprong: het
-        # of een onmogelijk vermogen opleverde: het kwartier is dan
-        # onbetrouwbaar en wordt niet afgesloten.
+        # True zodra de meterstand in het lopende kwartier terugsprong of een
+        # onmogelijk vermogen opleverde: het kwartier is dan onbetrouwbaar en
+        # wordt niet afgesloten.
         self._quarter_invalid: bool = False
+        # Laatste meting (voor de interpolatie op de kwartiergrens).
+        self._prev_ts: Optional[datetime] = None
+        self._prev_energy: Optional[float] = None
 
     # ---------------------------------------------------------------- #
     #  Publieke interface                                                #
@@ -79,6 +102,41 @@ class QuarterCalculator:
         """Timestamp (start) van het zojuist afgelopen kwartier."""
         return self._last_finished_ts
 
+    @property
+    def current_quarter_start(self) -> Optional[datetime]:
+        """Start van het lopende kwartier."""
+        return self._current_quarter_start
+
+    @property
+    def quarter_complete(self) -> bool:
+        """True als het lopende kwartier vanaf de grens gemeten wordt en geldig is."""
+        return (
+            self._current_quarter_start is not None
+            and self._measure_start == self._current_quarter_start
+            and not self._quarter_invalid
+        )
+
+    def baseline(self) -> Optional[tuple]:
+        """
+        (kwartierstart, meterstand op de grens) van het lopende kwartier, of
+        None als het niet volledig gemeten wordt. De piek-beslisser rekent
+        er de energie tot nu mee uit met een verse meterstand.
+        """
+        if not self.quarter_complete:
+            return None
+        return self._current_quarter_start, self._quarter_start_energy
+
+    def energy_so_far_kwh(self) -> Optional[float]:
+        """
+        Energie (kWh) sinds het begin van het lopende kwartier, tot de laatste
+        meting. None als het kwartier niet volledig gemeten wordt.
+        """
+        if not self.quarter_complete or self._prev_energy is None:
+            return None
+        if self._prev_ts is None or self._prev_ts < self._current_quarter_start:
+            return None
+        return max(0.0, self._prev_energy - self._quarter_start_energy)
+
     def update(self, energy_kwh: float, now: Optional[datetime] = None) -> float:
         """
         Verwerk een nieuwe energiemeting.
@@ -98,51 +156,152 @@ class QuarterCalculator:
         """
         if now is None:
             now = datetime.now(timezone.utc)
+        # Lokale tijd vergelijkt fout rond de zomer-/wintertijdwissel (fold).
+        now = now.astimezone(timezone.utc)
 
         self._quarter_just_finished = False
         q_start = _quarter_start(now)
 
-        # Eerste meting ooit
         if self._current_quarter_start is None:
-            self._current_quarter_start = q_start
-            self._quarter_start_energy = energy_kwh
-            self._current_kw = 0.0
-            return 0.0
+            # Eerste meting ooit: enkel volledig als ze op de grens valt.
+            self._start_quarter(q_start, energy_kwh, now)
+        elif q_start > self._current_quarter_start:
+            self._roll_over(q_start, energy_kwh, now)
 
-        # Nieuw kwartier gestart?
-        if q_start > self._current_quarter_start:
-            if self._quarter_invalid:
-                _LOGGER.warning(
-                    "QuarterCalculator: kwartier %s niet afgesloten — de "
-                    "meterstand sprong terug tijdens dit kwartier",
-                    self._current_quarter_start.isoformat(),
-                )
-            else:
-                # Sla de definitieve waarde op van het afgelopen kwartier
-                self._last_finished_value = self._current_kw
-                self._last_finished_ts = self._current_quarter_start
+        self._prev_ts = now
+        self._prev_energy = energy_kwh
+        return self._running_value(energy_kwh, now)
+
+    # ---------------------------------------------------------------- #
+    #  Persistentie (herstart midden in een kwartier)                   #
+    # ---------------------------------------------------------------- #
+
+    def to_dict(self) -> dict:
+        """Toestand om een herstart te overbruggen (zie from_dict)."""
+        def iso(dt: Optional[datetime]) -> Optional[str]:
+            return dt.isoformat() if dt is not None else None
+        return {
+            "quarter_start": iso(self._current_quarter_start),
+            "measure_start": iso(self._measure_start),
+            "start_energy": self._quarter_start_energy,
+            "invalid": self._quarter_invalid,
+            "prev_ts": iso(self._prev_ts),
+            "prev_energy": self._prev_energy,
+        }
+
+    def restore(self, data: Optional[dict]) -> bool:
+        """
+        Herstel de toestand van vóór een herstart. De volgende update() werkt
+        dan alsof er geen herstart was: zelfde kwartier → exact verder meten,
+        grens gepasseerd met een kort gat → geïnterpoleerd afsluiten, anders
+        wordt het onderbroken kwartier niet afgesloten.
+        Geeft True terug als er iets hersteld werd.
+        """
+        if not isinstance(data, dict):
+            return False
+        try:
+            q = datetime.fromisoformat(data["quarter_start"])
+            m = datetime.fromisoformat(data["measure_start"])
+            start = float(data["start_energy"])
+            prev_ts = datetime.fromisoformat(data["prev_ts"])
+            prev_e = float(data["prev_energy"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        if not (math.isfinite(start) and math.isfinite(prev_e)):
+            return False
+        if q.tzinfo is None or m.tzinfo is None or prev_ts.tzinfo is None:
+            return False
+        q, m, prev_ts = (dt.astimezone(timezone.utc) for dt in (q, m, prev_ts))
+        self._current_quarter_start = q
+        self._measure_start = m
+        self._quarter_start_energy = start
+        self._quarter_invalid = bool(data.get("invalid", False))
+        self._prev_ts = prev_ts
+        self._prev_energy = prev_e
+        return True
+
+    # ---------------------------------------------------------------- #
+    #  Intern                                                            #
+    # ---------------------------------------------------------------- #
+
+    def _start_quarter(self, q_start: datetime, energy_kwh: float, at: datetime) -> None:
+        self._current_quarter_start = q_start
+        self._quarter_start_energy = energy_kwh
+        # Valt de meting (bijna) op de grens, dan is het kwartier volledig.
+        if (at - q_start).total_seconds() <= _EXACT_START_S:
+            self._measure_start = q_start
+        else:
+            self._measure_start = at
+        self._quarter_invalid = False
+        self._current_kw = 0.0
+
+    def _roll_over(self, q_start: datetime, energy_kwh: float, now: datetime) -> None:
+        old_start = self._current_quarter_start
+        boundary = old_start + timedelta(minutes=15)
+        e_boundary: Optional[float] = None
+        if (
+            self._prev_ts is not None
+            and self._prev_energy is not None
+            and q_start == boundary                 # precies één grens gepasseerd
+            and self._prev_ts <= boundary <= now
+            and (now - self._prev_ts).total_seconds() <= _MAX_INTERPOLATION_GAP_S
+            and energy_kwh >= self._prev_energy
+        ):
+            span = (now - self._prev_ts).total_seconds()
+            frac = 1.0 if span <= 0 else (boundary - self._prev_ts).total_seconds() / span
+            e_boundary = self._prev_energy + (energy_kwh - self._prev_energy) * frac
+
+        complete = self._measure_start == old_start
+        if self._quarter_invalid:
+            _LOGGER.warning(
+                "QuarterCalculator: kwartier %s niet afgesloten — de "
+                "meterstand sprong terug tijdens dit kwartier",
+                old_start.isoformat(),
+            )
+        elif not complete:
+            _LOGGER.info(
+                "QuarterCalculator: kwartier %s niet afgesloten — het begin "
+                "ervan werd niet gemeten (herstart)",
+                old_start.isoformat(),
+            )
+        elif e_boundary is None:
+            _LOGGER.info(
+                "QuarterCalculator: kwartier %s niet afgesloten — geen meting "
+                "rond het einde (gat van %.0f s)",
+                old_start.isoformat(),
+                (now - self._prev_ts).total_seconds() if self._prev_ts else -1,
+            )
+        else:
+            value = round((e_boundary - self._quarter_start_energy) * 4.0, 4)
+            if 0.0 <= value <= MAX_PLAUSIBLE_QUARTER_KW:
+                self._last_finished_value = value
+                self._last_finished_ts = old_start
                 self._quarter_just_finished = True
                 _LOGGER.debug(
-                    "Kwartier %s afgesloten: %.3f kW",
-                    self._current_quarter_start.isoformat(),
-                    self._current_kw,
+                    "Kwartier %s afgesloten: %.3f kW", old_start.isoformat(), value,
                 )
-            # Reset voor het nieuwe kwartier
-            self._quarter_invalid = False
-            self._current_quarter_start = q_start
-            self._quarter_start_energy = energy_kwh
-            self._current_kw = 0.0
-            return 0.0
+            else:
+                _LOGGER.warning(
+                    "QuarterCalculator: kwartier %s niet afgesloten — "
+                    "onmogelijke waarde %.1f kW",
+                    old_start.isoformat(), value,
+                )
 
-        # Binnen hetzelfde kwartier: bereken lopend gemiddelde
-        elapsed_minutes = (now - self._current_quarter_start).total_seconds() / 60.0
+        if e_boundary is not None:
+            self._start_quarter(q_start, e_boundary, q_start)
+        else:
+            self._start_quarter(q_start, energy_kwh, now)
+
+    def _running_value(self, energy_kwh: float, now: datetime) -> float:
+        elapsed_minutes = (now - self._measure_start).total_seconds() / 60.0
         if elapsed_minutes < 0.05:
-            # Minder dan 3 seconden in het kwartier: vermijd deling door ~0
+            # Minder dan 3 seconden gemeten: vermijd deling door ~0
             self._current_kw = 0.0
             return 0.0
 
         if self._quarter_invalid:
             # Rest van een onbetrouwbaar kwartier: niets meten tot het volgende.
+            self._current_kw = 0.0
             return 0.0
 
         delta_kwh = energy_kwh - self._quarter_start_energy
@@ -179,17 +338,3 @@ class QuarterCalculator:
             return 0.0
         self._current_kw = current_kw
         return self._current_kw
-
-    def restore(
-        self,
-        quarter_start_energy: float,
-        quarter_start_dt: datetime,
-        current_kw: float,
-    ) -> None:
-        """
-        Herstel toestand na HA-herstart (vanuit opgeslagen state).
-        Wordt aangeroepen door de sensor vóór de eerste update().
-        """
-        self._quarter_start_energy = quarter_start_energy
-        self._current_quarter_start = quarter_start_dt
-        self._current_kw = current_kw

@@ -18,13 +18,17 @@ from homeassistant.core import HomeAssistant
 from ..const import (
     ACTION_EV_CHARGER,
     CONF_BUFFER_WATTS,
+    CONF_ENERGY_SENSOR,
     CONF_PEAK_SENSOR,
     DEFAULT_BUFFER_WATTS,
     PEAK_RESTART_CONFIRM_S,
+    PEAK_SETTLE_S,
+    PEAK_SWITCH_MIN_OFF_S,
 )
 from ..models import EV_MIN_OFF_DURATION_S, BaseCascadeDevice, DeviceSnapshot
+from ..quarter_budget import PeakBudget, PowerAverager, make_budget
 from ..utils import effective_peak_w
-from .base import BaseDecider, read_power_w
+from .base import BaseDecider, read_energy_kwh, read_power_w
 
 if TYPE_CHECKING:
     from ..avoided_peak_tracker import PeakAvoidTracker, SolarShiftTracker
@@ -70,9 +74,38 @@ class PeakDecider(BaseDecider):
         self._skip_fn: Optional[Callable[[BaseCascadeDevice], bool]] = None
         # EV's herstart op een lagere stroom: entity_id → (tijdstip, stroom A).
         self._ev_restarts: Dict[str, Tuple[datetime, int]] = {}
+        # Kwartierbudget: geeft (kwartierstart, meterstand bij de start) van
+        # het lopende, volledig gemeten kwartier, of None.
+        self._baseline_fn: Optional[Callable[[], Optional[Tuple[datetime, float]]]] = None
+        self._averager = PowerAverager()
+        self._budget_cache: Optional[Tuple[datetime, float, PeakBudget]] = None
+        # Laatste afschakeling door de cascade, en per entity wanneer ze uitging.
+        self._last_shed_at: Optional[datetime] = None
+        self._shed_at: Dict[str, datetime] = {}
 
     def set_skip_fn(self, skip_fn: Optional[Callable[[BaseCascadeDevice], bool]]) -> None:
         self._skip_fn = skip_fn
+
+    def set_quarter_baseline_fn(
+        self, fn: Optional[Callable[[], Optional[Tuple[datetime, float]]]]
+    ) -> None:
+        self._baseline_fn = fn
+
+    def _budget(self, consumption: float, peak: float, buffer: float, now: datetime) -> PeakBudget:
+        """Kwartierbudget voor deze cyclus (één keer per tijdstip berekend)."""
+        cached = self._budget_cache
+        if cached is not None and cached[0] == now and cached[1] == consumption:
+            return cached[2]
+        energy = read_energy_kwh(self.hass, self.config.get(CONF_ENERGY_SENSOR))
+        avg_w = self._averager.add(now, energy)
+        baseline = self._baseline_fn() if self._baseline_fn is not None else None
+        q_start, so_far = None, None
+        if baseline is not None and energy is not None:
+            q_start, start_energy = baseline
+            so_far = max(0.0, energy - start_energy)
+        budget = make_budget(peak - buffer, consumption, now, avg_w, q_start, so_far)
+        self._budget_cache = (now, consumption, budget)
+        return budget
 
     # ------------------------------------------------------------------ #
     #  Publieke interface                                                  #
@@ -94,26 +127,50 @@ class PeakDecider(BaseDecider):
         # op een lagere piek dan dat minimum, ook al meldt de P1-meter minder.
         peak = effective_peak_w(raw_peak)
         buffer = float(self.config.get(CONF_BUFFER_WATTS, DEFAULT_BUFFER_WATTS))
-        excess = consumption - peak + buffer
+        if now is None:
+            now = datetime.now(timezone.utc)
+        budget = self._budget(consumption, peak, buffer, now)
+        excess = budget.excess_w
         _LOGGER.debug(
-            "Peak Guard _check_peak: verbruik=%.0f W, piek=%.0f W (P1: %.0f W), "
-            "buffer=%.0f W, overschot=%.0f W",
-            consumption, peak, raw_peak, buffer, excess,
+            "Peak Guard _check_peak: verbruik=%.0f W (gem. %s), piek=%.0f W (P1: %.0f W), "
+            "buffer=%.0f W, toegelaten=%.0f W%s, overschot=%.0f W",
+            consumption, f"{budget.avg_w:.0f} W" if budget.avg_w is not None else "–",
+            peak, raw_peak, buffer, budget.allowed_w,
+            "" if budget.on_budget else " (momentaan)", excess,
         )
-        if excess > 0:
-            enabled_devices = [d for d in self._cascade if d.enabled]
-            _LOGGER.warning(
-                "Peak Guard [PIEK cascade]: gestart — piek overschreden met %.0f W "
-                "(verbruik=%.0f W, piekgrens=%.0f W, buffer=%.0f W, "
-                "%d apparaat/apparaten: %s)",
-                excess, consumption, peak, buffer, len(enabled_devices),
-                ", ".join(f"'{d.name}'" for d in enabled_devices) or "–",
+        if excess <= 0:
+            return
+        if self._last_shed_at is not None and (now - self._last_shed_at).total_seconds() < PEAK_SETTLE_S:
+            # Vlak na de eigen afschakeling: het verbruik is nog niet bijgewerkt.
+            _LOGGER.debug(
+                "Peak Guard [PIEK]: overschot %.0f W genegeerd — %.0f s na de vorige "
+                "afschakeling is het verbruik nog niet bijgewerkt",
+                excess, (now - self._last_shed_at).total_seconds(),
             )
-            if not enabled_devices:
-                _LOGGER.warning(
-                    "Peak Guard: geen actieve apparaten in piek-cascade — niets te doen!"
-                )
-            await self._run_cascade(self._cascade, excess, self._snapshots, "peak", now)
+            return
+        enabled_devices = [d for d in self._cascade if d.enabled]
+        _LOGGER.warning(
+            "Peak Guard [PIEK cascade]: gestart — piek overschreden met %.0f W "
+            "(verbruik=%.0f W, gem. laatste minuut=%s, toegelaten rest kwartier=%.0f W, "
+            "piekgrens=%.0f W, buffer=%.0f W, %d apparaat/apparaten: %s)",
+            excess, consumption,
+            f"{budget.avg_w:.0f} W" if budget.avg_w is not None else "–",
+            budget.allowed_w, peak, buffer, len(enabled_devices),
+            ", ".join(f"'{d.name}'" for d in enabled_devices) or "–",
+        )
+        if not enabled_devices:
+            _LOGGER.warning(
+                "Peak Guard: geen actieve apparaten in piek-cascade — niets te doen!"
+            )
+        before = set(self._snapshots)
+        remaining = await self._run_cascade(self._cascade, excess, self._snapshots, "peak", now)
+        if remaining < excess:
+            self._last_shed_at = now
+        for entity_id in set(self._snapshots) - before:
+            self._shed_at[entity_id] = now
+        if remaining > 0:
+            # Alles wat kon, staat al uit: een piek in dit kwartier was niet te vermijden.
+            self.peak_tracker.note_exhausted(now, remaining)
 
     async def check_restore(self, consumption: float, now: Optional[datetime] = None) -> None:
         """
@@ -127,17 +184,22 @@ class PeakDecider(BaseDecider):
             return
         peak = effective_peak_w(raw_peak)
         buffer = float(self.config.get(CONF_BUFFER_WATTS, DEFAULT_BUFFER_WATTS))
-        headroom = peak - buffer - consumption
         if now is None:
             now = datetime.now(timezone.utc)
+        budget = self._budget(consumption, peak, buffer, now)
+        headroom = budget.restore_headroom_w
         for entity_id in list(self._ev_restarts):
             if entity_id not in self._snapshots:
                 del self._ev_restarts[entity_id]
+        for entity_id in list(self._shed_at):
+            if entity_id not in self._snapshots:
+                del self._shed_at[entity_id]
         if headroom <= 0:
             _LOGGER.debug(
-                "Peak Guard [PIEK] herstel geblokkeerd: verbruik=%.0f W, "
-                "piekgrens=%.0f W, buffer=%.0f W → headroom=%.0f W (≤ 0)",
-                consumption, peak, buffer, headroom,
+                "Peak Guard [PIEK] herstel geblokkeerd: verbruik=%.0f W (herstel rekent "
+                "met %.0f W), toegelaten=%.0f W, piekgrens=%.0f W, buffer=%.0f W "
+                "→ headroom=%.0f W (≤ 0)",
+                consumption, budget.restore_power_w, budget.allowed_w, peak, buffer, headroom,
             )
             for device in self._cascade:
                 if device.entity_id not in self._snapshots:
@@ -151,8 +213,10 @@ class PeakDecider(BaseDecider):
                 self.ev_guard.set_hold(
                     device.id, "peak_no_headroom",
                     ("Laadstroom blijft verlaagd" if reduced_ev else "Blijft afgeschakeld")
-                    + f": het verbruik ({consumption:.0f} W) ligt niet "
-                    f"onder de piekgrens min buffer ({peak - buffer:.0f} W).",
+                    + f": het verbruik ({budget.restore_power_w:.0f} W) ligt niet "
+                    f"onder de piekgrens min buffer"
+                    + (f" en wat het kwartier nog toelaat ({min(budget.allowed_w, budget.limit_w):.0f} W)."
+                       if budget.on_budget else f" ({peak - buffer:.0f} W)."),
                 )
             return
 
@@ -220,6 +284,18 @@ class PeakDecider(BaseDecider):
                         continue
             else:
                 need_w = float(device.power_watts) if device.power_watts else 0.0
+                shed_at = self._shed_at.get(device.entity_id)
+                off_s = (now - shed_at).total_seconds() if shed_at is not None else None
+                if off_s is not None and off_s < PEAK_SWITCH_MIN_OFF_S:
+                    wait_s = PEAK_SWITCH_MIN_OFF_S - off_s
+                    self.ev_guard.set_hold(
+                        device.id, "min_off",
+                        f"Wacht nog {wait_s:.0f} s voor het herstel: na een afschakeling "
+                        f"blijft dit apparaat minstens {PEAK_SWITCH_MIN_OFF_S / 60:.0f} min "
+                        f"uit, zodat het niet aan en uit pendelt op een wisselend huisverbruik.",
+                        until=now + timedelta(seconds=wait_s),
+                    )
+                    continue
             if need_w > 0 and remaining_headroom < need_w:
                 _LOGGER.info(
                     "Peak Guard [PIEK]:   · '%s' herstel GEBLOKKEERD — "
@@ -230,7 +306,7 @@ class PeakDecider(BaseDecider):
                     device.id, "peak_headroom",
                     f"Blijft afgeschakeld: herstel vraagt {need_w:.0f} W, maar er is maar "
                     f"{max(0.0, remaining_headroom):.0f} W ruimte onder de piekgrens "
-                    f"(piek {peak:.0f} W − buffer {buffer:.0f} W − verbruik {consumption:.0f} W"
+                    f"(piek {peak:.0f} W − buffer {buffer:.0f} W − verbruik {budget.restore_power_w:.0f} W"
                     + (", min. wat eerder herstelde apparaten vragen" if remaining_headroom < headroom else "")
                     + ").",
                 )

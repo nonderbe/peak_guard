@@ -63,6 +63,9 @@ def _local_month_of(ts: str, time_zone: str) -> tuple[int, int]:
 # wordt de hele reeks als "verkeerde eenheid" beschouwd en niet overgenomen.
 _WRONG_UNIT_SHARE = 0.10
 
+# Kleinere verschillen met de meter zijn afronding: het record niet herschrijven.
+_RAISE_MIN_KW = 0.001
+
 
 def _is_plausible_kw(kw) -> bool:
     """
@@ -279,6 +282,30 @@ class QuarterStore:
         )
         return removed
 
+    async def async_raise_month_peak(self, meter_peak_kw: float, now: datetime) -> bool:
+        """
+        Trek het maandpiek-record van de lopende maand op tot de maandpiek van
+        de P1-meter als die hoger ligt. De meter is de facturatiereferentie;
+        een eigen meting kan een kwartier missen (HA uit, ongeldig kwartier).
+        Het tijdstip blijft dat van de eigen piek (de meter geeft er geen).
+        Geeft True terug als het record verhoogd werd.
+        """
+        if not _is_plausible_kw(meter_peak_kw):
+            return False
+        month = local_year_month(now)
+        best = self._peaks_by_month().get(month)
+        kw = round(float(meter_peak_kw), 4)
+        if best is not None and kw <= best["kw"] + _RAISE_MIN_KW:
+            return False
+        self._monthly_peaks[month] = {"ts": best["ts"] if best else None, "kw": kw}
+        await self.async_save()
+        _LOGGER.info(
+            "QuarterStore: maandpiek %04d-%02d verhoogd naar de P1-meter: %.3f kW "
+            "(eigen meting: %s)",
+            month[0], month[1], kw, f"{best['kw']:.3f} kW" if best else "geen",
+        )
+        return True
+
     def _record_month_peak(self, ts: str, kw: float) -> None:
         """Verhoog het maandpiek-record van de maand van dit kwartier, indien hoger."""
         key = self._entry_month({"ts": ts})
@@ -322,6 +349,10 @@ class QuarterStore:
         """Hoogste kwartierpiek-waarde voor de gegeven maand (kW), of None."""
         peak = self._peaks_by_month().get((year, month))
         return peak["kw"] if peak else None
+
+    def get_current_month_peak_entry(self) -> Optional[dict]:
+        """{"ts", "kw"} van de hoogste kwartierwaarde van de huidige maand, of None."""
+        return self._peaks_by_month().get(local_year_month(dt_util.utcnow()))
 
     def get_current_month_peak(self) -> Optional[float]:
         """Hoogste kwartierpiek-waarde voor de huidige maand (kW), of None."""

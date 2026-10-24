@@ -103,7 +103,8 @@ sys.modules.update({
     "homeassistant.helpers":                 _mod("homeassistant.helpers"),
     "homeassistant.helpers.event":           _mod("homeassistant.helpers.event",
                                                   async_track_state_change_event=MagicMock(),
-                                                  async_track_time_interval=MagicMock()),
+                                                  async_track_time_interval=MagicMock(),
+                                                  async_track_time_change=MagicMock()),
     "homeassistant.helpers.storage":         _mod("homeassistant.helpers.storage",
                                                   Store=MagicMock()),
     "homeassistant.helpers.entity":          _mod("homeassistant.helpers.entity",
@@ -231,8 +232,8 @@ class MockPeakTracker:
         self.pending_avoids: list = []
         self.turn_on_measurements: list = []
 
-    def record_pending_avoid(self, device_id, device_name, nominal_kw, ts):
-        self.pending_avoids.append({"id": device_id, "kw": nominal_kw})
+    def record_pending_avoid(self, device_id, device_name, nominal_kw, ts, deferred=False):
+        self.pending_avoids.append({"id": device_id, "kw": nominal_kw, "deferred": deferred})
 
     def start_measurement_on_turnon(self, device_id, device_name, ts, max_kw=None):
         self.turn_on_measurements.append(device_id)
@@ -240,6 +241,15 @@ class MockPeakTracker:
     def complete_peak_calculation(self, device_id, now):
         self.completed = getattr(self, "completed", [])
         self.completed.append(device_id)
+        return None
+
+    def note_exhausted(self, ts, remaining_w):
+        self.exhausted = getattr(self, "exhausted", [])
+        self.exhausted.append(remaining_w)
+
+    def complete_deferral(self, device_id, ts):
+        self.deferrals_completed = getattr(self, "deferrals_completed", [])
+        self.deferrals_completed.append(device_id)
         return None
 
 

@@ -48,6 +48,9 @@ class PendingAvoid:
     device_name: str
     nominal_kw:  float
     avoid_ts:    datetime
+    # EV: de lading schuift op naar het einde van de sessie (zie
+    # start_measurement_on_turnon) in plaats van na het herinschakelen in te halen.
+    deferred:    bool = False
 
 
 @dataclass
@@ -152,6 +155,11 @@ class PeakAvoidTracker:
         # laatst opgeslagen maandrecord per apparaat (zie hypothetical_peaks_this_month).
         self.device_hypo_floor_this_month: Dict[str, float] = {}
 
+        # Kwartieren waarin de piek-cascade uitgeput was (alle apparaten al
+        # uit/verlaagd en toch nog overschot): kwartierstart → hoogste rest (W).
+        # Verklaart een maandpiek die Peak Guard niet kon vermijden.
+        self.exhausted_quarters: Dict[datetime, float] = {}
+
         # Context (bijgewerkt door SharedCapacityState)
         self._actual_quarters:     Dict[datetime, float] = {}
         self._actual_monthly_peak: float = 0.0
@@ -208,6 +216,7 @@ class PeakAvoidTracker:
         self.device_max_hypo_this_month.clear()
         self.device_names_this_month.clear()
         self.device_hypo_floor_this_month.clear()
+        self.exhausted_quarters.clear()
         _LOGGER.info("PeakAvoidTracker: maanddata gereset")
 
     def reset_year(self) -> None:
@@ -219,7 +228,8 @@ class PeakAvoidTracker:
 
     def record_pending_avoid(self, device_id: str, device_name: str,
                               nominal_kw: float,
-                              ts: Optional[datetime] = None) -> None:
+                              ts: Optional[datetime] = None,
+                              deferred: bool = False) -> None:
         if ts is None:
             ts = datetime.now(timezone.utc)
         # Opnieuw afgeschakeld terwijl de vorige meting nog liep: rond die
@@ -234,7 +244,7 @@ class PeakAvoidTracker:
             return
         self._pending[device_id] = PendingAvoid(
             device_id=device_id, device_name=device_name,
-            nominal_kw=nominal_kw, avoid_ts=ts,
+            nominal_kw=nominal_kw, avoid_ts=ts, deferred=deferred,
         )
         _LOGGER.debug("PeakAvoidTracker: pending '%s' @ %s", device_name, ts.isoformat())
 
@@ -243,11 +253,24 @@ class PeakAvoidTracker:
     def start_measurement_on_turnon(self, device_id: str, device_name: str,
                                      ts: Optional[datetime] = None,
                                      max_kw: Optional[float] = None) -> None:
-        """max_kw: het apparaat trekt na herstel minder (bv. EV op lagere stroom)."""
+        """
+        max_kw: het apparaat trekt na herstel minder (bv. EV op lagere stroom).
+
+        Een uitgestelde EV-lading (deferred) wordt hier meteen afgerond: zonder
+        Peak Guard had de wagen de hele stilstand verder geladen, dus die
+        energie valt in de kwartieren van avoid_ts tot nu. Ze wordt niet na het
+        herinschakelen ingehaald maar aan het einde van de sessie, uren later
+        en buiten de kwartieren die ertoe doen; dat minus-deel wordt niet
+        geboekt. De daling van het huisverbruik wordt voor een EV dus niet als
+        natuurlijke stop gebruikt.
+        """
         if device_id not in self._pending:
             return
         if ts is None:
             ts = datetime.now(timezone.utc)
+        if self._pending[device_id].deferred:
+            self.complete_deferral(device_id, ts)
+            return
         p = self._pending.pop(device_id)   # verwijder uit pending bij overgang → active
         nominal_kw = p.nominal_kw if max_kw is None else min(p.nominal_kw, max_kw)
         self._active[device_id] = ActivePeakMeasurement(
@@ -262,16 +285,91 @@ class PeakAvoidTracker:
         Rond metingen af die al een kwartier lopen. De duur wordt toch op
         15 min begrensd; zonder deze stap blijft een meting waarvan de
         natuurlijke stop niet gedetecteerd wordt (modulerend verbruik,
-        gelijktijdig ander verbruik) tot de maandwissel hangen.
+        gelijktijdig ander verbruik) tot de maandwissel hangen. Zo ook een
+        uitgestelde EV-lading die geen herstart meer ziet (kabel uit, vol,
+        door iets anders herstart).
         """
         done: List[PeakEvent] = []
         limit = timedelta(minutes=_QUARTER_MIN)
+        for device_id, p in list(self._pending.items()):
+            if p.deferred and now - p.avoid_ts >= limit:
+                event = self.complete_deferral(device_id, p.avoid_ts + limit)
+                if event is not None:
+                    done.append(event)
         for device_id, meas in list(self._active.items()):
             if now - meas.turnon_ts >= limit:
                 event = self.complete_peak_calculation(device_id, now=meas.turnon_ts + limit)
                 if event is not None:
                     done.append(event)
         return done
+
+    def complete_deferral(self, device_id: str, ts: datetime) -> Optional[PeakEvent]:
+        """
+        Rond een uitgestelde EV-lading af op ts (herstart, overname door de
+        solar-cascade, of einde van het laadvenster). Geen effect als het
+        apparaat geen uitgestelde lading heeft.
+        """
+        p = self._pending.get(device_id)
+        if p is None or not p.deferred:
+            return None
+        del self._pending[device_id]
+        # Begrensd: zonder bevestiging dat de wagen bleef laden (vol, kabel
+        # uit, door iets anders herstart) is een langer uitstel geen besparing.
+        off_min = min((ts - p.avoid_ts).total_seconds() / 60.0, float(_QUARTER_MIN))
+        if off_min < 0.5 or p.nominal_kw <= 0:
+            return None
+        added_kwh = (off_min / 60.0) * p.nominal_kw
+        avoid_parts = self._distribute(p.avoid_ts, off_min, added_kwh)
+        dev_extra = self.extra_by_device.setdefault(device_id, {})
+        for q, kwh in avoid_parts.items():
+            dev_extra[q] = dev_extra.get(q, 0.0) + kwh / _QUARTER_H
+        self.device_names_this_month[device_id] = p.device_name
+        event = PeakEvent(
+            device_id=device_id, device_name=p.device_name,
+            nominal_kw=p.nominal_kw,
+            avoid_ts=p.avoid_ts, turnon_ts=ts, natural_stop_ts=ts,
+            measured_duration_min=round(off_min, 2),
+            added_energy_kwh=round(added_kwh, 4),
+            avoided_peak_kw=0.0, savings_euro=0.0,
+            avoid_quarters=sorted(avoid_parts),
+        )
+        self.events.append(event)
+        self._recalc()
+        _LOGGER.info(
+            "PeakAvoidTracker: '%s' lading %.1f min uitgesteld (max. 15) (%.3f kWh) "
+            "hypo=%.3fkW event_vermeden=%.3fkW €%.4f",
+            p.device_name, off_min, added_kwh, event.hypothetical_peak_kw,
+            event.avoided_peak_kw, event.savings_euro,
+        )
+        return event
+
+    def rebuild_legacy_events(self) -> int:
+        """
+        Bouw de verschuiving op van events van vóór v1.9.2 (zonder
+        avoid_quarters), met dezelfde +/−-regel als complete_peak_calculation.
+        Geeft het aantal herbouwde events terug. Geen herberekening hier
+        (zie extra_from_dict).
+        """
+        rebuilt = 0
+        for ev in self.events:
+            if ev.avoid_quarters:
+                continue
+            if ev.measured_duration_min < 0.5 or ev.added_energy_kwh <= 0:
+                continue
+            dev_extra = self.extra_by_device.setdefault(ev.device_id, {})
+            avoid_parts = self._distribute(
+                ev.avoid_ts, ev.measured_duration_min, ev.added_energy_kwh
+            )
+            for q, kwh in avoid_parts.items():
+                dev_extra[q] = dev_extra.get(q, 0.0) + kwh / _QUARTER_H
+            for q, kwh in self._distribute(
+                ev.turnon_ts, ev.measured_duration_min, ev.added_energy_kwh
+            ).items():
+                dev_extra[q] = dev_extra.get(q, 0.0) - kwh / _QUARTER_H
+            ev.avoid_quarters = sorted(avoid_parts)
+            self.device_names_this_month.setdefault(ev.device_id, ev.device_name)
+            rebuilt += 1
+        return rebuilt
 
     # ── Hook 3: natuurlijke stop → bereken kW-impact ─────────────── #
 
@@ -328,6 +426,22 @@ class PeakAvoidTracker:
             self.avoided_kw_this_month, self.savings_euro_this_month,
         )
         return event
+
+    def note_exhausted(self, ts: datetime, remaining_w: float) -> None:
+        """De piek-cascade hield na alle apparaten nog remaining_w W over."""
+        q = _quarter_start(ts)
+        self.exhausted_quarters[q] = round(max(self.exhausted_quarters.get(q, 0.0), remaining_w), 1)
+
+    def exhausted_to_dict(self) -> Dict[str, float]:
+        return {q.isoformat(): w for q, w in sorted(self.exhausted_quarters.items())}
+
+    def exhausted_from_dict(self, data) -> None:
+        self.exhausted_quarters = {}
+        for q, w in (data or {}).items():
+            try:
+                self.exhausted_quarters[datetime.fromisoformat(q)] = float(w)
+            except (TypeError, ValueError):
+                continue
 
     # ── query-methoden ────────────────────────────────────────────── #
 

@@ -3301,6 +3301,21 @@ class PeakGuardPanel extends HTMLElement {
     // ---- Events-log ophalen ------------------------------------ //
     const peakEvents  = this._hass?.states["sensor.peak_guard_peak_avoided_events"]
                           ?.attributes?.events ?? [];
+    // Wanneer viel de maandpiek, en kon Peak Guard toen nog iets afschakelen?
+    const monthPeak   = this._hass?.states["sensor.peak_guard_peak_avoided_events"]
+                          ?.attributes?.maandpiek ?? null;
+    const monthPeakKw = monthPeak?.kw != null ? Number(monthPeak.kw) : null;
+    let monthPeakNote = "";
+    if (monthPeakKw !== null && monthPeak.kwartier_start) {
+      const d = new Date(monthPeak.kwartier_start);
+      const maanden = ["jan","feb","mrt","apr","mei","jun","jul","aug","sep","okt","nov","dec"];
+      const when = isNaN(d.getTime()) ? monthPeak.kwartier_start
+        : `${d.getDate()} ${maanden[d.getMonth()]} ${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}`;
+      const why = monthPeak.cascade_uitgeput
+        ? ` In dat kwartier had de piek-cascade alle apparaten doorlopen en bleef het verbruik nog ${Math.round(monthPeak.overschot_na_cascade_w)} W boven de grens: er was niets meer af te schakelen (of een apparaat was niet bereikbaar).`
+        : "";
+      monthPeakNote = `Maandpiek ${monthPeakKw.toFixed(3)} kW in het kwartier van ${when}.${why}`;
+    }
     const solarEvents = this._hass?.states["sensor.peak_guard_solar_avoided_events"]
                           ?.attributes?.events ?? [];
 
@@ -3456,6 +3471,7 @@ class PeakGuardPanel extends HTMLElement {
           📋 Recente gebeurtenissen (laatste 100)
         </div>
 
+        ${monthPeakNote ? `<div class="field-hint" style="margin-bottom:8px;">${this._esc(monthPeakNote)}</div>` : ""}
         <div class="events-table-wrap">
           <table class="events-table">
             <thead>
@@ -3464,7 +3480,7 @@ class PeakGuardPanel extends HTMLElement {
                 <th>Modus</th>
                 <th>Apparaat</th>
                 <th>Duur · Resultaat</th>
-                <th title="Hoogste kwartierwaarde die er zonder Peak Guard zou zijn geweest in de kwartieren van dit event">Hypo. piek</th>
+                <th title="Hoogste kwartierwaarde die er zonder dit uitstel (en de andere) zou zijn geweest, in de kwartieren waarin het apparaat uit stond. Dit is één kwartier, niet de maandpiek.">Kwartier zonder PG</th>
                 <th>Besparing</th>
               </tr>
             </thead>
@@ -3474,10 +3490,13 @@ class PeakGuardPanel extends HTMLElement {
           </table>
         </div>
         <div class="field-hint" style="margin-top:8px;">
-          Per piek-event: <b>Hypo. piek</b> is de hoogste kwartierwaarde zonder Peak Guard in de
-          kwartieren van dat event; resultaat en besparing zijn wat dat event uitspaart tegenover de
-          huidige maandpiek. Ze worden bijgewerkt tot de maand afsluit. Events in hetzelfde kwartier
-          overlappen, dus de som van de rijen is niet het maandtotaal (dat staat bovenaan).
+          Per piek-event: <b>Kwartier zonder PG</b> is de hoogste kwartierwaarde die er zonder Peak
+          Guard zou zijn geweest in de kwartieren waarin het apparaat uit stond — niet de maandpiek.
+          Ligt die onder de maandpiek${monthPeakKw !== null ? ` (${monthPeakKw.toFixed(3)} kW)` : ""},
+          dan spaarde dat event niets uit: het kwartier bleef ook zonder ingreep onder de piek.
+          Een EV laadt de uitgestelde energie later in de sessie bij; die telt in de kwartieren
+          waarin de lader uit stond. Waarden worden bijgewerkt tot de maand afsluit. Events in
+          hetzelfde kwartier overlappen, dus de som van de rijen is niet het maandtotaal (dat staat bovenaan).
         </div>
 
       </div>

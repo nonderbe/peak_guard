@@ -30,7 +30,7 @@ from homeassistant.const import UnitOfPower, UnitOfEnergy
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.event import async_track_time_change
 from homeassistant.helpers.restore_state import RestoreEntity
 
 from .const import (
@@ -44,6 +44,8 @@ from .const import (
     DEVICE_ID_CAPACITY,
     DEVICE_ID_SAVINGS,
     DEVICE_ID_OVERVIEW,
+    STORAGE_KEY_QUARTER_CALC,
+    STORAGE_VERSION_QUARTER_CALC,
     STORAGE_KEY_SAVINGS,
     STORAGE_VERSION_SAVINGS,
     STORAGE_KEY_SOLAR_SAVINGS,
@@ -62,8 +64,12 @@ from .deciders.base import read_energy_kwh, read_power_w
 
 _LOGGER = logging.getLogger(__name__)
 
-# Sensorupdate-interval: elke minuut
-_UPDATE_INTERVAL = timedelta(minutes=1)
+# Sensorupdate: elke minuut op seconde 0, zodat de eerste meting van een
+# kwartier (bijna) op de grens valt.
+_UPDATE_SECOND = 0
+
+# Zo lang na het begin van een (lokale) maand de maandpiek van de meter negeren.
+_METER_MONTH_START_GRACE_MIN = 20
 
 # Persistente opslag voor events en maandstatistieken
 _STORAGE_KEY_PEAK_STATE   = "peak_guard.peak_state"
@@ -103,6 +109,7 @@ def restore_peak_tracker(
         peak_tracker.avoided_kw_this_month   = float(peak_state.get("avoided_kw_this_month", 0.0))
         peak_tracker.savings_euro_this_month = float(peak_state.get("savings_euro_this_month", 0.0))
         peak_tracker.device_names_this_month = dict(peak_state.get("device_names", {}))
+        peak_tracker.exhausted_from_dict(peak_state.get("exhausted_quarters"))
         if "extra_by_device" in peak_state:
             # Verschuiving per apparaat per kwartier: de hypothetische pieken
             # worden er bij elke update opnieuw uit berekend.
@@ -133,10 +140,23 @@ def restore_peak_tracker(
                 peak_tracker.events.append(ev)
             except (KeyError, ValueError):
                 pass
+        if peak_tracker.hypothetical_peaks_this_month:
+            # De vloer komt van het algoritme van vóór v1.9.2, dat een
+            # verschuiving binnen één kwartier dubbel telde (+ bij het uitstel,
+            # nooit − bij het herinschakelen). Bouw de verschuiving van die
+            # events opnieuw op en laat de vloer vallen. Zijn er events uit
+            # het begin van de maand al uit de log gevallen, dan is het
+            # resultaat een ondergrens — beter dan een te hoge besparing.
+            rebuilt = peak_tracker.rebuild_legacy_events()
+            _LOGGER.warning(
+                "Peak Guard: hypothetische maandpiek van vóór v1.9.2 (%.3f kW) "
+                "vervangen door een herberekening uit %d event(s)",
+                max(peak_tracker.hypothetical_peaks_this_month), rebuilt,
+            )
+            peak_tracker.hypothetical_peaks_this_month = []
         _LOGGER.info(
-            "Peak Guard: %d piek-events hersteld vanuit opslag (%d hypo-pieken)",
+            "Peak Guard: %d piek-events hersteld vanuit opslag",
             len(peak_tracker.events),
-            len(peak_tracker.hypothetical_peaks_this_month),
         )
 
     # Jaarbasis zodat _recalc_month_savings() de jaarbesparing correct herberekent.
@@ -185,7 +205,12 @@ async def async_setup_entry(
     store = QuarterStore(hass)
     await store.async_load()
 
+    # Toestand van het lopende kwartier: een herstart midden in een kwartier
+    # meet zo exact verder in plaats van een onvolledig kwartier op te slaan.
+    calc_store = Store(hass, STORAGE_VERSION_QUARTER_CALC, STORAGE_KEY_QUARTER_CALC)
     calculator = QuarterCalculator()
+    if calculator.restore(await calc_store.async_load()):
+        _LOGGER.debug("Peak Guard: toestand van het lopende kwartier hersteld")
 
     # Haal controller + trackers op
     controller    = hass.data[DOMAIN]["controller"]
@@ -280,6 +305,7 @@ async def async_setup_entry(
         device_savings_store=device_savings_store,
         # Zelfde samenvoeging als de controller: opties gaan voor op de initiële config.
         peak_sensor_id={**entry.data, **entry.options}.get(CONF_PEAK_SENSOR),
+        calc_store=calc_store,
     )
 
     entities = [
@@ -321,6 +347,8 @@ async def async_setup_entry(
 
     # Sla shared op zodat async_unload_entry de timer kan stoppen
     hass.data[DOMAIN]["shared"] = shared
+    # Piekbeperking op het kwartierbudget: het kwartierbegin komt van hier.
+    controller.set_quarter_baseline_fn(calculator.baseline)
 
 
 class SharedCapacityState:
@@ -345,8 +373,10 @@ class SharedCapacityState:
         solar_state_store,
         device_savings_store,
         peak_sensor_id: Optional[str] = None,
+        calc_store=None,
     ) -> None:
         self.hass = hass
+        self._calc_store = calc_store
         self.energy_sensor_id = energy_sensor_id
         # Maandpiek-sensor van de P1-meter: referentie om eigen kwartierwaarden
         # te controleren (zie _verify_against_meter).
@@ -359,6 +389,8 @@ class SharedCapacityState:
         # Actuele berekende waarden
         self.current_quarter_kw: float = 0.0
         self.monthly_peak_kw: Optional[float] = None
+        self.monthly_peak_ts: Optional[str] = None
+        self.meter_peak_kw: Optional[float] = None
         self.historical_peaks: list[dict] = []
         self.rolling_avg_kw: Optional[float] = None
         self.billed_peak_kw: float = CAPACITY_MIN_KW
@@ -391,8 +423,8 @@ class SharedCapacityState:
         # Voer meteen een eerste berekening uit
         await self._async_update(datetime.now(timezone.utc))
         # Plan daarna elke minuut een update
-        self._unsub = async_track_time_interval(
-            self.hass, self._async_update, _UPDATE_INTERVAL
+        self._unsub = async_track_time_change(
+            self.hass, self._async_update, second=_UPDATE_SECOND
         )
 
     def stop(self) -> None:
@@ -403,12 +435,18 @@ class SharedCapacityState:
 
     async def _async_update(self, now: datetime) -> None:
         """Lees energiesensor, bereken kwartierpiek, update alle sensoren."""
+        # async_track_time_change geeft lokale tijd; alles hieronder rekent in
+        # UTC (anders loopt de kwartierwissel vast bij de wintertijd-overgang).
+        now = now.astimezone(timezone.utc)
         energy_kwh = self._read_energy()
         if energy_kwh is None:
             return
 
         # Kwartierberekening
         self.current_quarter_kw = self.calculator.update(energy_kwh, now)
+        if self._calc_store is not None:
+            # Uitgesteld schrijven; HA schrijft openstaande saves weg bij het stoppen.
+            self._calc_store.async_delay_save(self.calculator.to_dict, 10)
 
         # Kwartier afgesloten? → opslaan
         if self.calculator.quarter_just_finished:
@@ -418,8 +456,12 @@ class SharedCapacityState:
                 await self.store.add_quarter(finished_ts, finished_kw)
 
         await self._verify_against_meter(now)
+        await self._raise_to_meter(now)
 
         # Afgeleide waarden herberekenen
+        self.meter_peak_kw = self.meter_month_peak_kw(now)
+        peak_entry = self.store.get_current_month_peak_entry()
+        self.monthly_peak_ts = peak_entry["ts"] if peak_entry else None
         self.monthly_peak_kw = self.store.get_current_month_peak()
         # Vergelijk ook met de lopende waarde (nog niet afgesloten kwartier)
         if self.monthly_peak_kw is None:
@@ -510,7 +552,7 @@ class SharedCapacityState:
             # kanten op) maar de energie tot nu als kwartiergemiddelde: een
             # ondergrens die naar de eindwaarde groeit.
             actual_peak = self.store.get_current_month_peak() or 0.0
-            q_start = self.calculator._current_quarter_start
+            q_start = self.calculator.current_quarter_start
             if q_start is not None:
                 elapsed = (now - q_start).total_seconds() / (15 * 60)
                 open_kw = round(self.current_quarter_kw * min(1.0, max(0.0, elapsed)), 4)
@@ -545,7 +587,8 @@ class SharedCapacityState:
         if self._peak_tracker and self._peak_state_store:
             # Ook bij een volle log (100 events) moet een nieuw event opgeslagen worden.
             last = self._peak_tracker.events[-1] if self._peak_tracker.events else None
-            n   = (len(self._peak_tracker.events), last.natural_stop_ts if last else None)
+            n   = (len(self._peak_tracker.events), last.natural_stop_ts if last else None,
+                   tuple(sorted(self._peak_tracker.exhausted_quarters.items())))
             msv = self._peak_tracker.savings_euro_this_month
             if n != self._last_peak_events_count or msv != self._last_persisted_peak_month_savings:
                 events_data = [
@@ -573,6 +616,7 @@ class SharedCapacityState:
                     "hypothetical_peaks_this_month": list(self._peak_tracker.hypothetical_peaks_this_month),
                     "extra_by_device":       self._peak_tracker.extra_to_dict(),
                     "device_names":          dict(self._peak_tracker.device_names_this_month),
+                    "exhausted_quarters":    self._peak_tracker.exhausted_to_dict(),
                     "events":                events_data,
                 })
                 self._last_peak_events_count            = n
@@ -644,6 +688,40 @@ class SharedCapacityState:
         if meter_peak_w is None or meter_peak_w < 0:
             return
         await self.store.async_remove_unconfirmed_peaks(meter_peak_w / 1000.0, now)
+
+    def meter_month_peak_kw(self, now: datetime) -> Optional[float]:
+        """
+        Maandpiek van de P1-meter (kW), of None als ze niet bruikbaar is:
+        niet ingesteld, een eigen sensor, onbeschikbaar, of niet bijgewerkt
+        in de lopende (lokale) maand — vlak na de maandwissel kan de sensor
+        nog de piek van de vorige maand tonen.
+        """
+        if not self.peak_sensor_id or self.peak_sensor_id.startswith(f"sensor.{DOMAIN}_"):
+            return None
+        state = self.hass.states.get(self.peak_sensor_id)
+        if state is None:
+            return None
+        changed = getattr(state, "last_changed", None)
+        if not isinstance(changed, datetime) or local_year_month(changed) != local_year_month(now):
+            return None
+        # Vlak na de maandwissel kan een herstart last_changed vernieuwen voor
+        # de meter zijn maandpiek terugzette: dan nog niet vertrouwen.
+        if local_year_month(now - timedelta(minutes=_METER_MONTH_START_GRACE_MIN)) != local_year_month(now):
+            return None
+        meter_peak_w = read_power_w(self.hass, self.peak_sensor_id)
+        if meter_peak_w is None or meter_peak_w < 0:
+            return None
+        return meter_peak_w / 1000.0
+
+    async def _raise_to_meter(self, now: datetime) -> None:
+        """
+        De meter is de referentie voor de facturatie: ligt zijn maandpiek
+        hoger dan de eigen, dan geldt die van de meter (de eigen meting mist
+        bv. een kwartier waarin HA uit stond).
+        """
+        meter_kw = self.meter_month_peak_kw(now)
+        if meter_kw is not None:
+            await self.store.async_raise_month_peak(meter_kw, now)
 
     @staticmethod
     def _entry_in_current_month(entry: dict, now: datetime) -> bool:
@@ -1019,7 +1097,7 @@ class PeakSavingsEuroThisYearSensor(_TrackerSensorBase):
 
 
 class PeakAvoidedEventsSensor(_TrackerSensorBase):
-    """Log van de laatste 100 piek-vermijdings-events."""
+    """Log van de laatste 100 piek-vermijdings-events, plus uitleg bij de maandpiek."""
     _DEF = _SensorDef(
         unique_suffix="peak_avoided_events",
         name="Peak Guard Piek Events Log",
@@ -1037,9 +1115,33 @@ class PeakAvoidedEventsSensor(_TrackerSensorBase):
     def native_value(self) -> int:
         return len(self._tracker.events)
 
+    def _month_peak_info(self) -> dict:
+        """
+        Wanneer viel de maandpiek, en was er toen nog iets af te schakelen?
+        cascade_uitgeput: in dat kwartier stonden alle apparaten van de
+        piek-cascade al uit of op minimum en bleef er toch overschot.
+        """
+        ts = self._shared.monthly_peak_ts
+        exhausted_w = None
+        if ts:
+            try:
+                exhausted_w = self._tracker.exhausted_quarters.get(datetime.fromisoformat(ts))
+            except (TypeError, ValueError):
+                exhausted_w = None
+        kw = self._shared.monthly_peak_kw
+        return {
+            "kw": round(kw, 3) if kw is not None else None,
+            "kwartier_start": ts,
+            "meter_kw": round(self._shared.meter_peak_kw, 3)
+                        if self._shared.meter_peak_kw is not None else None,
+            "cascade_uitgeput": exhausted_w is not None,
+            "overschot_na_cascade_w": exhausted_w,
+        }
+
     @property
     def extra_state_attributes(self) -> dict:
         return {
+            "maandpiek": self._month_peak_info(),
             "events": [
                 {
                     "timestamp_start_uitstel": e.avoid_ts.isoformat(),
