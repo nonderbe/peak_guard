@@ -1,6 +1,6 @@
 # Peak Guard — Next Steps
 
-Updated: 2026-10-02.
+Updated: 2026-10-24.
 
 ## Status Legend
 - ✅ Done
@@ -148,6 +148,23 @@ CLAUDE.md under "Known limitations".
 | `controller.py` and the panel have no automated tests | ⏳ accepted |
 
 ---
+
+---
+
+## v1.9.3 follow-ups (field-data review 2026-10-24)
+
+v1.9.3 released and installed on HA 2026-10-24 12:00 CEST; monitoring running.
+
+| # | Item | Status |
+|---|------|--------|
+| R3 | October savings: hypothetical from old (too-low) quarters vs meter-raised actual → lower bound; panel month-peak note uses own peak's ts after a raise | ⏳ |
+| R5 | Use the energy state's `last_updated` as reading time (slow energy sensors) | ⏳ |
+| R6 | `note_exhausted` also fires when devices were skipped (rate limit, unreachable); only note when every device is really off/min | ⏳ |
+| R7 | Schedule books the deferral on a `turn_on` that may not lead to charging (bounded by the 15-min cap) | ⏳ |
+| R8 | `PEAK_SWITCH_MIN_OFF_S` per device / persisted across restarts | ⏳ |
+| F7 | Re-shed chain: counterfactual energy contiguous from the first shed | ⏳ |
+| S1 | Schedule raise hysteresis vs. peak reduction (8→7→8 A ping-pong) | ⏳ |
+| S2 | Suggest configuring `charge_state_sensor: sensor.niels_en_puji_tesla_opladen` for the Tesla | ⏳ user |
 
 ## How to resume
 
