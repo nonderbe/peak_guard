@@ -259,3 +259,37 @@ class TestDiscardPending:
         later = NOW.replace(hour=18)
         t.record_pending_avoid("dev_bad", "Badkamer", 1.8, ts=later)
         assert t._pending["dev_bad"].avoid_ts == later
+
+
+class TestTuyaThermostat:
+    """Tuya 'Vloerverwarming RM': hvac_modes [off, heat_cool], geen hvac_action."""
+
+    def _tuya(self, hass, mode="heat_cool", temp=10.0, room=17.5):
+        hass.states.set(ENTITY, mode, {
+            "hvac_modes": ["off", "heat_cool"], "temperature": temp,
+            "current_temperature": room, "target_temp_step": 0.5,
+        })
+
+    async def test_surplus_uses_the_thermostats_own_heat_mode(self, hass, ev_guard):
+        self._tuya(hass, mode="off")
+        await _device().apply(2000.0, {}, _ctx(hass, ev_guard, "solar"))
+        (call,) = hass.services.calls
+        assert call["data"] == {"entity_id": ENTITY, "temperature": 24.0, "hvac_mode": "heat_cool"}
+
+    async def test_already_in_heat_cool_only_sets_the_temperature(self, hass, ev_guard):
+        self._tuya(hass)
+        await _device().apply(2000.0, {}, _ctx(hass, ev_guard, "solar"))
+        (call,) = hass.services.calls
+        assert call["data"] == {"entity_id": ENTITY, "temperature": 24.0}
+
+    async def test_satisfied_thermostat_frees_nothing_on_a_peak(self, hass, ev_guard):
+        """Doel 10 °C, gemeten 17,5 °C: verwarmt niet."""
+        self._tuya(hass)
+        ctx = _ctx(hass, ev_guard, "peak")
+        assert await _device().apply(2500.0, {}, ctx) == pytest.approx(2500.0)
+        assert ctx.peak_tracker.pending_avoids == []
+
+    async def test_cold_room_counts_as_heating(self, hass, ev_guard):
+        self._tuya(hass, temp=24.0, room=19.0)
+        ctx = _ctx(hass, ev_guard, "peak")
+        assert await _device().apply(2500.0, {}, ctx) == pytest.approx(700.0)

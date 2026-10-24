@@ -644,7 +644,8 @@ class ClimateDevice(BaseCascadeDevice):
     _action_type: ClassVar[str] = "climate"
 
     inject_temp: Optional[float] = None
-    heat_mode:   str = "heat"
+    # Leeg: de verwarmingsmodus die de thermostaat aanbiedt (heat, heat_cool, auto …).
+    heat_mode:   str = ""
 
     @classmethod
     def _from_dict(cls, base: dict, d: dict) -> "ClimateDevice":
@@ -653,7 +654,32 @@ class ClimateDevice(BaseCascadeDevice):
             inject_temp = float(inject_temp) if inject_temp not in (None, "") else None
         except (TypeError, ValueError):
             inject_temp = None
-        return cls(**base, inject_temp=inject_temp, heat_mode=d.get("heat_mode") or "heat")
+        return cls(**base, inject_temp=inject_temp, heat_mode=d.get("heat_mode") or "")
+
+    def _heat_mode_for(self, state) -> str:
+        """Ingestelde modus, anders de eerste niet-'off'-modus van de thermostaat."""
+        modes = [m for m in (state.attributes.get("hvac_modes") or []) if m != "off"]
+        if self.heat_mode and (not modes or self.heat_mode in modes):
+            return self.heat_mode
+        for preferred in ("heat", "heat_cool", "auto"):
+            if preferred in modes:
+                return preferred
+        return modes[0] if modes else "heat"
+
+    @staticmethod
+    def _is_heating(state) -> bool:
+        """
+        hvac_action als de thermostaat het meldt; anders: gemeten temperatuur
+        onder het doel. Onbekend → aannemen dat hij verwarmt.
+        """
+        action = state.attributes.get("hvac_action")
+        if action is not None:
+            return action == "heating"
+        room = _float_attr(state, "current_temperature")
+        target = _float_attr(state, "temperature")
+        if room is None or target is None:
+            return True
+        return room < target
 
     async def _call(self, ctx: CascadeContext, service: str, data: dict) -> None:
         await ctx.hass.services.async_call(
@@ -676,8 +702,7 @@ class ClimateDevice(BaseCascadeDevice):
         if state.state in _CLIMATE_OFF_STATES:
             ctx.last_skip_reason = f"thermostaat staat al uit ({state.state or '?'})"
             return excess
-        heating = state.attributes.get("hvac_action")
-        drawing = heating in (None, "heating")
+        drawing = self._is_heating(state)
         if self.entity_id not in snapshots:
             snapshots[self.entity_id] = DeviceSnapshot(
                 entity_id=self.entity_id, original_state=state.state,
@@ -710,7 +735,8 @@ class ClimateDevice(BaseCascadeDevice):
         if self.inject_temp is None or state.state in ("unavailable", "unknown"):
             return excess
         target = _float_attr(state, "temperature")
-        if state.state == self.heat_mode and target is not None and target >= self.inject_temp:
+        heat_mode = self._heat_mode_for(state)
+        if state.state == heat_mode and target is not None and target >= self.inject_temp:
             ctx.last_skip_reason = f"verwarmt al op {target:.1f} °C"
             return excess
         room = _float_attr(state, "current_temperature")
@@ -733,8 +759,8 @@ class ClimateDevice(BaseCascadeDevice):
             )
         try:
             data = {"temperature": self.inject_temp}
-            if state.state != self.heat_mode:
-                data["hvac_mode"] = self.heat_mode
+            if state.state != heat_mode:
+                data["hvac_mode"] = heat_mode
             await self._call(ctx, "set_temperature", data)
         except HomeAssistantError as err:
             ctx.warn(
