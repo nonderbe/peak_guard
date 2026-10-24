@@ -164,7 +164,7 @@ v1.9.3 released and installed on HA 2026-10-24 12:00 CEST; monitoring running.
 | R8 | `PEAK_SWITCH_MIN_OFF_S` per device / persisted across restarts | ⏳ |
 | F7 | Re-shed chain: counterfactual energy contiguous from the first shed | ⏳ |
 | S1 | Schedule raise hysteresis vs. peak reduction (8→7→8 A ping-pong) | ⏳ |
-| S2 | Suggest configuring `charge_state_sensor: sensor.niels_en_puji_tesla_opladen` for the Tesla | ⏳ user |
+| S2 | `charge_state_sensor: sensor.niels_en_puji_tesla_opladen` configured for the Tesla (peak, inject, schedule) | ✅ 2026-10-24 |
 
 ## How to resume
 
