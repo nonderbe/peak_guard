@@ -166,6 +166,16 @@ v1.9.3 released and installed on HA 2026-10-24 12:00 CEST; monitoring running.
 | S1 | Schedule raise hysteresis vs. peak reduction (8→7→8 A ping-pong) | ⏳ |
 | S2 | `charge_state_sensor: sensor.niels_en_puji_tesla_opladen` configured for the Tesla (peak, inject, schedule) | ✅ 2026-10-24 |
 
+## v1.9.4 — thermostat (bathroom floor heating), released 2026-10-24
+
+| # | Item | Status |
+|---|------|--------|
+| T1 | `ClimateDevice` released and installed on HA (running since 19:03 CEST) | ✅ |
+| T2 | User links Tuya (Smart Life user code → Settings → Devices & services → Tuya, scan QR) | ⏳ user |
+| T3 | Check the heater's climate entity (hvac_modes, hvac_action); adjust `heat_mode` if not `heat` | ⏳ after T2 |
+| T4 | Add heater: peak cascade LAST (climate, 1800 W); inject cascade FIRST (climate, 1800 W, inject_temp 24) | ⏳ after T2 |
+| T5 | Solar savings for a thermostat count full power while it idles at temperature (D4) | ⏳ |
+
 ## How to resume
 
 1. Read this file first.
