@@ -140,6 +140,8 @@ class DeviceSnapshot:
     original_state:   str
     original_current: Optional[float] = None
     original_soc:     Optional[float] = None
+    # Thermostaat: doeltemperatuur vóór de ingreep (original_state = hvac-modus).
+    original_temp:    Optional[float] = None
 
 
 # ──────────────────────────────────────────────────────────────────────────── #
@@ -613,6 +615,191 @@ def _migrate_flat_format(d: dict) -> dict:
     return d
 
 
+_CLIMATE_OFF_STATES = ("off", "unavailable", "unknown", "")
+
+
+def _float_attr(state, name: str) -> Optional[float]:
+    try:
+        value = state.attributes.get(name)
+        return None if value is None else float(value)
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+@dataclass
+class ClimateDevice(BaseCascadeDevice):
+    """
+    Thermostaat (climate.*), bv. een elektrische vloerverwarming.
+
+    Piek-cascade: uitschakelen (hvac-modus 'off'); daarna terug naar de vorige
+    modus en doeltemperatuur.
+    Solar-cascade: verwarmen op inject_temp zolang er overschot is; daarna
+    terug naar de vorige modus en doeltemperatuur.
+
+    power_watts is het vermogen tijdens het verwarmen. Een thermostaat die op
+    temperatuur is, trekt niets: dan telt het afschakelen niet als verlaging
+    (hvac_action 'idle'), en bij overschot wordt hij niet aangestuurd als de
+    kamer al op inject_temp is.
+    """
+    _action_type: ClassVar[str] = "climate"
+
+    inject_temp: Optional[float] = None
+    heat_mode:   str = "heat"
+
+    @classmethod
+    def _from_dict(cls, base: dict, d: dict) -> "ClimateDevice":
+        inject_temp = d.get("inject_temp")
+        try:
+            inject_temp = float(inject_temp) if inject_temp not in (None, "") else None
+        except (TypeError, ValueError):
+            inject_temp = None
+        return cls(**base, inject_temp=inject_temp, heat_mode=d.get("heat_mode") or "heat")
+
+    async def _call(self, ctx: CascadeContext, service: str, data: dict) -> None:
+        await ctx.hass.services.async_call(
+            "climate", service, {"entity_id": self.entity_id, **data}, blocking=True)
+        ctx.track_action(self.entity_id, f"climate.{service}", data or None)
+
+    async def apply(self, excess: float, snapshots: dict, ctx: CascadeContext) -> float:
+        state = ctx.hass.states.get(self.entity_id)
+        if state is None:
+            ctx.warn(
+                "Peak Guard: entity '%s' ('%s') niet gevonden in HA — apparaat overgeslagen",
+                self.entity_id, self.name,
+            )
+            return excess
+        if ctx.cascade_type == "peak":
+            return await self._apply_peak(excess, snapshots, ctx, state)
+        return await self._apply_solar(excess, snapshots, ctx, state)
+
+    async def _apply_peak(self, excess, snapshots, ctx, state) -> float:
+        if state.state in _CLIMATE_OFF_STATES:
+            ctx.last_skip_reason = f"thermostaat staat al uit ({state.state or '?'})"
+            return excess
+        heating = state.attributes.get("hvac_action")
+        drawing = heating in (None, "heating")
+        if self.entity_id not in snapshots:
+            snapshots[self.entity_id] = DeviceSnapshot(
+                entity_id=self.entity_id, original_state=state.state,
+                original_temp=_float_attr(state, "temperature"),
+            )
+        try:
+            await self._call(ctx, "set_hvac_mode", {"hvac_mode": "off"})
+        except HomeAssistantError as err:
+            ctx.warn(
+                "Peak Guard: '%s' niet bereikbaar om uit te schakelen — "
+                "snapshot teruggedraaid, volgende cyclus opnieuw (%s)", self.name, err,
+            )
+            snapshots.pop(self.entity_id, None)
+            return excess
+        _LOGGER.info(
+            "Peak Guard: → thermostaat '%s' UITgeschakeld (piekbeperking, %s, overschot was %.0f W)",
+            self.name, f"-{self.power_watts} W" if drawing else "was niet aan het verwarmen",
+            excess,
+        )
+        if not drawing:
+            # Op temperatuur: uitschakelen voorkomt enkel dat hij in de piek begint.
+            return excess
+        ctx.peak_tracker.record_pending_avoid(
+            device_id=self.id, device_name=self.name,
+            nominal_kw=self.power_watts / 1000.0, ts=ctx.now,
+        )
+        return excess - self.power_watts
+
+    async def _apply_solar(self, excess, snapshots, ctx, state) -> float:
+        if self.inject_temp is None or state.state in ("unavailable", "unknown"):
+            return excess
+        target = _float_attr(state, "temperature")
+        if state.state == self.heat_mode and target is not None and target >= self.inject_temp:
+            ctx.last_skip_reason = f"verwarmt al op {target:.1f} °C"
+            return excess
+        room = _float_attr(state, "current_temperature")
+        if room is not None and room >= self.inject_temp:
+            ctx.last_skip_reason = f"al {room:.1f} °C (doel {self.inject_temp:.1f} °C)"
+            return excess
+        if self.power_watts and excess < self.power_watts:
+            ctx.last_skip_reason = (
+                f"overschot {excess:.0f} W < vermogen {self.power_watts:.0f} W"
+            )
+            ctx.ev_guard.set_hold(
+                self.id, "surplus_too_small",
+                f"Wacht: het zonne-overschot ({excess:.0f} W) dekt het vermogen van "
+                f"deze verwarming ({self.power_watts:.0f} W) nog niet.",
+            )
+            return excess
+        if self.entity_id not in snapshots:
+            snapshots[self.entity_id] = DeviceSnapshot(
+                entity_id=self.entity_id, original_state=state.state, original_temp=target,
+            )
+        try:
+            data = {"temperature": self.inject_temp}
+            if state.state != self.heat_mode:
+                data["hvac_mode"] = self.heat_mode
+            await self._call(ctx, "set_temperature", data)
+        except HomeAssistantError as err:
+            ctx.warn(
+                "Peak Guard: '%s' niet bereikbaar om op %.1f °C te zetten — "
+                "snapshot teruggedraaid, volgende cyclus opnieuw (%s)",
+                self.name, self.inject_temp, err,
+            )
+            snapshots.pop(self.entity_id, None)
+            return excess
+        _LOGGER.info(
+            "Peak Guard: → thermostaat '%s' op %.1f °C (injectiepreventie, +%d W, overschot was %.0f W)",
+            self.name, self.inject_temp, self.power_watts, excess,
+        )
+        ctx.solar_tracker.start_solar_measurement(
+            device_id=self.id, device_name=self.name,
+            nominal_kw=self.power_watts / 1000.0, ts=ctx.now,
+        )
+        return excess - self.power_watts
+
+    async def restore(self, snapshot: DeviceSnapshot, ctx: CascadeContext) -> bool:
+        state = ctx.hass.states.get(self.entity_id)
+        if state is None:
+            ctx.warn("Peak Guard: kan '%s' niet herstellen — entity niet gevonden", self.name)
+            return False
+        try:
+            original_mode = snapshot.original_state or "off"
+            if original_mode in ("unavailable", "unknown"):
+                original_mode = "off"
+            if original_mode != "off" and snapshot.original_temp is not None:
+                data = {"temperature": snapshot.original_temp}
+                if state.state != original_mode:
+                    data["hvac_mode"] = original_mode
+                await self._call(ctx, "set_temperature", data)
+            elif state.state != original_mode:
+                await self._call(ctx, "set_hvac_mode", {"hvac_mode": original_mode})
+            _LOGGER.info(
+                "Peak Guard: thermostaat '%s' hersteld na %s (%s%s)",
+                self.name, "piekbeperking" if ctx.cascade_type == "peak" else "injectiepreventie",
+                original_mode,
+                f", {snapshot.original_temp:.1f} °C" if snapshot.original_temp is not None else "",
+            )
+            if ctx.cascade_type == "peak":
+                if original_mode != "off":
+                    ctx.peak_tracker.start_measurement_on_turnon(
+                        device_id=self.id, device_name=self.name, ts=ctx.now)
+            else:
+                event = ctx.solar_tracker.complete_solar_calculation(
+                    device_id=self.id, now=ctx.now)
+                if event:
+                    _LOGGER.info(
+                        "Peak Guard: solar-event afgerond voor '%s' — "
+                        "duur=%.1f min, verschoven=%.4f kWh, besparing=€%.4f",
+                        self.name, event.measured_duration_min,
+                        event.shifted_kwh, event.savings_euro,
+                    )
+            return True
+        except HomeAssistantError as err:
+            ctx.warn(
+                "Peak Guard: '%s' niet bereikbaar bij herstel — "
+                "volgende cyclus opnieuw proberen (%s)", self.name, err)
+        except (ValueError, TypeError) as err:
+            _LOGGER.error("Peak Guard: fout bij herstellen '%s': %s", self.name, err)
+        return False
+
+
 # Registry populated after all subclasses are defined.
 _DEVICE_REGISTRY: dict[str, type[BaseCascadeDevice]] = {}
 
@@ -649,5 +836,5 @@ def from_dict(d: dict) -> BaseCascadeDevice:
 # Populate registry after all subclasses are defined.
 _DEVICE_REGISTRY.update({
     cls._action_type: cls
-    for cls in (SwitchOffDevice, SwitchOnDevice, ThrottleDevice, EVChargerDevice)
+    for cls in (SwitchOffDevice, SwitchOnDevice, ThrottleDevice, EVChargerDevice, ClimateDevice)
 })

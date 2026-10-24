@@ -20,7 +20,7 @@ python3 -m venv .venv && .venv/bin/python -m pip install -r requirements-test.tx
 
 `requirements-test.txt` (pytest, pytest-asyncio) is test tooling only — the integration itself still has no third-party dependencies.
 
-The test suite uses stub modules in `tests/conftest.py` to avoid a live HA install; the stubbed `homeassistant.util.dt.as_local` uses a fixed Europe/Brussels time zone. Fourteen test files:
+The test suite uses stub modules in `tests/conftest.py` to avoid a live HA install; the stubbed `homeassistant.util.dt.as_local` uses a fixed Europe/Brussels time zone. Fifteen test files:
 - `tests/test_ev_guard.py` — 57 tests covering the EV state machine, rate limiter and its reserve, daily-budget reserve, unreachable-vehicle back-off, debounce, and Tesla-specific paths
 - `tests/test_tracker.py` — 32 tests covering the financial calculations in `PeakAvoidTracker` and `SolarShiftTracker`, incl. per-event and per-device hypothetical peaks, shift bookkeeping and measurement lifecycle
 - `tests/test_peak_floor.py` — 24 tests covering the 2.5 kW capacity-tariff floor (decider, savings, billed peak, decision log)
@@ -34,6 +34,7 @@ The test suite uses stub modules in `tests/conftest.py` to avoid a live HA insta
 - `tests/test_peak_verification.py` — 16 tests covering the automatic removal of quarters and monthly records that contradict the P1 meter's monthly peak
 - `tests/test_schedule.py` — 69 tests covering the charging schedule: window logic (midnight, DST, overlap, tariff sensor), serialisation, `ScheduleDecider`, and the peak > schedule > injection interplay through `deciders/dispatch.run_tick`
 - `tests/test_field_fixes.py` — 39 tests covering the fixes from the October 2026 field data (v1.9.3): quarter-boundary interpolation and the calculator restart state, the quarter budget (`quarter_budget.py`) and `PeakDecider` on it (spike vs. sustained overload, settle after own shedding, switch min-OFF, exhausted cascade), EV deferral bookkeeping, and raising the month record to the P1 meter, plus the DST change with local-time timer callbacks (real `zoneinfo`) and the 15-min bound on EV deferrals
+- `tests/test_climate.py` — 19 tests covering `ClimateDevice` (thermostat): serialisation, switching off in the peak cascade (idle thermostat frees nothing), the inject temperature in the solar cascade (surplus rule, room already warm, no inject temperature), restore of mode and temperature, rollback on a failed call, and the same thermostat in both cascades through `run_tick` (peak takes over from solar, solar takes over from peak)
 - `tests/test_status_holds.py` — 25 tests covering the status explanations (`holds`) and the control fixes found with them: inject switch start rule, inject restore past a held EV, peak restore without `break`, stepwise EV restore after a peak, min-OFF on peak restore (also with a stale charge state), giving up a capped restart that never charges, headroom reservation for a restarted EV, and the hand-over of a peak-limited EV to the solar cascade
 
 `controller.py` and the frontend panel are not importable in this harness and are not covered.
@@ -72,6 +73,7 @@ The integration lives entirely in `custom_components/peak_guard/`.
 | `SwitchOffDevice` | `models.py` | Simple switch-off device (peak cascade) |
 | `SwitchOnDevice` | `models.py` | Simple switch-on device (inject cascade) |
 | `ThrottleDevice` | `models.py` | Throttleable device with min/max/power_per_unit |
+| `ClimateDevice` | `models.py` | Thermostat (`climate.*`, action type `climate`): off in the peak cascade, `inject_temp` in the solar cascade, restores mode + temperature (`DeviceSnapshot.original_temp`) |
 | `EVChargerDevice` | `models.py` | EV charger — all EV fields directly on the class (switch_entity, current_entity, phases, soc_entity, charge_state_sensor, …) |
 | `CascadeContext` | `models.py` | Dependency-injection bag threaded through cascade loop (hass, trackers, ev_guard, callbacks) |
 | `from_dict()` | `models.py` | Factory that deserialises a dict into the correct subclass; migrates old `ev_*`-prefixed formats automatically |
@@ -110,6 +112,17 @@ EV chargers are significantly more complex than simple switches. All logic lives
 - **Wake-up support**: detects sleeping EV (via `status_sensor`), calls `wake_button`, waits up to `EV_WAKE_TIMEOUT_S`, then backs off for `EV_WAKE_COOLDOWN_S` on failure
 - **Location guard**: skips all action when `location_tracker` is present and EV is not home
 - **Manual-start detection**: if `switch_entity` reports `unknown`/`unavailable` but `status_sensor` confirms charging, the EV is treated as already on. This "handmatige start" path sets `guard.state = CHARGING` **and** calls `solar_tracker.start_solar_measurement` so the session is tracked even though Peak Guard didn't initiate it. Relevant for Tesla, whose switch entity is permanently `unknown`.
+
+### Thermostats (`ClimateDevice`)
+
+Action type `climate`, entity `climate.*`, `power_watts` = draw while heating. Same class in both cascades, behaviour by `ctx.cascade_type`:
+- **Peak**: `climate.set_hvac_mode` → `off`; snapshot keeps the hvac mode (`original_state`) and the target temperature (`original_temp`). When `hvac_action` is known and not `heating`, it is still switched off (so it can't start during the peak) but frees nothing and records no avoided peak. Restore needs `power_watts` headroom and the switch min-OFF, like a switch.
+- **Solar**: `climate.set_temperature` to `inject_temp` (plus `hvac_mode: heat_mode` when it was off) only when the surplus covers `power_watts`, the room (`current_temperature`) is below `inject_temp` and it is not already heating at ≥ `inject_temp`. No `inject_temp` → no solar action. Solar savings count `power_watts` × duration even when the thermostat cycles off at temperature (over-estimate).
+- Restore (both): `set_temperature` with the original temperature (+ mode when it differs), or `set_hvac_mode` when the original mode was `off`.
+- Not schedulable (the Planning tab only lists switches and EVs).
+- **Same device in both cascades** (any non-EV type): one owner at a time. `PeakDecider.take_over_from_solar()` (in `run_tick` right after `peak.check`) moves an inject snapshot into the peak snapshot when the peak sheds a device the solar cascade had turned on — otherwise the inject restore (consumption ≥ 0) turns it back on in the same tick — and keeps the pre-surplus original. `hand_over_to_solar()` now also covers non-EV devices: a peak-shed device that the solar cascade turns on loses its peak snapshot and the inject snapshot gets the pre-peak original, so the end of the surplus returns to the user's setting instead of "off".
+- The inject restore keeps the `solar_share` rule (owner's choice, 2026-10-24): an EV held at minimum is skipped and the next device — also a thermostat with a higher priority — is restored first.
+- A manual setpoint change while Peak Guard holds a snapshot is overwritten by the restore (same as the other types).
 
 ### Charging schedule (Planning tab)
 

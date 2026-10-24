@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from dataclasses import asdict
+from dataclasses import asdict, fields as dataclass_fields
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
@@ -36,6 +36,12 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _snapshot_from_dict(v: dict) -> DeviceSnapshot:
+    """Onbekende velden (van een nieuwere versie) negeren in plaats van te crashen."""
+    known = {f.name for f in dataclass_fields(DeviceSnapshot)}
+    return DeviceSnapshot(**{k: val for k, val in v.items() if k in known})
 
 
 # ──────────────────────────────────────────────────────────────────────────── #
@@ -152,12 +158,12 @@ class PeakGuardController:
             inject_entity_ids = {d.entity_id for d in self.inject_cascade}
             for k, v in data.get("peak_snapshots", {}).items():
                 if k in peak_entity_ids:
-                    self._peak_snapshots[k] = DeviceSnapshot(**v)
+                    self._peak_snapshots[k] = _snapshot_from_dict(v)
                 else:
                     _LOGGER.info("Peak Guard: verouderd piek-snapshot verwijderd voor '%s' (niet meer in cascade)", k)
             for k, v in data.get("inject_snapshots", {}).items():
                 if k in inject_entity_ids:
-                    self._inject_snapshots[k] = DeviceSnapshot(**v)
+                    self._inject_snapshots[k] = _snapshot_from_dict(v)
                 else:
                     _LOGGER.info("Peak Guard: verouderd inject-snapshot verwijderd voor '%s' (niet meer in cascade)", k)
             self._schedule_decider.set_entries([

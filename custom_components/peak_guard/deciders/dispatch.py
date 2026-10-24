@@ -37,6 +37,7 @@ async def run_tick(
         return
     if consumption > 0:
         await peak.check(consumption, now)
+        peak.take_over_from_solar(injection.snapshots, now)
         await peak.check_restore(consumption, now)
         await schedule.check(consumption, now)
         await injection.check_restore(consumption, now)

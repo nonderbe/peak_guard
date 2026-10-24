@@ -987,6 +987,7 @@ class PeakGuardPanel extends HTMLElement {
       switch_on:   "Inschakelen",
       throttle:    "Vermogen verminderen",
       ev_charger:  "EV Charger",
+      climate:     "Thermostaat",
     };
 
     const { text: statusText, cls: statusCls } = this._deviceStatus(device);
@@ -1056,6 +1057,7 @@ class PeakGuardPanel extends HTMLElement {
       switch_on:   "Dit apparaat wordt ingeschakeld bij overtollige zonne-energie om de injectie naar het net te beperken.",
       throttle:    "Het vermogen van dit apparaat wordt verminderd via een instelbare number-entiteit (legacy modus).",
       ev_charger:  "Elektrisch voertuig met variabele laadstroom. Peak Guard past de laadsnelheid aan op basis van beschikbaar vermogen.",
+      climate:     "Thermostaat: gaat uit bij piekdreiging en verwarmt op de ingestelde doeltemperatuur bij zonne-overschot; daarna terug naar de vorige instelling.",
     };
 
     return `
@@ -1403,6 +1405,15 @@ class PeakGuardPanel extends HTMLElement {
       const display = isNaN(val) ? state.state : `${val} ${unit}`;
       return { text: display, cls: "status-throttle" };
     }
+    if (device.action_type === "climate") {
+      if (state.state === "off") return { text: "uit", cls: "status-off" };
+      const t = state.attributes?.temperature;
+      const heating = state.attributes?.hvac_action === "heating";
+      return {
+        text: `${heating ? "verwarmt" : state.state}${t != null ? ` · ${t} °C` : ""}`,
+        cls: heating ? "status-on" : "status-throttle",
+      };
+    }
     // switch_on / switch_off
     if (state.state === "on") return { text: "aan", cls: "status-on" };
     if (state.state === "off") return { text: "uit", cls: "status-off" };
@@ -1691,6 +1702,8 @@ class PeakGuardPanel extends HTMLElement {
 
   _renderStandardModal(d) {
     const isThrottle = d.action_type === "throttle";
+    const isClimate  = d.action_type === "climate";
+    const isInject   = this._editCascadeType === "inject";
     this._modalEl.innerHTML = `
       <div class="modal" id="modal-box">
         <h3>${d.id ? "Apparaat bewerken" : "Apparaat toevoegen"}</h3>
@@ -1709,12 +1722,14 @@ class PeakGuardPanel extends HTMLElement {
             <option value="switch_off"  ${d.action_type === "switch_off"  ? "selected" : ""}>Uitschakelen (switch)</option>
             <option value="switch_on"   ${d.action_type === "switch_on"   ? "selected" : ""}>Inschakelen bij zonne-overschot (switch)</option>
             <option value="ev_charger"  ${d.action_type === "ev_charger"  ? "selected" : ""}>Elektrisch Voertuig (EV Charger)</option>
+            <option value="climate"     ${d.action_type === "climate"     ? "selected" : ""}>Thermostaat / verwarming (climate)</option>
             <option value="throttle"    ${d.action_type === "throttle"    ? "selected" : ""}>Vermogen verminderen — legacy (number)</option>
           </select>
           <div class="field-hint">
             <b>Uitschakelen</b>: schakelaar die tijdelijk uitgaat bij piekdreiging.<br>
             <b>Inschakelen</b>: schakelaar die aangaat bij zonne-overschot.<br>
-            <b>EV Charger</b>: laadpaal met variabele stroomsterkte.
+            <b>EV Charger</b>: laadpaal met variabele stroomsterkte.<br>
+            <b>Thermostaat</b>: gaat uit bij piekdreiging, verwarmt op een doeltemperatuur bij zonne-overschot.
           </div>
         </div>
 
@@ -1725,7 +1740,16 @@ class PeakGuardPanel extends HTMLElement {
               placeholder="Zoek op naam of entity ID..." autocomplete="off" />
             <div id="entity-dropdown" class="entity-dropdown" style="display:none;"></div>
           </div>
-          <div class="field-hint">De schakelaar (switch.*) of regelbare entiteit (number.*) in Home Assistant.</div>
+          <div class="field-hint">De schakelaar (switch.*), thermostaat (climate.*) of regelbare entiteit (number.*) in Home Assistant.</div>
+        </div>
+
+        <div id="climate-fields" ${isClimate && isInject ? "" : 'style="display:none"'}>
+          <div class="form-group">
+            <label>Doeltemperatuur bij zonne-overschot (°C)</label>
+            <input id="f-inject-temp" type="number" min="5" max="35" step="0.5"
+              value="${d.inject_temp ?? 24}" />
+            <div class="field-hint">Zolang er overschot is, verwarmt de thermostaat op deze temperatuur. Daarna keert hij terug naar zijn vorige modus en temperatuur.</div>
+          </div>
         </div>
 
         <div class="form-group">
@@ -2256,6 +2280,11 @@ class PeakGuardPanel extends HTMLElement {
             return;
           }
           if (throttleFields) throttleFields.style.display = v === "throttle" ? "" : "none";
+          const climateFields = root.querySelector("#climate-fields");
+          if (climateFields) {
+            climateFields.style.display =
+              v === "climate" && this._editCascadeType === "inject" ? "" : "none";
+          }
         });
       }
 
@@ -2331,6 +2360,11 @@ class PeakGuardPanel extends HTMLElement {
       if (!entity_id) { alert("Entity ID is verplicht."); return; }
 
       const power_watts = parseInt(val("#f-power")) || 0;
+      const isClimate   = action_type === "climate";
+      if (isClimate && !entity_id.startsWith("climate.")) {
+        alert("Een thermostaat heeft een climate.*-entiteit nodig."); return;
+      }
+      const injectTemp  = parseFloat(val("#f-inject-temp"));
       device = {
         id:             this._editDevice?.id || `dev_${Date.now()}`,
         name,
@@ -2340,6 +2374,7 @@ class PeakGuardPanel extends HTMLElement {
         min_value:      isThrottle ? (parseFloat(val("#f-min")) || 0)   : null,
         max_value:      isThrottle ? (parseFloat(val("#f-max")) || 32)  : null,
         power_per_unit: isThrottle ? (parseFloat(val("#f-ppu")) || 690) : null,
+        inject_temp:    isClimate ? (isNaN(injectTemp) ? (this._editDevice?.inject_temp ?? null) : injectTemp) : null,
         enabled:        true,
         priority:       this._editDevice?.priority ?? 999,
         switch_entity:  null,

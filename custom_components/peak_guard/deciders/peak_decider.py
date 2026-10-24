@@ -345,12 +345,14 @@ class PeakDecider(BaseDecider):
         if now is None:
             now = datetime.now(timezone.utc)
         for device in self._cascade:
-            if getattr(device, "action_type", None) != ACTION_EV_CHARGER:
-                continue
             peak_snap = self._snapshots.get(device.entity_id)
             inject_snap = inject_snapshots.get(device.entity_id)
             if peak_snap is None or inject_snap is None:
                 continue
+            # Ook voor een schakelaar of thermostaat in beide cascades: anders
+            # zet het piekherstel tijdens het overschot de oude instelling
+            # terug, en zet het solar-herstel daarna de toestand van tijdens
+            # de piek (uit) terug — de vloerverwarming bleef dan uit.
             inject_snapshots[device.entity_id] = replace(
                 inject_snap,
                 original_state=peak_snap.original_state,
@@ -359,9 +361,15 @@ class PeakDecider(BaseDecider):
                     if peak_snap.original_current is not None
                     else inject_snap.original_current
                 ),
+                original_temp=(
+                    peak_snap.original_temp
+                    if peak_snap.original_temp is not None
+                    else inject_snap.original_temp
+                ),
             )
             del self._snapshots[device.entity_id]
             self._ev_restarts.pop(device.entity_id, None)
+            self._shed_at.pop(device.entity_id, None)
             # Een stop door de piek wacht op de herinschakeling: die is er nu.
             self.peak_tracker.start_measurement_on_turnon(
                 device_id=device.id, device_name=device.name, ts=now,
@@ -372,6 +380,43 @@ class PeakDecider(BaseDecider):
                 device.name,
                 f"{peak_snap.original_current:.0f} A" if peak_snap.original_current is not None
                 else peak_snap.original_state,
+            )
+
+    def take_over_from_solar(
+        self, inject_snapshots: Dict[str, DeviceSnapshot], now: Optional[datetime] = None
+    ) -> None:
+        """
+        Omgekeerde richting van hand_over_to_solar: de piek-cascade schakelde
+        een apparaat af dat de solar-cascade had aangezet. De piek is nu
+        eigenaar; anders zet het solar-herstel (verbruik ≥ 0) het in dezelfde
+        cyclus weer aan en pendelt het elke minuut. Het piek-snapshot neemt
+        de toestand van vóór het overschot over, zodat het herstel na de piek
+        naar de instelling van de gebruiker terugkeert, niet naar die van het
+        overschot. Niet voor EV's: daar regelen de EV-paden de overdracht.
+        """
+        if now is None:
+            now = datetime.now(timezone.utc)
+        for device in self._cascade:
+            if getattr(device, "action_type", None) == ACTION_EV_CHARGER:
+                continue
+            peak_snap = self._snapshots.get(device.entity_id)
+            inject_snap = inject_snapshots.get(device.entity_id)
+            if peak_snap is None or inject_snap is None:
+                continue
+            self._snapshots[device.entity_id] = replace(
+                peak_snap,
+                original_state=inject_snap.original_state,
+                original_temp=inject_snap.original_temp,
+            )
+            del inject_snapshots[device.entity_id]
+            self.solar_tracker.complete_solar_calculation(device_id=device.id, now=now)
+            if inject_snap.original_state in ("off", "unavailable", "unknown"):
+                # Stond uit vóór het overschot: na de piek wordt er niets
+                # herstart, dus de afschakeling vermeed ook niets.
+                self.peak_tracker.discard_pending(device.id)
+            _LOGGER.info(
+                "Peak Guard [PIEK]: '%s' overgenomen van de solar-cascade — na de piek "
+                "terug naar %s", device.name, inject_snap.original_state,
             )
 
     def _ev_restart_pending(self, device: BaseCascadeDevice, ev_off: bool, now: datetime) -> bool:

@@ -303,6 +303,10 @@ class PeakAvoidTracker:
                     done.append(event)
         return done
 
+    def discard_pending(self, device_id: str) -> None:
+        """Vergeet een afschakeling die nooit hersteld wordt (apparaat stond vóór het overschot uit)."""
+        self._pending.pop(device_id, None)
+
     def complete_deferral(self, device_id: str, ts: datetime) -> Optional[PeakEvent]:
         """
         Rond een uitgestelde EV-lading af op ts (herstart, overname door de

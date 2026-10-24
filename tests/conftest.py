@@ -243,6 +243,10 @@ class MockPeakTracker:
         self.completed.append(device_id)
         return None
 
+    def discard_pending(self, device_id):
+        self.discarded = getattr(self, "discarded", [])
+        self.discarded.append(device_id)
+
     def note_exhausted(self, ts, remaining_w):
         self.exhausted = getattr(self, "exhausted", [])
         self.exhausted.append(remaining_w)

@@ -199,6 +199,7 @@ ACTION_SWITCH_OFF  = "switch_off"
 ACTION_SWITCH_ON   = "switch_on"
 ACTION_THROTTLE    = "throttle"      # behouden voor backwards-compat met bestaande data
 ACTION_EV_CHARGER  = "ev_charger"   # nieuw: elektrisch voertuig
+ACTION_CLIMATE     = "climate"      # thermostaat: uit bij piek, doeltemperatuur bij overschot
 
 # ------------------------------------------------------------------ #
 #  Device-identifiers voor HA device registry                         #
