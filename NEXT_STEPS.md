@@ -171,9 +171,10 @@ v1.9.3 released and installed on HA 2026-10-24 12:00 CEST; monitoring running.
 | # | Item | Status |
 |---|------|--------|
 | T1 | `ClimateDevice` released and installed on HA (running since 19:03 CEST) | ✅ |
-| T2 | User links Tuya (Smart Life user code → Settings → Devices & services → Tuya, scan QR) | ⏳ user |
-| T3 | Check the heater's climate entity (hvac_modes, hvac_action); adjust `heat_mode` if not `heat` | ⏳ after T2 |
-| T4 | Add heater: peak cascade LAST (climate, 1800 W); inject cascade FIRST (climate, 1800 W, inject_temp 24) | ⏳ after T2 |
+| T2 | Tuya linked; heater = `climate.badkamer_vloerverwarming_rm` (modes off/heat_cool, no hvac_action) | ✅ |
+| T3 | v1.9.5: own heat mode auto-detected, heating inferred from temperatures | ✅ |
+| T4 | Heater added: peak cascade priority 3 (last), inject cascade priority 1 (24 °C), 1800 W | ✅ |
+| T6 | Tuya "Smart Plug" (power/voltage sensors) offline in the Tuya cloud — user to check | ⏳ user |
 | T5 | Solar savings for a thermostat count full power while it idles at temperature (D4) | ⏳ |
 
 ## How to resume
