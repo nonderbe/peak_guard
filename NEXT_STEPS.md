@@ -180,6 +180,12 @@ v1.9.3 released and installed on HA 2026-10-24 12:00 CEST; monitoring running.
 | T8 | Why the 2026-11-07 17:59 shed was never restored is unexplained (no snapshot left, heater stayed off; only WARNING logs) — watch after v1.9.6 | ⏳ |
 | T9 | Solar `set_temperature` 24 °C may still flip the Tuya program into manual mode (no program-mode entity exposed) | ⏳ user |
 
+## Next release (user request 2026-11-08)
+
+| # | Item | Status |
+|---|------|--------|
+| U1 | Show the version number in the UI: read `version` from `manifest.json` once at setup; expose it as `sw_version` in the device info (device page) and in `/api/peak_guard/cascade` (`config.version`) and show it in the panel header. No separate release for this — ship it with the next one | ⏳ |
+
 ## How to resume
 
 1. Read this file first.
