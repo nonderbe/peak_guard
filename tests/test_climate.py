@@ -83,12 +83,15 @@ class TestPeak:
         assert snaps[ENTITY].original_temp == 21.0
         assert ctx.peak_tracker.pending_avoids == [{"id": "dev_bad", "kw": 1.8, "deferred": False}]
 
-    async def test_idle_thermostat_is_off_but_frees_nothing(self, hass, ev_guard):
+    async def test_idle_thermostat_is_left_on_its_schedule(self, hass, ev_guard):
+        """Op temperatuur: niet uitzetten, anders stopt het eigen tijdschema."""
         _set(hass, "heat", action="idle")
+        snaps: dict = {}
         ctx = _ctx(hass, ev_guard, "peak")
-        left = await _device().apply(2500.0, {}, ctx)
+        left = await _device().apply(2500.0, snaps, ctx)
         assert left == pytest.approx(2500.0)
-        assert hass.services.has_call("set_hvac_mode")
+        assert hass.services.calls == []
+        assert snaps == {}
         assert ctx.peak_tracker.pending_avoids == []
 
     async def test_already_off_is_skipped(self, hass, ev_guard):
@@ -96,15 +99,24 @@ class TestPeak:
         assert await _device().apply(2500.0, {}, _ctx(hass, ev_guard, "peak")) == 2500.0
         assert hass.services.calls == []
 
-    async def test_restore_returns_to_previous_mode_and_temperature(self, hass, ev_guard):
+    async def test_restore_after_a_peak_only_restores_the_mode(self, hass, ev_guard):
+        """De piek wijzigde enkel de modus: geen set_temperature (Tuya → manueel)."""
         _set(hass, "off")
         ctx = _ctx(hass, ev_guard, "peak")
         snap = DeviceSnapshot(entity_id=ENTITY, original_state="heat", original_temp=21.0)
         assert await _device().restore(snap, ctx) is True
         (call,) = hass.services.calls
-        assert call["service"] == "set_temperature"
-        assert call["data"] == {"entity_id": ENTITY, "temperature": 21.0, "hvac_mode": "heat"}
+        assert call["service"] == "set_hvac_mode"
+        assert call["data"] == {"entity_id": ENTITY, "hvac_mode": "heat"}
         assert ctx.peak_tracker.turn_on_measurements == ["dev_bad"]
+
+    async def test_restore_keeps_a_setpoint_changed_by_the_schedule(self, hass, ev_guard):
+        """Eigen schema zette tijdens het overschot 22 °C: dat blijft staan."""
+        _set(hass, "heat", temp=22.0)
+        ctx = _ctx(hass, ev_guard, "solar")
+        snap = DeviceSnapshot(entity_id=ENTITY, original_state="heat", original_temp=18.0)
+        assert await _device().restore(snap, ctx) is True
+        assert hass.services.calls == []
 
 
 class TestSolar:

@@ -681,6 +681,21 @@ class ClimateDevice(BaseCascadeDevice):
             return True
         return room < target
 
+    def _setpoint_still_ours(self, state, snapshot: DeviceSnapshot) -> bool:
+        """
+        Staat de doeltemperatuur nog op wat Peak Guard zette (inject_temp)?
+        Enkel dan wordt de oude temperatuur teruggezet. De piek-cascade wijzigt
+        alleen de modus; en heeft het eigen tijdschema van de thermostaat (of
+        de gebruiker) de temperatuur intussen veranderd, dan blijft die staan.
+        Een temperatuur sturen zet sommige thermostaten (Tuya) ook van hun
+        programma in manuele modus.
+        """
+        original = snapshot.original_temp
+        target = _float_attr(state, "temperature")
+        if original is None or target is None or self.inject_temp is None:
+            return False
+        return abs(target - self.inject_temp) < 0.01 and abs(target - original) >= 0.01
+
     async def _call(self, ctx: CascadeContext, service: str, data: dict) -> None:
         await ctx.hass.services.async_call(
             "climate", service, {"entity_id": self.entity_id, **data}, blocking=True)
@@ -702,7 +717,13 @@ class ClimateDevice(BaseCascadeDevice):
         if state.state in _CLIMATE_OFF_STATES:
             ctx.last_skip_reason = f"thermostaat staat al uit ({state.state or '?'})"
             return excess
-        drawing = self._is_heating(state)
+        if not self._is_heating(state):
+            # Op temperatuur: niets af te schakelen. Uitzetten zou het eigen
+            # tijdschema van de thermostaat onderbreken (een Tuya-thermostaat
+            # met enkel off/heat_cool is dan echt uit). Begint hij tijdens de
+            # piek te verwarmen, dan schakelt de volgende cyclus hem af.
+            ctx.last_skip_reason = "verwarmt niet (op temperatuur) — eigen schema blijft lopen"
+            return excess
         if self.entity_id not in snapshots:
             snapshots[self.entity_id] = DeviceSnapshot(
                 entity_id=self.entity_id, original_state=state.state,
@@ -718,13 +739,9 @@ class ClimateDevice(BaseCascadeDevice):
             snapshots.pop(self.entity_id, None)
             return excess
         _LOGGER.info(
-            "Peak Guard: → thermostaat '%s' UITgeschakeld (piekbeperking, %s, overschot was %.0f W)",
-            self.name, f"-{self.power_watts} W" if drawing else "was niet aan het verwarmen",
-            excess,
+            "Peak Guard: → thermostaat '%s' UITgeschakeld (piekbeperking, -%d W, overschot was %.0f W)",
+            self.name, self.power_watts, excess,
         )
-        if not drawing:
-            # Op temperatuur: uitschakelen voorkomt enkel dat hij in de piek begint.
-            return excess
         ctx.peak_tracker.record_pending_avoid(
             device_id=self.id, device_name=self.name,
             nominal_kw=self.power_watts / 1000.0, ts=ctx.now,
@@ -789,7 +806,7 @@ class ClimateDevice(BaseCascadeDevice):
             original_mode = snapshot.original_state or "off"
             if original_mode in ("unavailable", "unknown"):
                 original_mode = "off"
-            if original_mode != "off" and snapshot.original_temp is not None:
+            if original_mode != "off" and self._setpoint_still_ours(state, snapshot):
                 data = {"temperature": snapshot.original_temp}
                 if state.state != original_mode:
                     data["hvac_mode"] = original_mode

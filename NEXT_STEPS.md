@@ -176,6 +176,9 @@ v1.9.3 released and installed on HA 2026-10-24 12:00 CEST; monitoring running.
 | T4 | Heater added: peak cascade priority 3 (last), inject cascade priority 1 (24 °C), 1800 W | ✅ |
 | T6 | Tuya "Smart Plug" (power/voltage sensors) offline in the Tuya cloud — user to check | ⏳ user |
 | T5 | Solar savings for a thermostat count full power while it idles at temperature (D4) | ⏳ |
+| T7 | v1.9.6: idle thermostat not shed (kept its firmware schedule running); peak restore sends only the mode, setpoint only when still `inject_temp` | ✅ 2026-11-08 |
+| T8 | Why the 2026-11-07 17:59 shed was never restored is unexplained (no snapshot left, heater stayed off; only WARNING logs) — watch after v1.9.6 | ⏳ |
+| T9 | Solar `set_temperature` 24 °C may still flip the Tuya program into manual mode (no program-mode entity exposed) | ⏳ user |
 
 ## How to resume
 
