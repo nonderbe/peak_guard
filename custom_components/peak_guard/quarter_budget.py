@@ -27,6 +27,7 @@ from .const import (
     PEAK_ALLOWANCE_CAP_FACTOR,
     PEAK_AVG_MAX_WINDOW_S,
     PEAK_AVG_MIN_WINDOW_S,
+    PEAK_ENERGY_MAX_STALE_S,
     QUARTER_SECONDS,
 )
 
@@ -89,6 +90,45 @@ class PowerAverager:
                 break
         self._samples.append((ts, energy_kwh))
         return avg
+
+
+class PowerHistory:
+    """Verbruik per cyclus, om de energie sinds een oude meterstand te schatten."""
+
+    def __init__(self) -> None:
+        self._samples: deque = deque(maxlen=64)
+
+    def add(self, ts: datetime, power_w: float) -> None:
+        while self._samples and (ts - self._samples[0][0]).total_seconds() > PEAK_ENERGY_MAX_STALE_S + 120:
+            self._samples.popleft()
+        if self._samples and self._samples[-1][0] == ts:
+            self._samples[-1] = (ts, power_w)
+        else:
+            self._samples.append((ts, power_w))
+
+    def energy_kwh_since(self, since: datetime, now: datetime) -> float:
+        """
+        Energie (kWh) tussen since en now. Elk gemeten vermogen geldt tot de
+        volgende meting; vóór de eerste meting na since geldt de laatste
+        ervoor (of anders de eerste erna).
+        """
+        if not self._samples or now <= since:
+            return 0.0
+        pts = list(self._samples)
+        # Vermogen op 'since'.
+        p_prev = pts[0][1]
+        for ts, p in pts:
+            if ts <= since:
+                p_prev = p
+        t_prev = since
+        total_ws = 0.0
+        for ts, p in pts:
+            if ts <= since or ts > now:
+                continue
+            total_ws += p_prev * (ts - t_prev).total_seconds()
+            t_prev, p_prev = ts, p
+        total_ws += p_prev * (now - t_prev).total_seconds()
+        return max(0.0, total_ws) / 3600.0 / 1000.0
 
 
 def make_budget(

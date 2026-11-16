@@ -236,6 +236,9 @@ async def async_setup_entry(
     restore_peak_tracker(
         peak_tracker, saved_data, peak_state, current_year, current_month
     )
+    # Herstelde afschakelingen zonder piek-snapshot waren al voltooid: vóór
+    # de eerste sensorupdate (complete_expired) laten vallen.
+    controller.prune_restored_measurements()
 
     # Laad persistente jaarbesparingen — solar
     solar_savings_store = Store(hass, STORAGE_VERSION_SOLAR_SAVINGS, STORAGE_KEY_SOLAR_SAVINGS)

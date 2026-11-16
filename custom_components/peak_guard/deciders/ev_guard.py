@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 import math
 from collections import deque
 from datetime import datetime, timedelta, timezone
@@ -66,6 +67,10 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 
+# Een apparaat dat elke cyclus een onverwachte fout geeft: stacktrace en
+# paneelwaarschuwing hoogstens zo vaak.
+DEVICE_ERROR_REPORT_S = 900
+
 # Weigeringen van een turn_on die bij herhaling hetzelfde antwoord geven
 # (Tesla: batterij vol / kabel niet ingeplugd) — niet opnieuw proberen.
 EV_TURN_ON_FINAL_REFUSALS = ("unsuccessful: complete", "unsuccessful: disconnected")
@@ -97,6 +102,8 @@ class EVGuard:
         # device.id, zodat alle kopieën (piek/injectie/schema) het delen; een
         # geslaagde turn_off van die schakelaar wist het (_svc).
         self._charging_confirmed: Dict[str, tuple] = {}
+        # Sleutel → laatste melding van een onverwachte apparaatfout.
+        self._reported_errors: Dict[str, datetime] = {}
         self._rate_limiter = EVRateLimiter()
         self._recent_warnings: deque = deque(maxlen=100)
         # Wordt gezet door apply_action; BaseDecider leest dit na de aanroep.
@@ -415,6 +422,27 @@ class EVGuard:
                 "ts": datetime.now(timezone.utc).isoformat(),
                 "message": str(msg),
             })
+
+    def report_device_error(self, key: str, log_msg: str, gui_msg: str) -> None:
+        """
+        Onverwachte fout van één apparaat (in een except-blok aanroepen).
+        Volledige stacktrace en GUI-waarschuwing hoogstens eens per
+        DEVICE_ERROR_REPORT_S per sleutel; tussendoor één regel op debug,
+        zodat een apparaat dat elke cyclus faalt de log en het paneel niet
+        overspoelt.
+        """
+        now = datetime.now(timezone.utc)
+        last = self._reported_errors.get(key)
+        if last is not None and (now - last).total_seconds() < DEVICE_ERROR_REPORT_S:
+            exc = sys.exc_info()[1]
+            _LOGGER.debug(
+                "%s (herhaling, stacktrace onderdrukt): %s: %s",
+                log_msg, type(exc).__name__ if exc else "-", exc,
+            )
+            return
+        self._reported_errors[key] = now
+        _LOGGER.exception("%s", log_msg)
+        self.add_warning(gui_msg)
 
     def add_warning(self, message: str) -> None:
         """Sla een waarschuwing op in de GUI-buffer (zonder opnieuw te loggen)."""
@@ -1374,6 +1402,11 @@ class EVGuard:
             guard.turned_on_at is not None
             and (now - guard.turned_on_at).total_seconds() < SCHEDULE_START_CONFIRM_S
         )
+        if guard.last_switch_state is False and guard.turned_off_by_pg:
+            # Door Peak Guard gestopt en niet herstart: de stroom verlagen op
+            # een wagen die stilstaat is een nutteloze API-call (een Tesla
+            # meldt na turn_off nog even 'charging').
+            return False
         charging = self.is_charging(device)
         if not charging and not self._charge_state(device):
             # Geen laadstatus en een schakelaar zonder toestand (Tesla zonder
@@ -1872,6 +1905,13 @@ class EVGuard:
             guard.turned_off_by_pg and guard.turned_off_at is not None
             and (now - guard.turned_off_at).total_seconds() < PEAK_RESTART_CONFIRM_S
         )
+        if guard.last_switch_state is False and not charge_state and not just_stopped:
+            _sw = self.hass.states.get(sw_entity)
+            if _sw is not None and _sw.state == "on":
+                # Zonder laadstatus is een echte 'on'-schakelaar het enige
+                # signaal: iemand zette hem terug aan (het piek-snapshot kan
+                # verdwenen zijn zonder herstel, bv. manuele bediening).
+                guard.last_switch_state = None
         if guard.last_switch_state is False and (
             just_stopped or not self.is_charging(device)
         ):

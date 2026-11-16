@@ -23,6 +23,8 @@ from ..const import (
     DEFAULT_BUFFER_WATTS,
     PEAK_RESTART_CONFIRM_S,
     PEAK_SETTLE_S,
+    PEAK_ENERGY_MAX_STALE_S,
+    PEAK_ENERGY_STALE_S,
     PEAK_SWITCH_MIN_OFF_S,
 )
 from ..models import (
@@ -33,7 +35,7 @@ from ..models import (
     str_to_ts,
     ts_to_str,
 )
-from ..quarter_budget import PeakBudget, PowerAverager, make_budget
+from ..quarter_budget import PeakBudget, PowerAverager, PowerHistory, make_budget
 from ..utils import effective_peak_w
 from .base import BaseDecider, read_energy_kwh, read_power_w, restore_need_w
 
@@ -89,6 +91,11 @@ class PeakDecider(BaseDecider):
         # het lopende, volledig gemeten kwartier, of None.
         self._baseline_fn: Optional[Callable[[], Optional[Tuple[datetime, float]]]] = None
         self._averager = PowerAverager()
+        self._power_history = PowerHistory()
+        self._inject_snapshots: Optional[Dict[str, DeviceSnapshot]] = None
+        # Snapshots gewijzigd buiten een async pad (take_over_from_solar):
+        # bewaren bij de volgende check_restore.
+        self._snapshots_dirty = False
         self._budget_cache: Optional[Tuple[datetime, float, PeakBudget]] = None
         # Laatste afschakeling door de cascade (PEAK_SETTLE_S).
         self._last_shed_at: Optional[datetime] = None
@@ -100,6 +107,64 @@ class PeakDecider(BaseDecider):
 
     def set_solar_owner_fn(self, fn: Optional[Callable[[BaseCascadeDevice], bool]]) -> None:
         self._solar_owner_fn = fn
+
+    def set_inject_snapshots(self, snapshots: Optional[Dict[str, DeviceSnapshot]]) -> None:
+        """De inject-snapshots (zelfde dict als de InjectionDecider), voor solar_started."""
+        self._inject_snapshots = snapshots
+
+    def note_consumption(self, now: datetime, consumption: Optional[float]) -> None:
+        """Verbruik van elke cyclus, voor de schatting bij een trage energiesensor.
+        Een afnameregister daalt niet: injectie telt als 0."""
+        if consumption is not None:
+            self._power_history.add(now, max(0.0, consumption))
+
+    def clear_power_history(self) -> None:
+        self._power_history = PowerHistory()
+
+    def _solar_may_act(self, device) -> bool:
+        return self._solar_owner_fn is None or self._solar_owner_fn(device)
+
+    def _mark_solar_started(self) -> None:
+        """Markeer piek-snapshots van EV's die de solar-cascade had gestart."""
+        inject = self._inject_snapshots
+        if not inject:
+            return
+        for device in self._cascade:
+            if getattr(device, "action_type", None) != ACTION_EV_CHARGER:
+                continue
+            peak_snap = self._snapshots.get(device.entity_id)
+            inject_snap = inject.get(device.entity_id)
+            if (
+                peak_snap is not None and not getattr(peak_snap, "solar_started", True)
+                and inject_snap is not None
+                and inject_snap.original_state in ("off", "unavailable", "unknown")
+                and self._solar_may_act(device)
+            ):
+                peak_snap.solar_started = True
+                self._snapshots_dirty = True
+
+    def _release_solar_started(self) -> bool:
+        """
+        Een door solar gestarte EV waarvan de solar-cascade intussen klaar is
+        (inject-snapshot weg: overschot voorbij, gestopt en opgeruimd): het
+        piekherstel herstart hem niet — de zon is weg, hij zou van het net
+        laden. True als er iets wegviel.
+        """
+        inject = self._inject_snapshots if self._inject_snapshots is not None else {}
+        changed = False
+        for device in self._cascade:
+            snap = self._snapshots.get(device.entity_id)
+            if snap is None or not getattr(snap, "solar_started", False) or device.entity_id in inject:
+                continue
+            del self._snapshots[device.entity_id]
+            self._ev_restarts.pop(device.entity_id, None)
+            self.peak_tracker.discard_pending(device.id)
+            changed = True
+            _LOGGER.info(
+                "Peak Guard [PIEK]: '%s' was door de solar-cascade gestart en die is klaar — "
+                "na de piek niet herstarten", device.name,
+            )
+        return changed
 
     # ------------------------------------------------------------------ #
     #  Runtime-toestand (persistentie) en bevestigings-hooks              #
@@ -186,8 +251,21 @@ class PeakDecider(BaseDecider):
         cached = self._budget_cache
         if cached is not None and cached[0] == now and cached[1] == consumption:
             return cached[2]
-        energy = read_energy_kwh(self.hass, self.config.get(CONF_ENERGY_SENSOR))
-        avg_w = self._averager.add(now, energy)
+        energy_entity = self.config.get(CONF_ENERGY_SENSOR)
+        energy = read_energy_kwh(self.hass, energy_entity)
+        reading_ts = self._energy_reading_ts(energy_entity)
+        age_s = (now - reading_ts).total_seconds() if reading_ts is not None else 0.0
+        if energy is not None and age_s > PEAK_ENERGY_STALE_S:
+            # Trage energiesensor: zijn stand mist het verbruik sinds de
+            # laatste update, het budget zou te ruim lijken (bug 6). Het
+            # minuutgemiddelde uit die standen is dan ook te laag.
+            avg_w = None
+            if age_s > PEAK_ENERGY_MAX_STALE_S:
+                energy = None       # te oud om op te schatten: momentane regel
+            else:
+                energy += self._power_history.energy_kwh_since(reading_ts, now)
+        else:
+            avg_w = self._averager.add(now, energy)
         baseline = self._baseline_fn() if self._baseline_fn is not None else None
         q_start, so_far = None, None
         if baseline is not None and energy is not None:
@@ -196,6 +274,17 @@ class PeakDecider(BaseDecider):
         budget = make_budget(peak - buffer, consumption, now, avg_w, q_start, so_far)
         self._budget_cache = (now, consumption, budget)
         return budget
+
+    def _energy_reading_ts(self, entity_id: Optional[str]) -> Optional[datetime]:
+        """Tijdstip van de laatste melding van de energiesensor (ook zonder
+        nieuwe waarde: last_reported), of None als onbekend."""
+        if not entity_id:
+            return None
+        st = self.hass.states.get(entity_id)
+        if st is None:
+            return None
+        ts = getattr(st, "last_reported", None) or getattr(st, "last_updated", None)
+        return ts if isinstance(ts, datetime) and ts.tzinfo is not None else None
 
     # ------------------------------------------------------------------ #
     #  Publieke interface                                                  #
@@ -278,9 +367,20 @@ class PeakDecider(BaseDecider):
             now = datetime.now(timezone.utc)
         self._prune_restored_at(now)
         if not self._snapshots:
+            if self._snapshots_dirty:
+                self._snapshots_dirty = False
+                await self._save_fn()
             return
         await self._poll_acks(self._cascade, self._snapshots, "peak", now)
         forced = await self._restore_max_off(now)
+        # Vóór de headroom-check: een vrijgegeven EV hoort geen 'blijft
+        # afgeschakeld' te tonen. Ook een nog niet bewaarde solar_started-
+        # markering of overname (take_over_from_solar) wordt hier bewaard.
+        if self._release_solar_started():
+            forced = True
+        if self._snapshots_dirty:
+            self._snapshots_dirty = False
+            forced = True
         if not self._snapshots:
             if forced:
                 await self._save_fn()
@@ -344,6 +444,16 @@ class PeakDecider(BaseDecider):
         any_restored = forced
         for device, snapshot in snapshots_to_restore:
             is_ev = getattr(device, "action_type", None) == ACTION_EV_CHARGER
+            if is_ev and getattr(snapshot, "solar_started", False):
+                # Verlaagd, en de solar-cascade (die hem startte) stuurt hem
+                # nog: geen stroomverhoging door het piekherstel, anders
+                # verhoogt die en verlaagt de solar-cascade om beurten.
+                self.ev_guard.set_hold(
+                    device.id, "peak_solar_handover",
+                    "Gestart door de solar-cascade; die beslist over de laadstroom en "
+                    "stopt hem na het overschot — het piekherstel verhoogt niet.",
+                )
+                continue
             if is_ev:
                 ev_off = self.ev_guard.peak_is_off(device)
                 if (
@@ -487,6 +597,19 @@ class PeakDecider(BaseDecider):
             inject_snap = inject_snapshots.get(device.entity_id)
             if peak_snap is None or inject_snap is None:
                 continue
+            if getattr(peak_snap, "solar_started", False):
+                # De solar-cascade had hem gestart: zijn snapshot ('uit' vóór
+                # het overschot) blijft gelden, niet de 'aan' van de piek —
+                # anders laadt hij na het overschot door van het net.
+                del self._snapshots[device.entity_id]
+                self._snapshots_dirty = True
+                self._ev_restarts.pop(device.entity_id, None)
+                self.peak_tracker.discard_pending(device.id)
+                _LOGGER.info(
+                    "Peak Guard [PIEK]: '%s' terug naar de solar-cascade die hem startte — "
+                    "piekherstel afgesloten", device.name,
+                )
+                continue
             # Ook voor een schakelaar of thermostaat in beide cascades: anders
             # zet het piekherstel tijdens het overschot de oude instelling
             # terug, en zet het solar-herstel daarna de toestand van tijdens
@@ -533,12 +656,15 @@ class PeakDecider(BaseDecider):
         """
         if now is None:
             now = datetime.now(timezone.utc)
+        self._inject_snapshots = inject_snapshots
+        self._mark_solar_started()
         for device in self._cascade:
-            if getattr(device, "action_type", None) == ACTION_EV_CHARGER:
-                continue
             peak_snap = self._snapshots.get(device.entity_id)
             inject_snap = inject_snapshots.get(device.entity_id)
             if peak_snap is None or inject_snap is None:
+                continue
+            if getattr(device, "action_type", None) == ACTION_EV_CHARGER:
+                self._take_over_ev_from_solar(device, peak_snap, inject_snap)
                 continue
             self._snapshots[device.entity_id] = replace(
                 peak_snap,
@@ -555,6 +681,40 @@ class PeakDecider(BaseDecider):
                 "Peak Guard [PIEK]: '%s' overgenomen van de solar-cascade — na de piek "
                 "terug naar %s", device.name, inject_snap.original_state,
             )
+
+    def _take_over_ev_from_solar(
+        self, device, peak_snap: DeviceSnapshot, inject_snap: DeviceSnapshot,
+    ) -> None:
+        """
+        De piek stopte een EV die de solar-cascade had gestart (laadde niet
+        vóór het overschot). Het piek-herstel mag hem dan niet herstarten —
+        de zon kan intussen weg zijn, hij zou van het net laden. Het
+        piek-snapshot vervalt; het inject-snapshot blijft, zodat het solar-
+        herstel de SoC-limiet terugzet en de meting afsluit, en de solar-
+        cascade hem bij nieuw overschot zelf herstart. Enkel verlaagd (laadt
+        nog): niets doen, de solar-cascade blijft eigenaar van de lading.
+        """
+        if not peak_snap.solar_started:
+            return
+        if peak_snap.pending or not self.ev_guard.peak_is_off(device):
+            return
+        del self._snapshots[device.entity_id]
+        self._snapshots_dirty = True
+        # Na de piek wordt niets herstart: de stop vermeed ook niets.
+        self.peak_tracker.discard_pending(device.id)
+        _LOGGER.info(
+            "Peak Guard [PIEK]: '%s' was door de solar-cascade gestart — "
+            "na de piek niet herstarten (de solar-cascade beslist)", device.name,
+        )
+
+    def prune_restored_measurements(self) -> None:
+        """Na het herstel van de tracker bij de start (sensor.py); de
+        piek-snapshots zijn dan al geladen (controller.async_load). Zie
+        PeakAvoidTracker.prune_restored_pendings."""
+        fn = getattr(self.peak_tracker, "prune_restored_pendings", None)
+        if fn is None:
+            return
+        fn({d.id for d in self._cascade if d.entity_id in self._snapshots})
 
     def _prune_restored_at(self, now: datetime) -> None:
         longest = max(

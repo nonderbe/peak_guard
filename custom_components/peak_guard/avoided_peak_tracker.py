@@ -125,6 +125,8 @@ class PeakAvoidTracker:
 
     def __init__(self) -> None:
         self._pending: Dict[str, PendingAvoid] = {}
+        # Uit de maandstaat hersteld; zie prune_restored_pendings.
+        self._restored_pending_ids: set = set()
         self._active:  Dict[str, ActivePeakMeasurement] = {}
 
         # Netto verschoven vermogen (kW) per apparaat per kwartierstart:
@@ -490,6 +492,7 @@ class PeakAvoidTracker:
             except (KeyError, TypeError, ValueError):
                 continue
             self._pending[p.device_id] = p
+            self._restored_pending_ids.add(p.device_id)
         for item in data.get("active") or []:
             try:
                 a = ActivePeakMeasurement(
@@ -501,6 +504,25 @@ class PeakAvoidTracker:
             except (KeyError, TypeError, ValueError):
                 continue
             self._active[a.device_id] = a
+
+    def prune_restored_pendings(self, shed_device_ids) -> None:
+        """
+        Eenmalig na de herstart: een herstelde afschakeling van een apparaat
+        dat geen piek-snapshot meer heeft, was al voltooid (de maandstaat
+        wordt pas op de minuut bewaard, een herstart vlak na het herstel
+        brengt ze terug) — anders boekt complete_expired een spookuitstel.
+        """
+        if not self._restored_pending_ids:
+            return
+        for device_id in self._restored_pending_ids:
+            if device_id not in shed_device_ids and device_id in self._pending:
+                _LOGGER.info(
+                    "PeakAvoidTracker: herstelde afschakeling van '%s' vervalt — "
+                    "geen piek-snapshot meer (al hersteld vóór de herstart)",
+                    self._pending[device_id].device_name,
+                )
+                del self._pending[device_id]
+        self._restored_pending_ids = set()
 
     def measurements_fingerprint(self) -> tuple:
         return (

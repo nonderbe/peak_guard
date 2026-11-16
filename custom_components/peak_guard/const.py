@@ -132,6 +132,11 @@ PEAK_ALLOWANCE_CAP_FACTOR: float = 1.5
 # Vermogensgemiddelde uit de energiesensor over minstens zo veel seconden.
 PEAK_AVG_MIN_WINDOW_S: float = 45.0
 PEAK_AVG_MAX_WINDOW_S: float = 300.0
+# Energiesensor die traag bijwerkt: ouder dan PEAK_ENERGY_STALE_S wordt de
+# energie sinds die stand geschat uit het verbruik per cyclus; ouder dan
+# PEAK_ENERGY_MAX_STALE_S valt de piekregeling terug op de momentane regel.
+PEAK_ENERGY_STALE_S: float = 30.0
+PEAK_ENERGY_MAX_STALE_S: float = 300.0
 # Na een afschakeling door de piek-cascade zo lang niets bijkomends afschakelen:
 # een wake-up direct na de eigen turn_off leest nog het oude verbruik.
 PEAK_SETTLE_S: float = 20.0

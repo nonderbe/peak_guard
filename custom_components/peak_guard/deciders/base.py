@@ -234,12 +234,11 @@ class BaseDecider:
             try:
                 remaining = await device.apply(remaining, snapshots, ctx)
             except Exception:  # noqa: BLE001 — één apparaat mag de cascade niet stoppen
-                _LOGGER.exception(
-                    "Peak Guard [%s cascade]: onverwachte fout bij '%s' — overgeslagen, "
-                    "volgende apparaat", label, device.name,
-                )
-                self.ev_guard.add_warning(
-                    f"Onverwachte fout bij '{device.name}' — overgeslagen (zie HA-log)"
+                self.ev_guard.report_device_error(
+                    f"apply:{label}:{device.id}",
+                    f"Peak Guard [{label} cascade]: onverwachte fout bij '{device.name}' "
+                    "— overgeslagen, volgende apparaat",
+                    f"Onverwachte fout bij '{device.name}' — overgeslagen (zie HA-log)",
                 )
                 remaining = before
             handled = before - remaining
@@ -421,11 +420,10 @@ class BaseDecider:
         try:
             return await device.restore(snapshot, ctx)
         except Exception:  # noqa: BLE001 — één apparaat mag het herstel niet stoppen
-            _LOGGER.exception(
-                "Peak Guard: onverwachte fout bij herstel van '%s' — volgende cyclus opnieuw",
-                device.name,
-            )
-            self.ev_guard.add_warning(
-                f"Onverwachte fout bij herstel van '{device.name}' (zie HA-log)"
+            self.ev_guard.report_device_error(
+                f"restore:{device.id}",
+                f"Peak Guard: onverwachte fout bij herstel van '{device.name}' "
+                "— volgende cyclus opnieuw",
+                f"Onverwachte fout bij herstel van '{device.name}' (zie HA-log)",
             )
             return False

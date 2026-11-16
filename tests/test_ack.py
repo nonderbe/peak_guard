@@ -936,3 +936,175 @@ class TestStaleChargeState:
         assert skip is not None and "laadt al" in skip
         assert not stale_hass.services.has_call("set_value")
         assert g.get_guard("ev").last_switch_state is True
+
+
+# ═══════════════════════════════════════════════════════════════════════════ #
+#  v1.9.8: bug 7 — door solar gestarte EV niet herstarten na een piek         #
+# ═══════════════════════════════════════════════════════════════════════════ #
+
+class TestSolarStartedEVAfterPeak:
+    def _setup(self, stale_hass, stopped: bool):
+        g = EVGuard(hass=stale_hass, config={}, iteration_actions=[])
+        dev = _tesla()
+        guard = g.get_guard("ev")
+        if stopped:
+            stale_hass.states.set("sensor.tesla_opladen", "stopped")
+            guard.last_switch_state, guard.turned_off_by_pg, guard.turned_off_at = False, True, T0
+        peak_snaps = {"switch.tesla_charge": DeviceSnapshot(
+            entity_id="switch.tesla_charge", original_state="on", original_current=16.0)}
+        inject_snaps = {"switch.tesla_charge": DeviceSnapshot(
+            entity_id="switch.tesla_charge", original_state="off", original_current=16.0,
+            original_soc=80.0)}
+        tracker = MockPeakTracker()
+        peak = _peak(stale_hass, g, [dev], peak_snaps, tracker)
+        return peak, peak_snaps, inject_snaps, tracker
+
+    async def test_peak_stopped_solar_ev_is_not_restarted(self, stale_hass):
+        stale_hass.states.set(PEAK_SENSOR, "5000")
+        peak, peak_snaps, inject_snaps, tracker = self._setup(stale_hass, stopped=True)
+        peak.take_over_from_solar(inject_snaps, _t(60))
+        assert peak_snaps == {}, "piek-herstel mag hem niet herstarten"
+        assert "switch.tesla_charge" in inject_snaps, "solar-herstel ruimt zelf op"
+        assert "ev" in tracker.discarded
+        await peak.check_restore(300.0, _t(900))
+        assert not stale_hass.services.has_call("turn_on")
+
+    async def test_reduced_solar_ev_keeps_both_snapshots(self, stale_hass):
+        peak, peak_snaps, inject_snaps, _ = self._setup(stale_hass, stopped=False)
+        peak.take_over_from_solar(inject_snaps, _t(60))
+        assert "switch.tesla_charge" in peak_snaps
+        assert "switch.tesla_charge" in inject_snaps
+
+
+class TestNoChargeStateCharger:
+    async def test_switch_back_on_is_shed_again(self, ev_hass):
+        """L1: lader zonder laadstatus, door PG gestopt, snapshot zonder herstel
+        verdwenen, schakelaar weer 'on' → de piek mag hem opnieuw afschakelen."""
+        ev_hass.states.set("switch.tesla_charge", "on")
+        g = EVGuard(hass=ev_hass, config={}, iteration_actions=[])
+        guard = g.get_guard("ev")
+        guard.last_switch_state, guard.turned_off_by_pg = False, True
+        guard.turned_off_at = T0 - timedelta(hours=1)
+        left = await g.apply_action(_ev(), 5000.0, {}, "peak", MockPeakTracker(),
+                                    MockSolarTracker(), now=T0)
+        assert left < 5000.0
+        assert ev_hass.services.has_call("turn_off") or ev_hass.services.has_call("set_value")
+
+
+class TestRestoredPendingPrune:
+    def test_restored_pending_without_snapshot_is_dropped(self):
+        """L2: herstart vlak na een herstel brengt een al voltooide afschakeling terug."""
+        t = PeakAvoidTracker()
+        item = {"device_id": "washer", "device_name": "Wasmachine", "nominal_kw": 2.0,
+                "avoid_ts": T0.isoformat(), "deferred": False}
+        item2 = dict(item, device_id="boiler", device_name="Boiler")
+        t.measurements_from_dict({"pending": [item, item2], "active": []})
+        t.prune_restored_pendings({"boiler"})
+        assert set(t._pending) == {"boiler"}
+        # Daarna raakt het nieuwe afschakelingen niet meer.
+        t.prune_restored_pendings(set())
+        assert set(t._pending) == {"boiler"}
+
+    async def test_peak_decider_prunes_via_its_snapshots(self, hass, ev_guard):
+        tracker = PeakAvoidTracker()
+        item = {"device_id": "washer", "device_name": "Wasmachine", "nominal_kw": 2.0,
+                "avoid_ts": T0.isoformat(), "deferred": False}
+        tracker.measurements_from_dict({"pending": [item], "active": []})
+        snaps = {WASHER: DeviceSnapshot(entity_id=WASHER, original_state="on")}
+        peak = _peak(hass, ev_guard, [_washer()], snaps, tracker)
+        peak.prune_restored_measurements()
+        assert "washer" in tracker._pending
+
+
+class TestRepeatedDeviceError:
+    async def test_failing_device_warns_once(self, hass, ev_guard):
+        """L3: een apparaat dat elke cyclus faalt, geeft één paneelwaarschuwing."""
+        class Broken(SwitchOffDevice):
+            async def apply(self, excess, snapshots, ctx):
+                raise RuntimeError("cloud stuk")
+
+        broken = Broken(id="kapot", name="Kapot", entity_id="switch.kapot", priority=1,
+                        action_type="switch_off", power_watts=2000)
+        peak = _peak(hass, ev_guard, [broken], {})
+        for i in range(3):
+            await peak.check(6500.0, _t(60 * i))
+        msgs = [w["message"] for w in ev_guard.recent_warnings if "Kapot" in w["message"]]
+        assert len(msgs) == 1
+
+
+class TestSolarStartedReducedEV:
+    """Tweede review v1.9.8: de piek verlaagde (niet stopte) een door solar gestarte EV."""
+
+    def _setup(self, stale_hass, owner=True):
+        g = EVGuard(hass=stale_hass, config={}, iteration_actions=[])
+        stale_hass.states.set(PEAK_SENSOR, "5000")
+        stale_hass.states.set("number.tesla_charge_current", "11")
+        dev = _tesla()
+        peak_snaps = {"switch.tesla_charge": DeviceSnapshot(
+            entity_id="switch.tesla_charge", original_state="on", original_current=16.0)}
+        inject_snaps = {"switch.tesla_charge": DeviceSnapshot(
+            entity_id="switch.tesla_charge", original_state="off", original_current=16.0,
+            original_soc=80.0)}
+        tracker = MockPeakTracker()
+        peak = _peak(stale_hass, g, [dev], peak_snaps, tracker)
+        peak.set_solar_owner_fn(lambda d: owner)
+        peak.take_over_from_solar(inject_snaps, _t(60))
+        return peak, peak_snaps, inject_snaps, tracker
+
+    async def test_not_restarted_once_solar_is_done(self, stale_hass):
+        peak, peak_snaps, inject_snaps, tracker = self._setup(stale_hass)
+        assert peak_snaps["switch.tesla_charge"].solar_started
+        inject_snaps.clear()            # solar-herstel stopte hem na het overschot
+        stale_hass.states.set("sensor.tesla_opladen", "stopped")
+        await peak.check_restore(300.0, _t(900))
+        assert peak_snaps == {}
+        assert not stale_hass.services.has_call("turn_on")
+        assert not stale_hass.services.has_call("set_value")
+
+    async def test_no_current_raise_while_solar_steers(self, stale_hass):
+        peak, peak_snaps, inject_snaps, _ = self._setup(stale_hass)
+        await peak.check_restore(300.0, _t(900))
+        assert "switch.tesla_charge" in peak_snaps
+        assert not stale_hass.services.has_call("set_value")
+        assert peak.ev_guard.hold_for("ev")["code"] == "peak_solar_handover"
+
+    async def test_hand_over_keeps_solar_original_off(self, stale_hass):
+        peak, peak_snaps, inject_snaps, _ = self._setup(stale_hass)
+        peak.hand_over_to_solar(inject_snaps, _t(120))
+        assert peak_snaps == {}
+        assert inject_snaps["switch.tesla_charge"].original_state == "off"
+
+    async def test_solar_copy_in_manual_override_keeps_peak_restore(self, stale_hass):
+        """Kan de solar-cascade niet handelen, dan blijft het gewone piekherstel."""
+        peak, peak_snaps, _, _ = self._setup(stale_hass, owner=False)
+        assert not peak_snaps["switch.tesla_charge"].solar_started
+
+
+class TestThrottleOnPeakStoppedEV:
+    async def test_no_set_value_to_a_car_pg_just_stopped(self, stale_hass):
+        g = EVGuard(hass=stale_hass, config={}, iteration_actions=[])
+        guard = g.get_guard("ev")
+        guard.last_switch_state, guard.turned_off_by_pg, guard.turned_off_at = False, True, T0
+        assert await g.throttle_down_solar(_tesla(), consumption=2000.0, now=_t(30)) is False
+        assert stale_hass.services.calls == []
+
+
+class TestSolarStartedPersistence:
+    async def test_flag_is_saved_in_the_same_tick(self, stale_hass):
+        saves = []
+
+        async def save():
+            saves.append(1)
+
+        g = EVGuard(hass=stale_hass, config={}, iteration_actions=[])
+        stale_hass.states.set(PEAK_SENSOR, "5000")
+        peak_snaps = {"switch.tesla_charge": DeviceSnapshot(
+            entity_id="switch.tesla_charge", original_state="on", original_current=16.0)}
+        inject_snaps = {"switch.tesla_charge": DeviceSnapshot(
+            entity_id="switch.tesla_charge", original_state="off")}
+        peak = _peak(stale_hass, g, [_tesla()], peak_snaps)
+        peak._save_fn = save
+        peak.take_over_from_solar(inject_snaps, _t(60))
+        await peak.check_restore(9000.0, _t(60))      # geen headroom
+        assert peak_snaps["switch.tesla_charge"].solar_started
+        assert saves, "markering moet bewaard worden"

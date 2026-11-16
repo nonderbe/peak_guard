@@ -158,6 +158,10 @@ class DeviceSnapshot:
     off_since:        Optional[str] = None   # afschakeling bevestigd (piek)
     # Vermogen (W) op het moment van de ingreep: wat bij herstel terugkomt.
     shed_w:           Optional[float] = None
+    # EV (piek-snapshot): de solar-cascade had hem gestart (laadde niet vóór
+    # het overschot). Het piekherstel herstart hem dan niet; de solar-cascade
+    # beslist (v1.9.8).
+    solar_started:    bool = False
 
 
 def ts_to_str(ts: datetime) -> str:

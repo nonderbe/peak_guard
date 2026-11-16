@@ -165,8 +165,11 @@ class InjectionDecider(BaseDecider):
                 try:
                     throttled = await self.ev_guard.throttle_down_solar(device, consumption, now=now)
                 except Exception:  # noqa: BLE001
-                    _LOGGER.exception(
-                        "Peak Guard [SOLAR]: onverwachte fout bij verlagen van '%s'", device.name)
+                    self.ev_guard.report_device_error(
+                        f"throttle:{device.id}",
+                        f"Peak Guard [SOLAR]: onverwachte fout bij verlagen van '{device.name}'",
+                        f"Onverwachte fout bij verlagen van '{device.name}' (zie HA-log)",
+                    )
                     throttled = False
                 if throttled:
                     hold = self.ev_guard.hold_for(device.id) or {}

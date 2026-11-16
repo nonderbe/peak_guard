@@ -1,6 +1,6 @@
 # Peak Guard — Next Steps
 
-Updated: 2026-10-24.
+Updated: 2026-11-16 (v1.9.8).
 
 ## Status Legend
 - ✅ Done
@@ -190,11 +190,11 @@ v1.9.3 released and installed on HA 2026-10-24 12:00 CEST; monitoring running.
 
 | # | Item | Status |
 |---|------|--------|
-| B6 | Slow energy sensor delays peak shedding: when the energy reading is older than ~30 s, extrapolate energy-so-far with the power readings since it (PowerAverager samples); older than ~5 min → fall back to the instantaneous rule. Not affecting the owner's P1 meter | ⏳ |
-| B7 | Solar-started EV stopped by the peak is restarted from the grid by the peak restore: carry the inject snapshot's original `off` into the peak snapshot | ⏳ |
-| L1 | A charger without charge-state sensor that PG once stopped can stay "stopped" for `_apply_peak` (reset `last_switch_state` when a real switch reports `on`) | ⏳ |
-| L2 | Restored pending peak measurement can be stale after a restart within the save minute (drop pendings without peak snapshot) | ⏳ |
-| L3 | A device that raises every tick adds a GUI warning every tick (dedup) | ⏳ |
+| B6 | Slow energy sensor delays peak shedding: when the energy reading is older than ~30 s, extrapolate energy-so-far with the power readings since it (PowerAverager samples); older than ~5 min → fall back to the instantaneous rule. Not affecting the owner's P1 meter | ✅ (v1.9.8) |
+| B7 | Solar-started EV stopped by the peak is restarted from the grid by the peak restore: carry the inject snapshot's original `off` into the peak snapshot | ✅ (v1.9.8) |
+| L1 | A charger without charge-state sensor that PG once stopped can stay "stopped" for `_apply_peak` (reset `last_switch_state` when a real switch reports `on`) | ✅ (v1.9.8) |
+| L2 | Restored pending peak measurement can be stale after a restart within the save minute (drop pendings without peak snapshot) | ✅ (v1.9.8) |
+| L3 | A device that raises every tick adds a GUI warning every tick (dedup) | ✅ (v1.9.8) |
 | M1 | Watch the EV API log (`charge_state` per call) for `turn_on` sent while charging / refused with `is_charging` | ⏳ |
 
 ## How to resume

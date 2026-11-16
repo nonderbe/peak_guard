@@ -404,3 +404,67 @@ class TestDeferralBound:
         assert t.get_pending_ids() == []
         t.start_measurement_on_turnon("ev", "tesla", ts=_t(30))   # latere herstart: niets meer
         assert len(t.events) == 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════ #
+#  v1.9.8 bug 6: trage energiesensor                                          #
+# ═══════════════════════════════════════════════════════════════════════════ #
+
+from custom_components.peak_guard.quarter_budget import PowerHistory, quarter_allowance_w  # noqa: E402
+
+
+class TestPowerHistory:
+    def test_step_integration(self):
+        h = PowerHistory()
+        h.add(_t(46), 2000.0)
+        h.add(_t(47), 8000.0)
+        # 46:30 → 47:00 aan 2000 W, 47:00 → 49:00 aan 8000 W
+        assert h.energy_kwh_since(_t(46, 30), _t(49)) == pytest.approx(
+            (2000 * 30 + 8000 * 120) / 3.6e6)
+
+    def test_no_samples_is_zero(self):
+        assert PowerHistory().energy_kwh_since(_t(46), _t(49)) == 0.0
+
+
+class TestSlowEnergySensor:
+    def _decider(self, hass, ev_guard):
+        d = _budget_decider(hass, ev_guard, FakeDevice(), (_t(45), 1000.0))
+        return d
+
+    def test_stale_reading_is_extrapolated(self, hass, ev_guard):
+        """De meter meldde voor het laatst om 18:46 (nog niets verbruikt); het
+        verbruik sindsdien (8 kW) telt mee, anders lijkt het budget te ruim."""
+        d = self._decider(hass, ev_guard)
+        hass.states.set(ENERGY, "1000.0", reported=_t(46))
+        for m in (46, 47, 48, 49):
+            d.note_consumption(_t(m), 8000.0)
+        b = d._budget(8000.0, 4958.0, 100.0, _t(49))
+        assert b.on_budget and b.avg_w is None
+        limit = b.limit_w
+        assert b.allowed_w == pytest.approx(quarter_allowance_w(limit, 8000 * 180 / 3.6e6, 240))
+        assert b.allowed_w < quarter_allowance_w(limit, 0.0, 240)
+
+    def test_very_old_reading_falls_back_to_instantaneous(self, hass, ev_guard):
+        d = self._decider(hass, ev_guard)
+        hass.states.set(ENERGY, "1000.0", reported=_t(45))
+        b = d._budget(8000.0, 4958.0, 100.0, _t(51))
+        assert b.on_budget is False
+        assert b.allowed_w == b.limit_w
+
+    def test_fresh_reading_unchanged(self, hass, ev_guard):
+        d = self._decider(hass, ev_guard)
+        hass.states.set(ENERGY, "1000.2", reported=_t(49) - timedelta(seconds=5))
+        b = d._budget(5000.0, 4958.0, 100.0, _t(49))
+        assert b.on_budget
+        assert b.allowed_w == pytest.approx(quarter_allowance_w(b.limit_w, 0.2, 240))
+
+    def test_injection_counts_as_zero(self, hass, ev_guard):
+        """Een afnameregister daalt niet: injectie telt als 0 in de schatting."""
+        d = self._decider(hass, ev_guard)
+        hass.states.set(ENERGY, "1000.0", reported=_t(46))
+        d.note_consumption(_t(46), 3000.0)
+        for m in (47, 48):
+            d.note_consumption(_t(m), -1500.0)
+        d.note_consumption(_t(49), 200.0)
+        b = d._budget(200.0, 4958.0, 100.0, _t(49))
+        assert b.allowed_w == pytest.approx(quarter_allowance_w(b.limit_w, 3000 * 60 / 3.6e6, 240))

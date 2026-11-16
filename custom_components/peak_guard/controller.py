@@ -306,12 +306,19 @@ class PeakGuardController:
             lambda: None if self._simulation_consumption is not None else fn()
         )
 
+    def prune_restored_measurements(self) -> None:
+        """Na het herstel van de piek-tracker: zie PeakDecider.prune_restored_measurements."""
+        self._peak_decider.prune_restored_measurements()
+
     def set_simulation(self, consumption_w: Optional[float]) -> None:
         """Activeer of deactiveer de simulatiemodus.
 
         consumption_w=float → simuleer dat waarde (W) als verbruik; echte sensor wordt genegeerd.
         consumption_w=None  → terug naar echte sensor.
         """
+        if consumption_w != self._simulation_consumption:
+            # Gesimuleerd verbruik hoort niet in de schatting bij een trage energiesensor.
+            self._peak_decider.clear_power_history()
         self._simulation_consumption = consumption_w
         if consumption_w is None:
             _LOGGER.info("Peak Guard: simulatiemodus uitgeschakeld — echte sensor actief")

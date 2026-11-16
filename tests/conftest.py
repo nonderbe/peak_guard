@@ -174,22 +174,34 @@ class MockState:
         self.attributes = attributes or {}
         from datetime import timezone
         self.last_updated = datetime.now(timezone.utc)
+        self.last_reported = self.last_updated
 
 
 class MockStateRegistry:
     def __init__(self) -> None:
         self._states: dict[str, str] = {}
         self._attributes: dict[str, dict] = {}
+        self._reported: dict = {}
 
-    def set(self, entity_id: str, state_str: str, attributes: dict | None = None) -> None:
+    def set(self, entity_id: str, state_str: str, attributes: dict | None = None,
+            reported=None) -> None:
+        """reported: tijdstip van de laatste melding (last_reported/last_updated);
+        standaard 'nu' bij elke get()."""
         self._states[entity_id] = state_str
         self._attributes[entity_id] = attributes or {}
+        if reported is not None:
+            self._reported[entity_id] = reported
+        else:
+            self._reported.pop(entity_id, None)
 
     def get(self, entity_id: str):
         val = self._states.get(entity_id)
         if val is None:
             return None
-        return MockState(val, self._attributes.get(entity_id))
+        st = MockState(val, self._attributes.get(entity_id))
+        if entity_id in self._reported:
+            st.last_updated = st.last_reported = self._reported[entity_id]
+        return st
 
 
 class MockServiceRegistry:

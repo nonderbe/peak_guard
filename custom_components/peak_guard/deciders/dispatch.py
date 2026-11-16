@@ -32,6 +32,8 @@ async def run_tick(
     """
     # Verklaringen in de status-popup gelden voor deze iteratie.
     peak.ev_guard.begin_tick()
+    peak.set_inject_snapshots(injection.snapshots)
+    peak.note_consumption(now, consumption)
     if consumption is None:
         await peak.enforce_limits(now)
         await schedule.check(None, now)
