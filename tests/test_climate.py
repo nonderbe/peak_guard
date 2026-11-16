@@ -472,13 +472,11 @@ class TestPeakSetbackReview:
         assert hass.services.calls == []
         assert hass.states.get(ENTITY).attributes["temperature"] == 17.0
 
-    async def test_idle_without_hvac_action_is_skipped(self, hass, ev_guard):
-        """Daikin meldt geen hvac_action: kamer op temperatuur → geen API-oproepen."""
-        _set(hass, "heat", temp=21.0, room=21.5, action=None)
-        assert await self._ac().apply(2500.0, {}, _ctx(hass, ev_guard, "peak")) == 2500.0
-        _set(hass, "cool", temp=24.0, room=23.0, action=None)
-        assert await self._ac().apply(2500.0, {}, _ctx(hass, ev_guard, "peak")) == 2500.0
-        assert hass.services.calls == []
+    async def test_warm_room_reading_without_hvac_action_still_sets_back(self, hass, ev_guard):
+        """Daikin: sensor in het binnentoestel leest 25 °C bij doel 21 °C terwijl hij verwarmt."""
+        _set(hass, "heat", temp=21.0, room=25.0, action=None)
+        assert await self._ac().apply(2500.0, {}, _ctx(hass, ev_guard, "peak")) == pytest.approx(1700.0)
+        assert hass.services.calls[-1]["data"]["temperature"] == 19.0
 
     async def test_removed_setback_mid_peak_switches_off(self, hass, ev_guard):
         _set(hass, "heat", temp=19.0, room=18.0)

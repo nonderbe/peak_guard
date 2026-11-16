@@ -1187,14 +1187,10 @@ class ClimateDevice(BaseCascadeDevice):
         if sign is None:
             ctx.last_skip_reason = f"modus '{state.state}': richting van bijstellen onbekend"
             return excess
-        room = _float_attr(state, "current_temperature")
-        if action is None and room is not None and base_temp == target and (
-            (sign < 0 and room >= target) or (sign > 0 and room <= target)
-        ):
-            # Geen hvac_action (Daikin Onecta): op temperatuur → draait
-            # (nagenoeg) niet; een bijstelling zou enkel API-oproepen kosten.
-            ctx.last_skip_reason = f"op temperatuur ({room:.1f} °C, doel {target:.1f} °C)"
-            return excess
+        # Zonder hvac_action (Daikin Onecta) telt hij als draaiend: de
+        # kamertemperatuur komt van de sensor in het binnentoestel (bovenaan
+        # de muur) en ligt tijdens het verwarmen 3–4 °C boven de kamer
+        # (veldwaarneming 2026-11-16: 25 °C bij doel 21 °C, 4,4 kWh verbruikt).
         new_temp = self._setback_target(state, sign, base_temp)
         if new_temp is None or (sign < 0 and new_temp >= target) or (sign > 0 and new_temp <= target):
             ctx.last_skip_reason = "doeltemperatuur al aan de grens of al lager"
