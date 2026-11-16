@@ -238,6 +238,10 @@ class CascadeContext:
     warn: Callable
     now: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     last_skip_reason: str = ""
+    # Piek-cascade: de inject-snapshots (zelfde apparaat in beide cascades),
+    # zodat een thermostaat-bijstelling vertrekt van de instelling van vóór
+    # het overschot.
+    inject_snapshots: Optional[dict] = None
 
 
 # ──────────────────────────────────────────────────────────────────────────── #
@@ -901,6 +905,9 @@ def _migrate_flat_format(d: dict) -> dict:
 
 
 _CLIMATE_OFF_STATES = ("off", "unavailable", "unknown", "")
+# Tolerantie voor 'staat op de bijgestelde doeltemperatuur': thermostaten
+# ronden af (0,5 °C, soms 1 °C).
+_SETBACK_TOL = 0.5
 
 
 def _float_attr(state, name: str) -> Optional[float]:
@@ -974,9 +981,8 @@ class ClimateDevice(BaseCascadeDevice):
                 return -1 if room < target else 1
         return None
 
-    def _setback_target(self, state, sign: int) -> Optional[float]:
+    def _setback_target(self, state, sign: int, target: Optional[float]) -> Optional[float]:
         """Bijgestelde doeltemperatuur (binnen min/max, op de stapgrootte), of None."""
-        target = _float_attr(state, "temperature")
         if target is None or not self.peak_setback:
             return None
         step = _float_attr(state, "target_temp_step") or 0.5
@@ -1026,10 +1032,16 @@ class ClimateDevice(BaseCascadeDevice):
         """
         original = snapshot.original_temp
         target = _float_attr(state, "temperature")
-        ours = snapshot.set_temp if snapshot.set_temp is not None else self.inject_temp
-        if original is None or target is None or ours is None:
+        if original is None or target is None:
             return False
-        return abs(target - ours) < 0.01 and abs(target - original) >= 0.01
+        if snapshot.set_temp is not None:
+            return (
+                abs(target - snapshot.set_temp) <= _SETBACK_TOL
+                and abs(target - original) > _SETBACK_TOL / 2
+            )
+        if self.inject_temp is None:
+            return False
+        return abs(target - self.inject_temp) < 0.01 and abs(target - original) >= 0.01
 
     @staticmethod
     def _original_mode(snapshot: DeviceSnapshot) -> str:
@@ -1043,7 +1055,7 @@ class ClimateDevice(BaseCascadeDevice):
         if cascade_type == "peak":
             if snapshot.set_temp is not None:
                 target = _float_attr(state, "temperature")
-                return target is not None and abs(target - snapshot.set_temp) <= 0.25
+                return target is not None and abs(target - snapshot.set_temp) <= _SETBACK_TOL
             return state.state == "off"
         target = _float_attr(state, "temperature")
         return (
@@ -1056,8 +1068,14 @@ class ClimateDevice(BaseCascadeDevice):
         if snapshot.set_temp is not None and self._original_mode(snapshot) != "off":
             # Enkel de doeltemperatuur werd bijgesteld: terug = niet meer op
             # de bijgestelde waarde (de oude, of wat de gebruiker koos).
+            if state.state in ("unavailable", "unknown"):
+                return False
             target = _float_attr(state, "temperature")
-            return target is None or abs(target - snapshot.set_temp) > 0.25
+            if target is None:
+                return False
+            if snapshot.original_temp is not None and abs(target - snapshot.original_temp) <= 0.25:
+                return True
+            return abs(target - snapshot.set_temp) > _SETBACK_TOL
         return state.state == self._original_mode(snapshot)
 
     async def _call(self, ctx: CascadeContext, service: str, data: dict) -> None:
@@ -1086,6 +1104,10 @@ class ClimateDevice(BaseCascadeDevice):
             return excess
         if self.peak_setback:
             return await self._apply_setback(excess, snapshots, ctx, state)
+        stale = snapshots.get(self.entity_id)
+        if stale is not None and stale.set_temp is not None:
+            # peak_setback werd tijdens de piek uitgezet: nu uitschakelen.
+            stale.set_temp = None
         if not self._is_heating(state):
             # Op temperatuur: niets af te schakelen. Uitzetten zou het eigen
             # tijdschema van de thermostaat onderbreken (een Tuya-thermostaat
@@ -1128,13 +1150,35 @@ class ClimateDevice(BaseCascadeDevice):
         """Piek: doeltemperatuur bijstellen (airco, warmtepomp) i.p.v. uitschakelen."""
         existing = snapshots.get(self.entity_id)
         target = _float_attr(state, "temperature")
-        if (
-            existing is not None and existing.set_temp is not None
-            and target is not None and abs(target - existing.set_temp) <= 0.25
-        ):
-            # Al bijgesteld: nooit een tweede keer (anders telkens 2 °C verder).
-            ctx.last_skip_reason = f"al bijgesteld naar {existing.set_temp:.1f} °C"
+        if existing is not None and existing.set_temp is not None:
+            if target is not None and abs(target - existing.set_temp) <= _SETBACK_TOL:
+                # Al bijgesteld: nooit een tweede keer (anders telkens verder).
+                ctx.last_skip_reason = f"al bijgesteld naar {existing.set_temp:.1f} °C"
+                return excess
+            if existing.pending is None:
+                # Bevestigd, en daarna zette de gebruiker (of het eigen schema)
+                # een andere temperatuur: die blijft staan, ook na de piek.
+                ctx.last_skip_reason = (
+                    f"doeltemperatuur gewijzigd naar {target if target is not None else '?'} °C "
+                    "tijdens de piek — blijft staan"
+                )
+                return excess
+        if state.state in ("unavailable", "unknown") or target is None:
+            ctx.last_skip_reason = "doeltemperatuur onbekend"
             return excess
+        # Vertrekpunt: de instelling van vóór de ingreep — bij een herhaling
+        # (geen bevestiging) dezelfde waarde, en bij een thermostaat die de
+        # solar-cascade opwarmde de temperatuur van vóór het overschot.
+        base_temp = target
+        if existing is not None and existing.original_temp is not None:
+            base_temp = existing.original_temp
+        else:
+            inject_snap = (ctx.inject_snapshots or {}).get(self.entity_id)
+            if (
+                inject_snap is not None and inject_snap.original_temp is not None
+                and self._original_mode(inject_snap) != "off"
+            ):
+                base_temp = inject_snap.original_temp
         action = state.attributes.get("hvac_action")
         if action in ("idle", "off", "fan", "drying"):
             ctx.last_skip_reason = f"draait niet ({action}) — niets af te schakelen"
@@ -1143,9 +1187,17 @@ class ClimateDevice(BaseCascadeDevice):
         if sign is None:
             ctx.last_skip_reason = f"modus '{state.state}': richting van bijstellen onbekend"
             return excess
-        new_temp = self._setback_target(state, sign)
-        if new_temp is None:
-            ctx.last_skip_reason = "doeltemperatuur onbekend of al aan de grens"
+        room = _float_attr(state, "current_temperature")
+        if action is None and room is not None and base_temp == target and (
+            (sign < 0 and room >= target) or (sign > 0 and room <= target)
+        ):
+            # Geen hvac_action (Daikin Onecta): op temperatuur → draait
+            # (nagenoeg) niet; een bijstelling zou enkel API-oproepen kosten.
+            ctx.last_skip_reason = f"op temperatuur ({room:.1f} °C, doel {target:.1f} °C)"
+            return excess
+        new_temp = self._setback_target(state, sign, base_temp)
+        if new_temp is None or (sign < 0 and new_temp >= target) or (sign > 0 and new_temp <= target):
+            ctx.last_skip_reason = "doeltemperatuur al aan de grens of al lager"
             return excess
         if self.draws_nothing(ctx.hass):
             ctx.last_skip_reason = (
@@ -1157,7 +1209,7 @@ class ClimateDevice(BaseCascadeDevice):
         created = existing is None
         if created:
             snapshots[self.entity_id] = DeviceSnapshot(
-                entity_id=self.entity_id, original_state=state.state, original_temp=target,
+                entity_id=self.entity_id, original_state=state.state, original_temp=base_temp,
             )
         snapshot = snapshots[self.entity_id]
         previous_set = snapshot.set_temp
@@ -1241,6 +1293,15 @@ class ClimateDevice(BaseCascadeDevice):
         original_mode = self._original_mode(snapshot)
         try:
             sent = False
+            if (
+                snapshot.set_temp is not None and original_mode != "off"
+                and (state.state in ("unavailable", "unknown")
+                     or _float_attr(state, "temperature") is None)
+            ):
+                # Cloud even weg: snapshot houden en volgende cyclus opnieuw,
+                # anders blijft de bijstelling zonder eigenaar staan.
+                ctx.last_skip_reason = "niet bereikbaar — herstel volgende cyclus"
+                return False
             if snapshot.set_temp is not None and original_mode != "off":
                 # Bijgesteld (peak_setback): enkel de temperatuur terug, en
                 # alleen als ze nog op de bijgestelde waarde staat en de

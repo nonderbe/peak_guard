@@ -152,6 +152,9 @@ class BaseDecider:
             track_action=self._track_action,
             warn=self.ev_guard._warn,
             now=now,
+            inject_snapshots=(
+                getattr(self, "_inject_snapshots", None) if cascade_type == "peak" else None
+            ),
         )
 
     # ------------------------------------------------------------------ #

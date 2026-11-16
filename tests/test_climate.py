@@ -419,3 +419,94 @@ class TestPeakSetback:
         snap = DeviceSnapshot(entity_id=ENTITY, original_state="heat",
                               original_temp=21.0, set_temp=19.0)
         assert DeviceSnapshot(**asdict(snap)) == snap
+
+
+class TestPeakSetbackReview:
+    """Fable-review v1.9.9: randgevallen van peak_setback."""
+
+    def _ac(self, **kw):
+        kw.setdefault("inject_temp", None)
+        return _device(peak_setback=2, power_watts=800, **kw)
+
+    async def test_restore_while_unavailable_keeps_the_snapshot(self, hass, ev_guard):
+        hass.states.set(ENTITY, "unavailable", {})
+        snap = DeviceSnapshot(entity_id=ENTITY, original_state="heat",
+                              original_temp=21.0, set_temp=19.0)
+        ctx = _ctx(hass, ev_guard, "peak")
+        assert await self._ac().restore(snap, ctx) is False
+        assert hass.services.calls == []
+        assert self._ac().restored(hass.states.get(ENTITY), snap, "peak") is False
+
+    async def test_resend_after_noack_does_not_escalate(self, hass, ev_guard):
+        """Toestel rondt 19,5 af naar 20: geen bevestiging → hersturen met dezelfde waarde."""
+        hass.states.set(ENTITY, "heat", {"temperature": 21.0, "target_temp_step": 0.5})
+        hass.services.no_reflect.add(ENTITY)
+        dev = _device(peak_setback=1.5, power_watts=800, inject_temp=None)
+        snaps: dict = {}
+        await dev.apply(2500.0, snaps, _ctx(hass, ev_guard, "peak"))
+        assert hass.services.calls[-1]["data"]["temperature"] == 19.5
+        snaps[ENTITY].pending = "noack"
+        snaps[ENTITY].cmd_at = "2026-10-25T11:00:00+00:00"   # ruim na ACK_RESEND_S
+        hass.states.set(ENTITY, "heat", {"temperature": 21.0, "target_temp_step": 0.5})
+        await dev.apply(2500.0, snaps, _ctx(hass, ev_guard, "peak"))
+        assert hass.services.calls[-1]["data"]["temperature"] == 19.5
+        assert snaps[ENTITY].original_temp == 21.0
+
+    async def test_rounded_setpoint_counts_as_applied(self, hass, ev_guard):
+        dev = self._ac()
+        snap = DeviceSnapshot(ENTITY, "heat", original_temp=21.0, set_temp=19.5)
+        hass.states.set(ENTITY, "heat", {"temperature": 20.0})
+        assert dev.applied(hass.states.get(ENTITY), snap, "peak") is True
+
+    async def test_user_change_during_the_peak_is_left_alone(self, hass, ev_guard):
+        _set(hass, "heat", temp=21.0, room=20.0, action=None)
+        snaps: dict = {}
+        dev = self._ac()
+        await dev.apply(2500.0, snaps, _ctx(hass, ev_guard, "peak"))
+        _set(hass, "heat", temp=17.0, room=20.0, action=None)   # gebruiker
+        hass.services.calls.clear()
+        ctx = _ctx(hass, ev_guard, "peak")
+        assert await dev.apply(2500.0, snaps, ctx) == 2500.0
+        assert hass.services.calls == []
+        assert await dev.restore(snaps[ENTITY], ctx) is True
+        assert hass.services.calls == []
+        assert hass.states.get(ENTITY).attributes["temperature"] == 17.0
+
+    async def test_idle_without_hvac_action_is_skipped(self, hass, ev_guard):
+        """Daikin meldt geen hvac_action: kamer op temperatuur → geen API-oproepen."""
+        _set(hass, "heat", temp=21.0, room=21.5, action=None)
+        assert await self._ac().apply(2500.0, {}, _ctx(hass, ev_guard, "peak")) == 2500.0
+        _set(hass, "cool", temp=24.0, room=23.0, action=None)
+        assert await self._ac().apply(2500.0, {}, _ctx(hass, ev_guard, "peak")) == 2500.0
+        assert hass.services.calls == []
+
+    async def test_removed_setback_mid_peak_switches_off(self, hass, ev_guard):
+        _set(hass, "heat", temp=19.0, room=18.0)
+        snaps = {ENTITY: DeviceSnapshot(ENTITY, "heat", original_temp=21.0, set_temp=19.0,
+                                        pending="noack", cmd_at="2026-10-25T11:00:00+00:00")}
+        await _device(inject_temp=None).apply(2500.0, snaps, _ctx(hass, ev_guard, "peak"))
+        assert hass.services.calls[-1]["service"] == "set_hvac_mode"
+        assert snaps[ENTITY].set_temp is None
+        assert hass.states.get(ENTITY).state == "off"
+
+    async def test_both_cascades_setback_starts_from_the_pre_surplus_setpoint(self, hass, ev_guard):
+        """Overschot zette 24 °C (gebruiker 21 °C); piek → 19 °C, niet 22 °C; herstel → 21 °C."""
+        _set(hass, "heat", temp=24.0, room=22.0, action=None)
+        peak_snaps: dict = {}
+        inject_snaps = {ENTITY: DeviceSnapshot(ENTITY, "heat", original_temp=21.0)}
+        peak, inj = _deciders(hass, ev_guard, peak_snaps, inject_snaps)
+        peak._cascade = [_device(priority=3, peak_setback=2, power_watts=1800)]
+        await run_tick(6500.0, NOW, peak=peak, schedule=_NoSchedule(), injection=inj)
+        assert [c["data"].get("temperature") for c in hass.services.calls] == [19.0]
+        assert inject_snaps == {}
+        snap = peak_snaps[ENTITY]
+        assert (snap.original_temp, snap.set_temp) == (21.0, 19.0)
+        hass.services.calls.clear()
+        assert await peak._cascade[0].restore(snap, _ctx(hass, ev_guard, "peak")) is True
+        assert hass.services.calls[0]["data"]["temperature"] == 21.0
+
+    def test_setback_gets_a_default_min_on(self):
+        from custom_components.peak_guard.const import PEAK_SWITCH_MIN_OFF_S
+        assert PeakDecider._effective_min_on_s(self._ac()) == PEAK_SWITCH_MIN_OFF_S
+        assert PeakDecider._effective_min_on_s(self._ac(min_on_s=60)) == 60
+        assert PeakDecider._effective_min_on_s(_device()) is None

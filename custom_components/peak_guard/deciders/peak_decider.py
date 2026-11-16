@@ -204,6 +204,10 @@ class PeakDecider(BaseDecider):
         min_on_s = getattr(device, "min_on_s", None)
         if min_on_s is None and getattr(device, "max_off_s", None) is not None:
             return PEAK_SWITCH_MIN_OFF_S
+        if min_on_s is None and getattr(device, "peak_setback", None):
+            # Thermostaat-bijstelling (cloud-airco met dagquotum): geen
+            # bijstellen/herstellen om de paar minuten bij een randpiek.
+            return PEAK_SWITCH_MIN_OFF_S
         return min_on_s
 
     async def enforce_limits(self, now: datetime) -> None:
