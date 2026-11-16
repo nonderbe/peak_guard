@@ -131,10 +131,15 @@ class BaseDecider:
         self._acks_polled_at: Optional[datetime] = None
         # Herstel dat in deze sessie al opnieuw verstuurd werd (opgeven pas daarna).
         self._resent_restore: set = set()
+        # Blijvend logboek van thermostaat-ingrepen (enkel piek), of None.
+        self._event_log_fn: Optional[Callable] = None
 
     # ------------------------------------------------------------------ #
     #  Hulpfuncties                                                        #
     # ------------------------------------------------------------------ #
+
+    def set_event_log_fn(self, fn: Optional[Callable]) -> None:
+        self._event_log_fn = fn
 
     def _sensor_value(self, entity_id: Optional[str]) -> Optional[float]:
         return read_sensor(self.hass, entity_id)
@@ -152,6 +157,7 @@ class BaseDecider:
             track_action=self._track_action,
             warn=self.ev_guard._warn,
             now=now,
+            event_log=self._event_log_fn if cascade_type == "peak" else None,
             inject_snapshots=(
                 getattr(self, "_inject_snapshots", None) if cascade_type == "peak" else None
             ),

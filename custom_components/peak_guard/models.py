@@ -165,6 +165,8 @@ class DeviceSnapshot:
     # Thermostaat met peak_setback: de doeltemperatuur die Peak Guard zette
     # (verlaagd bij verwarmen, verhoogd bij koelen) in plaats van 'off'.
     set_temp:         Optional[float] = None
+    # Thermostaat (piek): kamertemperatuur toen de ingreep bevestigd werd.
+    room_at_start:    Optional[float] = None
 
 
 def ts_to_str(ts: datetime) -> str:
@@ -242,6 +244,8 @@ class CascadeContext:
     # zodat een thermostaat-bijstelling vertrekt van de instelling van vóór
     # het overschot.
     inject_snapshots: Optional[dict] = None
+    # Blijvend logboek van thermostaat-ingrepen (climate_event_log), of None.
+    event_log: Optional[Callable] = None
 
 
 # ──────────────────────────────────────────────────────────────────────────── #
@@ -1078,6 +1082,60 @@ class ClimateDevice(BaseCascadeDevice):
             return abs(target - snapshot.set_temp) > _SETBACK_TOL
         return state.state == self._original_mode(snapshot)
 
+    # ---- logboek (climate_event_log) --------------------------------- #
+
+    def _event_base(self, snapshot: DeviceSnapshot) -> dict:
+        return {
+            "device":        self.name,
+            "entity":        self.entity_id,
+            "mode":          "setback" if snapshot.set_temp is not None else "off",
+            "original_mode": snapshot.original_state,
+            "original_temp": snapshot.original_temp,
+            "set_temp":      snapshot.set_temp,
+            "room_start":    snapshot.room_at_start,
+            "power_w":       snapshot.shed_w,
+        }
+
+    @staticmethod
+    def _emit(ctx: CascadeContext, entry: dict) -> None:
+        if ctx.event_log is None:
+            return
+        try:
+            ctx.event_log(entry)
+        except Exception as exc:   # het logboek mag de cascade nooit breken
+            _LOGGER.debug("Peak Guard: thermostaat-logboek: %s", exc)
+
+    def on_apply_ack(
+        self, snapshot: DeviceSnapshot, ctx: CascadeContext, ts: datetime, book: bool = True
+    ) -> None:
+        super().on_apply_ack(snapshot, ctx, ts, book)
+        if ctx.cascade_type != "peak":
+            return
+        state = ctx.hass.states.get(self.entity_id)
+        snapshot.room_at_start = (
+            _float_attr(state, "current_temperature") if state is not None else None
+        )
+        self._emit(ctx, {"event": "start", "start": snapshot.off_since,
+                         **self._event_base(snapshot)})
+
+    def _log_end(self, snapshot: DeviceSnapshot, ctx: CascadeContext, ts: datetime,
+                 reason: str) -> None:
+        if ctx.cascade_type != "peak" or not snapshot.off_since:
+            return   # nooit bevestigd: er was geen start
+        start = str_to_ts(snapshot.off_since)
+        state = ctx.hass.states.get(self.entity_id)
+        self._emit(ctx, {
+            "event": "end", "start": snapshot.off_since, "end": ts_to_str(ts),
+            "duration_min": round((ts - start).total_seconds() / 60, 1) if start else None,
+            **self._event_base(snapshot),
+            "room_end": _float_attr(state, "current_temperature") if state is not None else None,
+            "end_reason": reason,
+        })
+
+    def on_restore_ack(self, snapshot: DeviceSnapshot, ctx: CascadeContext, ts: datetime) -> None:
+        super().on_restore_ack(snapshot, ctx, ts)
+        self._log_end(snapshot, ctx, ts, "restored")
+
     async def _call(self, ctx: CascadeContext, service: str, data: dict) -> None:
         await ctx.hass.services.async_call(
             "climate", service, {"entity_id": self.entity_id, **data}, blocking=True)
@@ -1329,6 +1387,19 @@ class ClimateDevice(BaseCascadeDevice):
             # Al in de oorspronkelijke modus: een eerder herstel is uitgevoerd,
             # of de gebruiker zette hem zelf terug.
             if ctx.cascade_type == "peak" and snapshot.pending != "restore":
+                if state.state in _CLIMATE_OFF_STATES and original_mode != "off":
+                    reason = "unit_off"
+                elif snapshot.set_temp is not None and not self._setpoint_still_ours(state, snapshot):
+                    target = _float_attr(state, "temperature")
+                    reason = (
+                        "already_restored"
+                        if target is not None and snapshot.original_temp is not None
+                        and abs(target - snapshot.original_temp) <= 0.25
+                        else "user_changed"
+                    )
+                else:
+                    reason = "already_restored"
+                self._log_end(snapshot, ctx, ctx.now, reason)
                 ctx.peak_tracker.discard_pending(self.id)
                 snapshot.pending = None
                 return True

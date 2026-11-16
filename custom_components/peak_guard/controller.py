@@ -12,6 +12,7 @@ from .avoided_peak_tracker import PeakAvoidTracker, SolarShiftTracker
 from .decision_logger import DecisionLogger
 from .deciders import EVGuard, InjectionDecider, PeakDecider, ScheduleDecider, run_tick
 from .deciders.base import read_power_w, read_sensor
+from .climate_event_log import ClimateEventLog
 from .models import (
     BaseCascadeDevice,
     DeviceSnapshot,
@@ -132,6 +133,8 @@ class PeakGuardController:
             inject_snapshots=self._inject_snapshots,
         )
         self._injection_decider.set_skip_fn(self._schedule_decider.is_controlled)
+        # Blijvend logboek van thermostaat-ingrepen (airco-bijstelling, uitschakelen).
+        self._peak_decider.set_event_log_fn(ClimateEventLog(hass).write)
         self._peak_decider.set_skip_fn(self._schedule_decider.skip_peak_restore)
         self._peak_decider.set_solar_owner_fn(
             lambda d: any(

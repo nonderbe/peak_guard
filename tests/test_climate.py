@@ -508,3 +508,88 @@ class TestPeakSetbackReview:
         assert PeakDecider._effective_min_on_s(self._ac()) == PEAK_SWITCH_MIN_OFF_S
         assert PeakDecider._effective_min_on_s(self._ac(min_on_s=60)) == 60
         assert PeakDecider._effective_min_on_s(_device()) is None
+
+
+class TestClimateEventLog:
+    """Blijvend logboek van thermostaat-ingrepen (start/einde, kamertemperaturen)."""
+
+    def _ctx(self, hass, ev_guard, events, cascade="peak"):
+        ctx = _ctx(hass, ev_guard, cascade)
+        ctx.event_log = events.append
+        return ctx
+
+    def _ac(self):
+        return _device(peak_setback=2, power_watts=600, inject_temp=None)
+
+    async def test_setback_start_and_restore_are_logged(self, hass, ev_guard):
+        from datetime import timedelta
+        events: list = []
+        _set(hass, "heat", temp=21.0, room=22.5, action=None)
+        snaps: dict = {}
+        dev = self._ac()
+        await dev.apply(2500.0, snaps, self._ctx(hass, ev_guard, events))
+        (start,) = events
+        assert start["event"] == "start"
+        assert (start["mode"], start["original_temp"], start["set_temp"]) == ("setback", 21.0, 19.0)
+        assert start["room_start"] == 22.5
+        assert start["start"] == NOW.isoformat()
+        assert start["power_w"] == 600
+
+        _set(hass, "heat", temp=19.0, room=20.5, action=None)
+        ctx = self._ctx(hass, ev_guard, events)
+        ctx.now = NOW + timedelta(minutes=12)
+        assert await dev.restore(snaps[ENTITY], ctx) is True
+        end = events[-1]
+        assert end["event"] == "end" and end["end_reason"] == "restored"
+        assert end["start"] == start["start"]
+        assert end["duration_min"] == 12.0
+        assert end["room_start"] == 22.5
+        assert end["room_end"] == 20.5   # gelezen vóór het herstel bevestigd werd
+
+    async def test_end_reasons(self, hass, ev_guard):
+        cases = (("heat", 23.0, "user_changed"), ("off", 19.0, "unit_off"),
+                 ("heat", 21.0, "already_restored"))
+        for mode, temp, reason in cases:
+            events: list = []
+            _set(hass, mode, temp=temp, room=20.0, action=None)
+            snap = DeviceSnapshot(ENTITY, "heat", original_temp=21.0, set_temp=19.0,
+                                  off_since=NOW.isoformat(), room_at_start=21.5)
+            await self._ac().restore(snap, self._ctx(hass, ev_guard, events))
+            assert [e["end_reason"] for e in events] == [reason], mode
+
+    async def test_switch_off_thermostat_is_logged_too(self, hass, ev_guard):
+        events: list = []
+        _set(hass, "heat", temp=21.0, room=20.0)
+        await _device().apply(2500.0, {}, self._ctx(hass, ev_guard, events))
+        assert events[0]["mode"] == "off" and events[0]["room_start"] == 20.0
+
+    async def test_unacknowledged_apply_logs_nothing_and_solar_logs_nothing(self, hass, ev_guard):
+        events: list = []
+        _set(hass, "heat", temp=21.0, room=20.0, action=None)
+        hass.services.no_reflect.add(ENTITY)
+        await self._ac().apply(2500.0, {}, self._ctx(hass, ev_guard, events))
+        assert events == []
+        hass.services.no_reflect.discard(ENTITY)
+        _set(hass, "heat", temp=19.0, room=19.5)
+        await _device().apply(2000.0, {}, self._ctx(hass, ev_guard, events, "solar"))
+        assert events == []
+
+    async def test_a_failing_log_never_breaks_the_cascade(self, hass, ev_guard):
+        def boom(entry):
+            raise OSError("disk full")
+        _set(hass, "heat", temp=21.0, room=20.0, action=None)
+        ctx = _ctx(hass, ev_guard, "peak")
+        ctx.event_log = boom
+        assert await self._ac().apply(2500.0, {}, ctx) == pytest.approx(1900.0)
+
+    def test_writer_appends_jsonl(self, tmp_path):
+        import json
+        from types import SimpleNamespace
+        from custom_components.peak_guard.climate_event_log import ClimateEventLog
+        hass = SimpleNamespace(config=SimpleNamespace(config_dir=str(tmp_path)),
+                               async_add_executor_job=lambda fn, *a: fn(*a))
+        log = ClimateEventLog(hass)
+        log.write({"event": "start", "device": "Airco"})
+        log.write({"event": "end", "device": "Airco"})
+        lines = (tmp_path / "peak_guard" / "climate_events.jsonl").read_text().splitlines()
+        assert [json.loads(l)["event"] for l in lines] == ["start", "end"]
