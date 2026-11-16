@@ -101,6 +101,7 @@ class TestSolarHolds:
         assert ev_guard.status_dict()["holds"]["ev"]["code"] == "solar_share"
 
     async def test_update_interval_is_explained_with_a_countdown(self, hass, ev_guard):
+        hass.states.set("switch.tesla_charge", "on")
         hass.states.set("number.tesla_charge_current", "16")
         guard = ev_guard.get_guard("ev")
         guard.last_current_update = datetime.now(timezone.utc) - timedelta(seconds=5)

@@ -193,8 +193,14 @@ class MockStateRegistry:
 
 
 class MockServiceRegistry:
-    def __init__(self, raise_on: set[str] | None = None) -> None:
+    def __init__(self, raise_on: set[str] | None = None, states=None) -> None:
         self.calls: list[dict] = []
+        # Zoals HA: een switch/climate meldt na het commando zijn nieuwe
+        # toestand (bevestiging). Uitzetten om een traag cloud-apparaat na te
+        # bootsen (geen bevestiging), of per entiteit via no_reflect.
+        self._states = states
+        self.reflect: bool = True
+        self.no_reflect: set[str] = set()
         self._raise_on: set[str] = raise_on or set()
         # Optionele foutmelding (bv. "The vehicle is not 'online'") i.p.v. de standaard.
         self.error_message: str | None = None
@@ -209,6 +215,24 @@ class MockServiceRegistry:
         self.calls.append({"domain": domain, "service": service, "data": data})
         if service in self._raise_on:
             raise HomeAssistantError(self.error_message or f"Gesimuleerde fout: {service}")
+        self._reflect(domain, service, data)
+
+    def _reflect(self, domain: str, service: str, data: dict) -> None:
+        if not self.reflect or self._states is None:
+            return
+        entity_id = data.get("entity_id")
+        if not isinstance(entity_id, str) or entity_id in self.no_reflect:
+            return
+        if entity_id not in self._states._states:
+            return
+        attrs = dict(self._states._attributes.get(entity_id) or {})
+        if domain == "switch" and service in ("turn_on", "turn_off"):
+            self._states.set(entity_id, "on" if service == "turn_on" else "off", attrs)
+        elif domain == "climate" and service == "set_hvac_mode":
+            self._states.set(entity_id, data["hvac_mode"], attrs)
+        elif domain == "climate" and service == "set_temperature":
+            attrs["temperature"] = data["temperature"]
+            self._states.set(entity_id, data.get("hvac_mode", self._states._states[entity_id]), attrs)
 
     def calls_for(self, service: str) -> list[dict]:
         return [c for c in self.calls if c["service"] == service]
@@ -220,7 +244,7 @@ class MockServiceRegistry:
 class MockHass:
     def __init__(self, raise_on: set[str] | None = None) -> None:
         self.states = MockStateRegistry()
-        self.services = MockServiceRegistry(raise_on=raise_on)
+        self.services = MockServiceRegistry(raise_on=raise_on, states=self.states)
 
     def async_create_task(self, coro):
         """Minimale stand-in voor HomeAssistant.async_create_task."""
@@ -232,7 +256,7 @@ class MockPeakTracker:
         self.pending_avoids: list = []
         self.turn_on_measurements: list = []
 
-    def record_pending_avoid(self, device_id, device_name, nominal_kw, ts, deferred=False):
+    def record_pending_avoid(self, device_id, device_name, nominal_kw, ts, deferred=False, fresh=False):
         self.pending_avoids.append({"id": device_id, "kw": nominal_kw, "deferred": deferred})
 
     def start_measurement_on_turnon(self, device_id, device_name, ts, max_kw=None):
@@ -268,6 +292,10 @@ class MockSolarTracker:
     def complete_solar_calculation(self, device_id, now):
         self.completed.append(device_id)
         return None
+
+    def has_active_measurement(self, device_id) -> bool:
+        started = sum(1 for m in self.started if m["id"] == device_id)
+        return started > self.completed.count(device_id)
 
 
 class FakeBudgetStore:
@@ -345,3 +373,10 @@ def make_surplus_history(guard: EVDeviceGuard, seconds_span: float, value_w: flo
     for i in range(n):
         ts = t0 + timedelta(seconds=i * seconds_span / (n - 1))
         guard.surplus_history.append((ts, value_w))
+
+
+@pytest.fixture(autouse=True)
+def _no_ack_wait(monkeypatch):
+    """Geen echte wachttijd op een bevestiging binnen de cyclus in tests."""
+    from custom_components.peak_guard import const as _const
+    monkeypatch.setattr(_const, "ACK_WAIT_S", 0.0)

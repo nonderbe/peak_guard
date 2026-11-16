@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Callable, Dict, List, Optional
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 
+from .. import const as _const
 from ..const import (
     CONF_DEBUG_DECISION_LOGGING,
 )
@@ -26,6 +27,7 @@ from ..models import (
     CascadeContext,
     BaseCascadeDevice,
     DeviceSnapshot,
+    age_s,
 )
 
 if TYPE_CHECKING:
@@ -99,6 +101,14 @@ def read_energy_kwh(hass: HomeAssistant, entity_id: Optional[str]) -> Optional[f
     return value
 
 
+def restore_need_w(device: BaseCascadeDevice, snapshot: DeviceSnapshot) -> float:
+    """Vermogen dat een herstel terugbrengt (het vermogen bij het afschakelen)."""
+    fn = getattr(device, "restore_need_w", None)
+    if callable(fn):
+        return fn(snapshot)
+    return float(getattr(device, "power_watts", 0) or 0)
+
+
 class BaseDecider:
     def __init__(
         self,
@@ -117,6 +127,10 @@ class BaseDecider:
         self.ev_guard = ev_guard
         self._iteration_actions = iteration_actions
         self._save_fn = save_fn
+        # Bevestigingen worden één keer per cyclus verwerkt.
+        self._acks_polled_at: Optional[datetime] = None
+        # Herstel dat in deze sessie al opnieuw verstuurd werd (opgeven pas daarna).
+        self._resent_restore: set = set()
 
     # ------------------------------------------------------------------ #
     #  Hulpfuncties                                                        #
@@ -150,6 +164,7 @@ class BaseDecider:
         snapshots: Dict[str, DeviceSnapshot],
         reverse: bool = True,
         skip_fn: Optional[Callable[[BaseCascadeDevice], bool]] = None,
+        on_drop: Optional[Callable[[BaseCascadeDevice], None]] = None,
     ) -> List[tuple]:
         candidates = []
         for device in cascade:
@@ -160,6 +175,8 @@ class BaseDecider:
             if device.entity_id in snapshots:
                 if device.manual_override:
                     del snapshots[device.entity_id]
+                    if on_drop is not None:
+                        on_drop(device)
                     _LOGGER.info(
                         "Peak Guard: snapshot voor '%s' verwijderd — manuele bediening actief",
                         device.name,
@@ -214,7 +231,17 @@ class BaseDecider:
                 break
             before = remaining
             ctx.last_skip_reason = ""
-            remaining = await device.apply(remaining, snapshots, ctx)
+            try:
+                remaining = await device.apply(remaining, snapshots, ctx)
+            except Exception:  # noqa: BLE001 — één apparaat mag de cascade niet stoppen
+                _LOGGER.exception(
+                    "Peak Guard [%s cascade]: onverwachte fout bij '%s' — overgeslagen, "
+                    "volgende apparaat", label, device.name,
+                )
+                self.ev_guard.add_warning(
+                    f"Onverwachte fout bij '{device.name}' — overgeslagen (zie HA-log)"
+                )
+                remaining = before
             handled = before - remaining
             if handled > 0:
                 _LOGGER.info(
@@ -247,6 +274,137 @@ class BaseDecider:
         return remaining
 
     # ------------------------------------------------------------------ #
+    #  Bevestiging (ack)                                                   #
+    # ------------------------------------------------------------------ #
+
+    def _on_apply_acked(self, device: BaseCascadeDevice, now: datetime) -> None:
+        """Hook: een eerder verstuurde ingreep is (laat) bevestigd."""
+
+    def _on_restore_acked(self, device: BaseCascadeDevice, now: datetime) -> None:
+        """Hook: een herstel is bevestigd en het snapshot verwijderd."""
+
+    def _on_restore_given_up(self, device: BaseCascadeDevice) -> None:
+        """Hook: een herstel bleef ACK_GIVE_UP_S onbevestigd; snapshot verwijderd."""
+
+    def _on_snapshot_dropped(self, device: BaseCascadeDevice) -> None:
+        """Hook: snapshot weg zonder bevestigd herstel (manuele bediening, opgegeven ingreep)."""
+
+    async def _poll_acks(
+        self,
+        cascade: List[BaseCascadeDevice],
+        snapshots: Dict[str, DeviceSnapshot],
+        cascade_type: str,
+        now: datetime,
+    ) -> None:
+        """
+        Verwerk openstaande bevestigingen (één keer per cyclus):
+
+        - ingreep ('apply'/'noack') nu uitgevoerd → boeken (on_apply_ack);
+          'apply' na ACK_TIMEOUT_S nog niet → 'noack' (telt niet meer mee).
+          Een 'noack' ouder dan ACK_GIVE_UP_S vervalt zonder boeking: een
+          latere uit-toestand (wasbeurt gedaan, manueel uit) hoort er niet bij.
+          Een 'apply' die zo oud is (bewaard over een herstart) en nu
+          uitgevoerd blijkt, telt als afgeschakeld maar boekt niets.
+        - herstel ('restore') uitgevoerd → snapshot weg; na ACK_RESEND_S
+          opnieuw versturen; opgeven pas na ACK_GIVE_UP_S én minstens één
+          herhaling in deze sessie (na een herstart dus eerst opnieuw proberen).
+        - manuele bediening of uitgeschakeld in de cascade: snapshot weg.
+        """
+        if self._acks_polled_at == now:
+            return
+        self._acks_polled_at = now
+        changed = False
+        ctx = self._make_ctx(cascade_type, now)
+        for device in cascade:
+            snap = snapshots.get(device.entity_id)
+            pending = getattr(snap, "pending", None) if snap is not None else None
+            if pending is None or not getattr(device, "supports_ack", False):
+                continue
+            # Manuele bediening: alles vervalt. Uitgeschakeld in de cascade:
+            # enkel een open ingreep; een lopend herstel wordt afgewerkt.
+            if device.manual_override or (not device.enabled and pending != "restore"):
+                del snapshots[device.entity_id]
+                self._on_snapshot_dropped(device)
+                _LOGGER.info(
+                    "Peak Guard: '%s' — open actie vervalt (manuele bediening of uitgeschakeld)",
+                    device.name,
+                )
+                changed = True
+                continue
+            state = self.hass.states.get(device.entity_id)
+            too_old = age_s(snap.pending_since, now) >= _const.ACK_GIVE_UP_S
+            if pending in ("apply", "noack"):
+                applied = state is not None and device.applied(state, snap, cascade_type)
+                if pending == "noack" and too_old:
+                    del snapshots[device.entity_id]
+                    self._on_snapshot_dropped(device)
+                    self.ev_guard._warn(
+                        "Peak Guard: '%s' voerde de ingreep na %.0f min nog altijd niet uit — "
+                        "opgegeven, niets geboekt",
+                        device.name, _const.ACK_GIVE_UP_S / 60,
+                    )
+                    changed = True
+                elif applied:
+                    _LOGGER.info(
+                        "Peak Guard: '%s' — ingreep bevestigd door het apparaat (%.0f s na het commando)",
+                        device.name, age_s(snap.cmd_at, now),
+                    )
+                    device.on_apply_ack(snap, ctx, now, book=not too_old)
+                    self._on_apply_acked(device, now)
+                    changed = True
+                elif too_old:
+                    # 'apply' over een herstart heen en niet uitgevoerd: vervalt.
+                    del snapshots[device.entity_id]
+                    self._on_snapshot_dropped(device)
+                    changed = True
+                elif pending == "apply" and age_s(snap.cmd_at, now) >= _const.ACK_TIMEOUT_S:
+                    snap.pending = "noack"
+                    self.ev_guard._warn(
+                        "Peak Guard: '%s' bevestigde het commando niet binnen %.0f s — telt niet "
+                        "meer mee, nieuwe poging na %.0f s",
+                        device.name, _const.ACK_TIMEOUT_S, _const.ACK_RESEND_S,
+                    )
+                    changed = True
+            elif pending == "restore":
+                if state is not None and device.restored(state, snap, cascade_type):
+                    _LOGGER.info(
+                        "Peak Guard: '%s' — herstel bevestigd door het apparaat (%.0f s na het commando)",
+                        device.name, age_s(snap.cmd_at, now),
+                    )
+                    device.on_restore_ack(snap, ctx, now)
+                    del snapshots[device.entity_id]
+                    self._resent_restore.discard(device.entity_id)
+                    self._on_restore_acked(device, now)
+                    changed = True
+                elif age_s(snap.cmd_at, now) >= _const.ACK_RESEND_S:
+                    if too_old and device.entity_id in self._resent_restore:
+                        del snapshots[device.entity_id]
+                        self._resent_restore.discard(device.entity_id)
+                        self.ev_guard._warn(
+                            "Peak Guard: '%s' — herstel na %.0f min nog altijd niet bevestigd; "
+                            "Peak Guard geeft het op (controleer het apparaat)",
+                            device.name, age_s(snap.pending_since, now) / 60,
+                        )
+                        self._on_restore_given_up(device)
+                    else:
+                        _LOGGER.info("Peak Guard: '%s' — herstel opnieuw versturen", device.name)
+                        self._resent_restore.add(device.entity_id)
+                        if await self._restore_device(device, snap, cascade_type, now):
+                            snapshots.pop(device.entity_id, None)
+                            self._resent_restore.discard(device.entity_id)
+                            if snap.pending == "done":
+                                self._on_restore_acked(device, now)
+                    changed = True
+                else:
+                    self.ev_guard.set_hold(
+                        device.id, "awaiting_ack",
+                        f"Herstel verstuurd {age_s(snap.cmd_at, now):.0f} s geleden; wacht tot "
+                        f"het apparaat de oorspronkelijke toestand meldt.",
+                    )
+        if changed:
+            await self._save_fn()
+
+    # ------------------------------------------------------------------ #
     #  Apparaat herstel                                                    #
     # ------------------------------------------------------------------ #
 
@@ -260,4 +418,14 @@ class BaseDecider:
         if now is None:
             now = datetime.now(timezone.utc)
         ctx = self._make_ctx(cascade_type, now)
-        return await device.restore(snapshot, ctx)
+        try:
+            return await device.restore(snapshot, ctx)
+        except Exception:  # noqa: BLE001 — één apparaat mag het herstel niet stoppen
+            _LOGGER.exception(
+                "Peak Guard: onverwachte fout bij herstel van '%s' — volgende cyclus opnieuw",
+                device.name,
+            )
+            self.ev_guard.add_warning(
+                f"Onverwachte fout bij herstel van '{device.name}' (zie HA-log)"
+            )
+            return False

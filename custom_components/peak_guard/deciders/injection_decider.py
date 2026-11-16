@@ -8,7 +8,7 @@ Herstelt apparaten zodra het overschot verdwenen is.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional
 
 from homeassistant.core import HomeAssistant
@@ -64,6 +64,16 @@ class InjectionDecider(BaseDecider):
     def set_skip_fn(self, skip_fn: Optional[Callable[[BaseCascadeDevice], bool]]) -> None:
         self._skip_fn = skip_fn
 
+    def _on_snapshot_dropped(self, device: BaseCascadeDevice) -> None:
+        """Manuele bediening: de solar-meting stopt nu (anders blijft ze open)."""
+        if device.action_type != ACTION_EV_CHARGER:
+            self.solar_tracker.complete_solar_calculation(
+                device_id=device.id, now=datetime.now(timezone.utc))
+
+    def _on_restore_given_up(self, device: BaseCascadeDevice) -> None:
+        self.solar_tracker.complete_solar_calculation(
+            device_id=device.id, now=datetime.now(timezone.utc))
+
     @property
     def snapshots(self) -> Dict[str, DeviceSnapshot]:
         return self._snapshots
@@ -79,6 +89,9 @@ class InjectionDecider(BaseDecider):
 
         consumption: actueel netto-verbruik in W (negatief = injectie)
         """
+        if now is None:
+            now = datetime.now(timezone.utc)
+        await self._poll_acks(self._cascade, self._snapshots, "solar", now)
         injection = abs(consumption)
         _LOGGER.debug(
             "Peak Guard _check_injection: injectie=%.0f W, actief=%d snapshot(s)",
@@ -114,6 +127,9 @@ class InjectionDecider(BaseDecider):
         """
         if not self._snapshots:
             return
+        if now is None:
+            now = datetime.now(timezone.utc)
+        await self._poll_acks(self._cascade, self._snapshots, "solar", now)
         _LOGGER.debug(
             "Peak Guard _check_inject_restore: verbruik=%.0f W, %d snapshot(s) actief",
             consumption, len(self._snapshots),
@@ -124,9 +140,16 @@ class InjectionDecider(BaseDecider):
                 consumption,
             )
             return
-        snapshots_to_restore = self._get_restore_candidates(
-            self._cascade, self._snapshots, reverse=True, skip_fn=self._skip_fn
-        )
+        snapshots_to_restore = [
+            (device, snap)
+            for device, snap in self._get_restore_candidates(
+                self._cascade, self._snapshots, reverse=True, skip_fn=self._skip_fn,
+                on_drop=self._on_snapshot_dropped,
+            )
+            # Inschakelen nog niet bevestigd, of herstel al verstuurd (de
+            # bevestiging volgt via _poll_acks): niet opnieuw aanspreken.
+            if device.action_type == ACTION_EV_CHARGER or snap.pending not in ("apply", "restore")
+        ]
         if not snapshots_to_restore:
             return
         # Herstel één apparaat per cyclus (laagste prioriteit eerst).
@@ -139,7 +162,12 @@ class InjectionDecider(BaseDecider):
         # EV-verbruik en zonne-opbrengst elkaar precies opheffen.
         for index, (device, snapshot) in enumerate(snapshots_to_restore):
             if device.action_type == ACTION_EV_CHARGER and consumption >= 0:
-                throttled = await self.ev_guard.throttle_down_solar(device, consumption, now=now)
+                try:
+                    throttled = await self.ev_guard.throttle_down_solar(device, consumption, now=now)
+                except Exception:  # noqa: BLE001
+                    _LOGGER.exception(
+                        "Peak Guard [SOLAR]: onverwachte fout bij verlagen van '%s'", device.name)
+                    throttled = False
                 if throttled:
                     hold = self.ev_guard.hold_for(device.id) or {}
                     if hold.get("code") == "solar_share":
@@ -154,7 +182,9 @@ class InjectionDecider(BaseDecider):
                 )
             restored = await self._restore_device(device, snapshot, cascade_type="solar", now=now)
             if restored:
-                del self._snapshots[device.entity_id]
+                self._snapshots.pop(device.entity_id, None)
                 _LOGGER.info("Peak Guard: '%s' hersteld", device.name)
+                await self._save_fn()
+            elif snapshot.pending == "restore":
                 await self._save_fn()
             return

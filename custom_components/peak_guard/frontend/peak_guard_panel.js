@@ -345,6 +345,9 @@ class PeakGuardPanel extends HTMLElement {
           <div class="title-row">
             <span class="logo">⚡</span>
             <h1>Peak Guard</h1>
+            ${this._data.config?.version
+              ? `<span class="version" title="Geïnstalleerde versie">v${this._esc(this._data.config.version)}</span>`
+              : ""}
           </div>
           <div class="header-actions">
             <span class="badge ${this._data.status?.monitoring ? "active" : "inactive"}">
@@ -1759,6 +1762,31 @@ class PeakGuardPanel extends HTMLElement {
           <div class="field-hint">Gemiddeld opgenomen vermogen van dit apparaat. Gebruikt voor de besparingsberekening.</div>
         </div>
 
+        <div id="peak-limit-fields" ${!isInject && !isThrottle ? "" : 'style="display:none"'}>
+          <div class="form-group">
+            <label>Vermogenssensor (optioneel)</label>
+            <div class="entity-picker">
+              <input id="f-power-sensor" type="text" value="${this._esc(d.power_sensor || "")}"
+                placeholder="sensor.wasmachine_vermogen" autocomplete="off" />
+              <div id="power-sensor-dropdown" class="entity-dropdown" style="display:none;"></div>
+            </div>
+            <div class="field-hint">Actueel verbruik (W of kW). Bij afschakelen telt deze waarde in plaats van het nominale vermogen; onder 100 W blijft het apparaat aan (het verbruikt dan niets). Leeg = nominaal vermogen.</div>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label>Max. uit (min)</label>
+              <input id="f-max-off" type="number" min="0" step="1"
+                value="${d.max_off_s ? Math.round(d.max_off_s / 60) : ""}" placeholder="geen" />
+            </div>
+            <div class="form-group">
+              <label>Min. aan tussen twee afschakelingen (min)</label>
+              <input id="f-min-on" type="number" min="0" step="1"
+                value="${d.min_on_s ? Math.round(d.min_on_s / 60) : ""}" placeholder="geen" />
+            </div>
+          </div>
+          <div class="field-hint">Max. uit: na zo veel minuten gaat het apparaat terug aan, ook als dat de piek verhoogt (bv. een gepauzeerde wasmachine). Min. aan: na een herstel wordt het zo lang niet opnieuw afgeschakeld; de volgende apparaten wel. Leeg = geen grens.</div>
+        </div>
+
         <!-- Throttle legacy velden -->
         <div id="throttle-fields" ${isThrottle ? "" : 'style="display:none"'}>
           <div class="form-row">
@@ -2263,6 +2291,7 @@ class PeakGuardPanel extends HTMLElement {
       //  Standaard modal events
       // ================================================================
       makeEntityPicker("#f-entity", "#entity-dropdown", null);
+      makeEntityPicker("#f-power-sensor", "#power-sensor-dropdown", (id) => id.startsWith("sensor."));
 
       // Type-select: als gebruiker naar EV wisselt, open wizard
       const actionSelect = root.querySelector("#f-action");
@@ -2280,6 +2309,11 @@ class PeakGuardPanel extends HTMLElement {
             return;
           }
           if (throttleFields) throttleFields.style.display = v === "throttle" ? "" : "none";
+          const limitFields = root.querySelector("#peak-limit-fields");
+          if (limitFields) {
+            limitFields.style.display =
+              this._editCascadeType !== "inject" && v !== "throttle" ? "" : "none";
+          }
           const climateFields = root.querySelector("#climate-fields");
           if (climateFields) {
             climateFields.style.display =
@@ -2365,6 +2399,11 @@ class PeakGuardPanel extends HTMLElement {
         alert("Een thermostaat heeft een climate.*-entiteit nodig."); return;
       }
       const injectTemp  = parseFloat(val("#f-inject-temp"));
+      const minutes = (sel) => {
+        const m = parseFloat(val(sel));
+        return isNaN(m) || m <= 0 ? null : Math.round(m * 60);
+      };
+      const isPeakLimit = this._editCascadeType !== "inject" && !isThrottle;
       device = {
         id:             this._editDevice?.id || `dev_${Date.now()}`,
         name,
@@ -2375,6 +2414,9 @@ class PeakGuardPanel extends HTMLElement {
         max_value:      isThrottle ? (parseFloat(val("#f-max")) || 32)  : null,
         power_per_unit: isThrottle ? (parseFloat(val("#f-ppu")) || 690) : null,
         inject_temp:    isClimate ? (isNaN(injectTemp) ? (this._editDevice?.inject_temp ?? null) : injectTemp) : null,
+        power_sensor:   isPeakLimit ? (val("#f-power-sensor") || "") : "",
+        max_off_s:      isPeakLimit ? minutes("#f-max-off") : null,
+        min_on_s:       isPeakLimit ? minutes("#f-min-on") : null,
         enabled:        true,
         priority:       this._editDevice?.priority ?? 999,
         switch_entity:  null,
@@ -2631,6 +2673,7 @@ class PeakGuardPanel extends HTMLElement {
         .title-row { display: flex; align-items: center; gap: 10px; }
         .logo { font-size: 1.8em; }
         h1 { margin: 0; font-size: 1.5em; font-weight: 700; }
+        .title-row .version { font-size: 0.85em; color: var(--secondary-text-color); font-weight: 500; }
         .header-actions { display: flex; align-items: center; gap: 10px; }
         .badge {
           display: inline-flex; align-items: center; gap: 6px;

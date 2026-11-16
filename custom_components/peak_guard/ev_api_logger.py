@@ -71,6 +71,7 @@ class EVApiLogger:
         success: bool,
         error: Optional[str],
         duration_ms: float,
+        charge_state: Optional[str] = None,
     ) -> None:
         entry = {
             "ts":          datetime.now(timezone.utc).isoformat(),
@@ -84,6 +85,9 @@ class EVApiLogger:
             "error":       error,
             "duration_ms": round(duration_ms),
         }
+        if charge_state:
+            # Laadstatus vóór de call: toont of een turn_on nodig was.
+            entry["charge_state"] = charge_state
         try:
             await self._hass.async_add_executor_job(self._write_sync, entry)
         except Exception as exc:

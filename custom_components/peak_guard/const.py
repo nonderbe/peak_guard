@@ -118,6 +118,10 @@ EV_UNREACHABLE_BACKOFF_S: float = 900.0
 # Herstart na piekbeperking op een lagere stroom: zo lang wachten tot de wagen
 # laadt. Laadt hij dan nog niet (vol, kabel uit), dan vervalt het snapshot,
 # zodat niet elke cyclus opnieuw turn_on/set_value naar de wagen gaat.
+# Een turn_on die de wagen weigert met 'is_charging' bevestigt dat hij laadt.
+# Zo lang (en zolang de laadstatus in HA niet verandert) geldt hij als ladend,
+# ook als die laadstatus nog een oude waarde toont.
+EV_CHARGING_CONFIRM_S = 600
 PEAK_RESTART_CONFIRM_S: float = 180.0
 
 # Piekbeperking op het kwartierbudget (zie quarter_budget.py).
@@ -134,6 +138,24 @@ PEAK_SETTLE_S: float = 20.0
 # Een schakelaar die de piek-cascade uitzette, blijft minstens zo lang uit
 # (geen aan/uit-pendelen op een wisselende huislast).
 PEAK_SWITCH_MIN_OFF_S: float = 300.0
+
+# Bevestiging (ack) van een schakelactie op een schakelaar of thermostaat:
+# pas als de entiteit de nieuwe toestand meldt, telt de actie (vermogen
+# afgetrokken van het overschot, vermeden piek of verschoven energie geboekt).
+# Zo lang wordt binnen de cyclus op de nieuwe toestand gewacht (lokale
+# schakelaars melden die meestal meteen; cloud-apparaten later).
+ACK_WAIT_S: float = 2.0
+ACK_POLL_S: float = 0.5
+# Zo lang blijft het vermogen van een onbevestigde afschakeling gereserveerd;
+# daarna gaat de cascade naar het volgende apparaat (hold 'no_ack').
+ACK_TIMEOUT_S: float = 90.0
+# Een onbevestigde actie wordt na zo lang opnieuw verstuurd.
+ACK_RESEND_S: float = 300.0
+# Een herstel dat zo lang onbevestigd blijft, wordt opgegeven (snapshot weg).
+ACK_GIVE_UP_S: float = 1800.0
+# Met een vermogenssensor: onder deze waarde verbruikt het apparaat nu niets
+# en wordt het niet afgeschakeld (bv. een wasmachine die spoelt).
+POWER_SENSOR_MIN_W: float = 100.0
 # Tekstfragmenten (kleine letters) in de foutmelding die op een onbereikbare wagen wijzen.
 EV_UNREACHABLE_ERRORS: tuple = (
     "not 'online'", "not online", "offline", "asleep",

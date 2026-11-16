@@ -9,6 +9,8 @@ from homeassistant.components.panel_custom import async_register_panel
 from homeassistant.components import frontend
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr
+from homeassistant.loader import async_get_integration
 
 from .const import DOMAIN, PANEL_URL, PANEL_TITLE, PANEL_ICON
 from .controller import PeakGuardController
@@ -156,6 +158,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # entry.options wins on conflict so users can override defaults without re-adding.
     controller = PeakGuardController(hass, {**entry.data, **entry.options})
     await controller.async_load()
+    # Versie uit manifest.json (zonder HACS toont HA ze nergens anders).
+    try:
+        controller.version = str((await async_get_integration(hass, DOMAIN)).version or "")
+    except Exception:  # noqa: BLE001 — versie is enkel informatief
+        _LOGGER.debug("Peak Guard: versie niet gevonden", exc_info=True)
 
     # Sla alles op onder DOMAIN als dict zodat meerdere objecten
     # (controller + toekomstige uitbreiding) naast elkaar kunnen leven
@@ -223,8 +230,28 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Laad sensor-platform (sensor.py)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
+    # Opties ("Configureren") meteen toepassen: alle deciders delen dezelfde
+    # config-dict, dus bijwerken volstaat (geen herladen nodig).
+    entry.async_on_unload(entry.add_update_listener(_async_options_updated))
+
+    # Versie op de apparaatpagina's (sw_version) van alle Peak Guard-apparaten.
+    if controller.version:
+        dev_reg = dr.async_get(hass)
+        for device in dr.async_entries_for_config_entry(dev_reg, entry.entry_id):
+            if device.sw_version != controller.version:
+                dev_reg.async_update_device(device.id, sw_version=controller.version)
+
     _LOGGER.info("Peak Guard succesvol geladen")
     return True
+
+
+async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Opties gewijzigd: werk de gedeelde config van de controller bij."""
+    controller = hass.data.get(DOMAIN, {}).get("controller")
+    if controller is None:
+        return
+    controller.config.update({**entry.data, **entry.options})
+    _LOGGER.info("Peak Guard: opties bijgewerkt zonder herladen")
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

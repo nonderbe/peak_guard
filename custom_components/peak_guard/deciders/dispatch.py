@@ -33,6 +33,7 @@ async def run_tick(
     # Verklaringen in de status-popup gelden voor deze iteratie.
     peak.ev_guard.begin_tick()
     if consumption is None:
+        await peak.enforce_limits(now)
         await schedule.check(None, now)
         return
     if consumption > 0:

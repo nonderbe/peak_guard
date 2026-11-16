@@ -57,6 +57,8 @@ class PeakGuardController:
         self.inject_cascade: List[BaseCascadeDevice] = []
         self._monitoring = False
         self._task: Optional[asyncio.Task] = None
+        # Versie uit manifest.json, gezet door async_setup_entry.
+        self.version: Optional[str] = None
         self._store = Store(hass, STORAGE_VERSION, STORAGE_KEY)
 
         self._peak_snapshots:   Dict[str, DeviceSnapshot] = {}
@@ -131,6 +133,12 @@ class PeakGuardController:
         )
         self._injection_decider.set_skip_fn(self._schedule_decider.is_controlled)
         self._peak_decider.set_skip_fn(self._schedule_decider.skip_peak_restore)
+        self._peak_decider.set_solar_owner_fn(
+            lambda d: any(
+                x.entity_id == d.entity_id and x.enabled and not x.manual_override
+                for x in self.inject_cascade
+            )
+        )
         self._ev_guard_decider.set_soc_rest_lookup(self._schedule_decider.soc_rest_for)
         self._decision_logger = DecisionLogger(
             hass=hass,
@@ -171,6 +179,7 @@ class PeakGuardController:
                 if e is not None
             ])
             self._schedule_decider.load_state(data.get("schedule_state"))
+            self._peak_decider.load_runtime(data.get("peak_runtime"))
             if self._peak_snapshots:
                 _LOGGER.warning(
                     "Peak Guard: %d apparaat/apparaten nog uitgeschakeld uit vorige sessie — "
@@ -187,6 +196,7 @@ class PeakGuardController:
             "inject_snapshots": {k: asdict(v) for k, v in self._inject_snapshots.items()},
             "schedule":         self._schedule_decider.entries_to_list(),
             "schedule_state":   self._schedule_decider.state_to_dict(),
+            "peak_runtime":     self._peak_decider.runtime_to_dict(),
         })
 
     # ------------------------------------------------------------------ #
@@ -210,6 +220,7 @@ class PeakGuardController:
                 "buffer_watts":       self.config.get(CONF_BUFFER_WATTS, DEFAULT_BUFFER_WATTS),
                 "update_interval":    self.config.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL),
                 "capacity_min_w":     CAPACITY_MIN_KW * 1000.0,
+                "version":            self.version,
             },
             "status": {
                 "monitoring":   self._monitoring,
@@ -228,11 +239,16 @@ class PeakGuardController:
         parsed = [cascade_from_dict(d) for d in devices]
         new_entity_ids = {d.entity_id for d in parsed}
         if cascade_type == "peak":
+            old_ids = {d.entity_id: d.id for d in self.peak_cascade}
             self.peak_cascade.clear()
             self.peak_cascade.extend(parsed)
             for eid in list(self._peak_snapshots):
                 if eid not in new_entity_ids:
                     del self._peak_snapshots[eid]
+                    # Een afschakeling zonder herstel boekt niets (en laat geen
+                    # oude pending achter die later in een verkeerd kwartier valt).
+                    if eid in old_ids:
+                        self.peak_tracker.discard_pending(old_ids[eid])
                     _LOGGER.info("Peak Guard: snapshot verwijderd voor '%s' (niet meer in piek-cascade)", eid)
         elif cascade_type == "inject":
             self.inject_cascade.clear()
@@ -348,7 +364,11 @@ class PeakGuardController:
         """
         self._teardown_ev_listeners()
         all_entities, switch_entities = self._ev_watched_entities()
-        if not all_entities:
+        ack_entities = {
+            d.entity_id for d in list(self.peak_cascade) + list(self.inject_cascade)
+            if getattr(d, "supports_ack", False)
+        }
+        if not all_entities and not ack_entities:
             return
 
         @callback
@@ -358,6 +378,14 @@ class PeakGuardController:
             if old is None or new is None or old.state == new.state:
                 return
             entity_id = event.data.get("entity_id")
+            if entity_id in ack_entities:
+                # Bevestiging van een schakelaar/thermostaat die Peak Guard
+                # aanstuurde: meteen verwerken.
+                snap = self._peak_snapshots.get(entity_id) or self._inject_snapshots.get(entity_id)
+                if snap is not None and snap.pending is not None:
+                    self.trigger_wakeup()
+                if entity_id not in all_entities:
+                    return
             # Schakelaar-entiteiten: enkel reageren op '→ off'. Een '→ on'-transitie
             # is door PG zelf geïnitieerd; die hoeft geen extra iteratie te triggeren.
             if entity_id in switch_entities and new.state != "off":
@@ -368,7 +396,9 @@ class PeakGuardController:
             )
             self.trigger_wakeup()
 
-        unsub = async_track_state_change_event(self.hass, list(all_entities), _on_ev_state_changed)
+        unsub = async_track_state_change_event(
+            self.hass, list(all_entities | ack_entities), _on_ev_state_changed
+        )
         self._state_unsubs.append(unsub)
         _LOGGER.debug(
             "Peak Guard: state-change listeners geregistreerd op %d EV-entiteit(en): %s",
@@ -551,14 +581,15 @@ class PeakGuardController:
             if device is None:
                 continue
 
-            nominal_w = float(device.power_watts)
+            # Het vermogen bij het afschakelen staat in de tracker (EV-stroom,
+            # of de vermogenssensor van het apparaat); anders power_watts.
+            nominal_kw = self.peak_tracker.get_active_nominal_kw(device_id)
+            nominal_w = (
+                nominal_kw * 1000.0 if nominal_kw is not None and nominal_kw > 0
+                else float(device.power_watts)
+            )
             if nominal_w <= 0:
-                # EV-laders hebben power_watts=0 omdat hun vermogen dynamisch is.
-                # Het werkelijke vermogen bij uitschakelen is opgeslagen in de tracker.
-                nominal_kw = self.peak_tracker.get_active_nominal_kw(device_id)
-                if nominal_kw is None or nominal_kw <= 0:
-                    continue
-                nominal_w = nominal_kw * 1000.0
+                continue
 
             tol_pct = float(self.config.get(
                 CONF_POWER_DETECTION_TOLERANCE_PERCENT,

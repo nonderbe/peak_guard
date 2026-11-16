@@ -115,6 +115,11 @@ class SolarEvent:
 #  Modus 1 — PeakAvoidTracker                                          #
 # ──────────────────────────────────────────────────────────────────── #
 
+def _parse_ts(value) -> datetime:
+    ts = datetime.fromisoformat(str(value))
+    return ts if ts.tzinfo is not None else ts.replace(tzinfo=timezone.utc)
+
+
 class PeakAvoidTracker:
     """Berekent vermeden piekbijdrage (kW) en besparing via capaciteitstarief."""
 
@@ -229,13 +234,26 @@ class PeakAvoidTracker:
     def record_pending_avoid(self, device_id: str, device_name: str,
                               nominal_kw: float,
                               ts: Optional[datetime] = None,
-                              deferred: bool = False) -> None:
+                              deferred: bool = False,
+                              fresh: bool = False) -> None:
+        """
+        fresh: een nieuwe, bevestigde afschakeling. Een achtergebleven pending
+        (een afschakeling waarvan het herstel nooit gemeten werd) wordt dan
+        vervangen in plaats van haar oude avoid_ts te houden: anders boekt de
+        volgende afschakeling, dagen later, in een kwartier van toen.
+        """
         if ts is None:
             ts = datetime.now(timezone.utc)
         # Opnieuw afgeschakeld terwijl de vorige meting nog liep: rond die
         # eerst af, anders gaat de eerdere vermijding verloren.
         if device_id in self._active:
             self.complete_peak_calculation(device_id, now=ts)
+        if fresh and device_id in self._pending and not self._pending[device_id].deferred:
+            _LOGGER.debug(
+                "PeakAvoidTracker: oude pending voor '%s' (sinds %s) vervangen",
+                device_name, self._pending[device_id].avoid_ts.isoformat(),
+            )
+            del self._pending[device_id]
         # Nog altijd uit sinds de vorige afschakeling: het oorspronkelijke
         # uitstelmoment blijft gelden.
         if device_id in self._pending:
@@ -435,6 +453,60 @@ class PeakAvoidTracker:
         """De piek-cascade hield na alle apparaten nog remaining_w W over."""
         q = _quarter_start(ts)
         self.exhausted_quarters[q] = round(max(self.exhausted_quarters.get(q, 0.0), remaining_w), 1)
+
+    def measurements_to_dict(self) -> Dict[str, list]:
+        """Lopende afschakelingen en metingen, voor de maandstaat (herstart)."""
+        return {
+            "pending": [
+                {"device_id": p.device_id, "device_name": p.device_name,
+                 "nominal_kw": p.nominal_kw, "avoid_ts": p.avoid_ts.isoformat(),
+                 "deferred": p.deferred}
+                for p in self._pending.values()
+            ],
+            "active": [
+                {"device_id": a.device_id, "device_name": a.device_name,
+                 "nominal_kw": a.nominal_kw, "avoid_ts": a.avoid_ts.isoformat(),
+                 "turnon_ts": a.turnon_ts.isoformat()}
+                for a in self._active.values()
+            ],
+        }
+
+    def measurements_from_dict(self, data) -> None:
+        """
+        Herstel lopende afschakelingen en metingen na een herstart, zodat een
+        apparaat dat tijdens de herstart afgeschakeld bleef, bij zijn herstel
+        nog geboekt wordt. Onleesbare items worden overgeslagen.
+        """
+        if not isinstance(data, dict):
+            return
+        for item in data.get("pending") or []:
+            try:
+                p = PendingAvoid(
+                    device_id=str(item["device_id"]), device_name=str(item["device_name"]),
+                    nominal_kw=float(item["nominal_kw"]),
+                    avoid_ts=_parse_ts(item["avoid_ts"]),
+                    deferred=bool(item.get("deferred", False)),
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+            self._pending[p.device_id] = p
+        for item in data.get("active") or []:
+            try:
+                a = ActivePeakMeasurement(
+                    device_id=str(item["device_id"]), device_name=str(item["device_name"]),
+                    nominal_kw=float(item["nominal_kw"]),
+                    avoid_ts=_parse_ts(item["avoid_ts"]),
+                    turnon_ts=_parse_ts(item["turnon_ts"]),
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+            self._active[a.device_id] = a
+
+    def measurements_fingerprint(self) -> tuple:
+        return (
+            tuple(sorted((k, p.avoid_ts) for k, p in self._pending.items())),
+            tuple(sorted((k, a.turnon_ts) for k, a in self._active.items())),
+        )
 
     def exhausted_to_dict(self) -> Dict[str, float]:
         return {q.isoformat(): w for q, w in sorted(self.exhausted_quarters.items())}
@@ -650,6 +722,9 @@ class SolarShiftTracker:
         _LOGGER.info("SolarShiftTracker: jaardata gereset")
 
     # ── Hook A: cascade schakelt apparaat IN (injectiepreventie) ──── #
+
+    def has_active_measurement(self, device_id: str) -> bool:
+        return device_id in self._active
 
     def start_solar_measurement(self, device_id: str, device_name: str,
                                   nominal_kw: float,

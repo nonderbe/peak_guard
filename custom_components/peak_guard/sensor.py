@@ -110,6 +110,7 @@ def restore_peak_tracker(
         peak_tracker.savings_euro_this_month = float(peak_state.get("savings_euro_this_month", 0.0))
         peak_tracker.device_names_this_month = dict(peak_state.get("device_names", {}))
         peak_tracker.exhausted_from_dict(peak_state.get("exhausted_quarters"))
+        peak_tracker.measurements_from_dict(peak_state.get("measurements"))
         if "extra_by_device" in peak_state:
             # Verschuiving per apparaat per kwartier: de hypothetische pieken
             # worden er bij elke update opnieuw uit berekend.
@@ -588,7 +589,8 @@ class SharedCapacityState:
             # Ook bij een volle log (100 events) moet een nieuw event opgeslagen worden.
             last = self._peak_tracker.events[-1] if self._peak_tracker.events else None
             n   = (len(self._peak_tracker.events), last.natural_stop_ts if last else None,
-                   tuple(sorted(self._peak_tracker.exhausted_quarters.items())))
+                   tuple(sorted(self._peak_tracker.exhausted_quarters.items())),
+                   self._peak_tracker.measurements_fingerprint())
             msv = self._peak_tracker.savings_euro_this_month
             if n != self._last_peak_events_count or msv != self._last_persisted_peak_month_savings:
                 events_data = [
@@ -617,6 +619,7 @@ class SharedCapacityState:
                     "extra_by_device":       self._peak_tracker.extra_to_dict(),
                     "device_names":          dict(self._peak_tracker.device_names_this_month),
                     "exhausted_quarters":    self._peak_tracker.exhausted_to_dict(),
+                    "measurements":          self._peak_tracker.measurements_to_dict(),
                     "events":                events_data,
                 })
                 self._last_peak_events_count            = n

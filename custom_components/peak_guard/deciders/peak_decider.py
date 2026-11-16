@@ -25,10 +25,17 @@ from ..const import (
     PEAK_SETTLE_S,
     PEAK_SWITCH_MIN_OFF_S,
 )
-from ..models import EV_MIN_OFF_DURATION_S, BaseCascadeDevice, DeviceSnapshot
+from ..models import (
+    EV_MIN_OFF_DURATION_S,
+    BaseCascadeDevice,
+    DeviceSnapshot,
+    age_s,
+    str_to_ts,
+    ts_to_str,
+)
 from ..quarter_budget import PeakBudget, PowerAverager, make_budget
 from ..utils import effective_peak_w
-from .base import BaseDecider, read_energy_kwh, read_power_w
+from .base import BaseDecider, read_energy_kwh, read_power_w, restore_need_w
 
 if TYPE_CHECKING:
     from ..avoided_peak_tracker import PeakAvoidTracker, SolarShiftTracker
@@ -72,6 +79,10 @@ class PeakDecider(BaseDecider):
         self._snapshots = snapshots
         # Laadschema: apparaten die het schema nu beheert, overslaan.
         self._skip_fn: Optional[Callable[[BaseCascadeDevice], bool]] = None
+        # Staat dit apparaat (ook) in de inject-cascade? Een door de piek
+        # gestopte EV wordt dan tijdens injectie niet door het piekherstel
+        # herstart, maar door de solar-cascade overgenomen.
+        self._solar_owner_fn: Optional[Callable[[BaseCascadeDevice], bool]] = None
         # EV's herstart op een lagere stroom: entity_id → (tijdstip, stroom A).
         self._ev_restarts: Dict[str, Tuple[datetime, int]] = {}
         # Kwartierbudget: geeft (kwartierstart, meterstand bij de start) van
@@ -79,12 +90,91 @@ class PeakDecider(BaseDecider):
         self._baseline_fn: Optional[Callable[[], Optional[Tuple[datetime, float]]]] = None
         self._averager = PowerAverager()
         self._budget_cache: Optional[Tuple[datetime, float, PeakBudget]] = None
-        # Laatste afschakeling door de cascade, en per entity wanneer ze uitging.
+        # Laatste afschakeling door de cascade (PEAK_SETTLE_S).
         self._last_shed_at: Optional[datetime] = None
-        self._shed_at: Dict[str, datetime] = {}
+        # Per entity: wanneer het herstel bevestigd werd (min_on_s). Gepersisteerd.
+        self._restored_at: Dict[str, datetime] = {}
 
     def set_skip_fn(self, skip_fn: Optional[Callable[[BaseCascadeDevice], bool]]) -> None:
         self._skip_fn = skip_fn
+
+    def set_solar_owner_fn(self, fn: Optional[Callable[[BaseCascadeDevice], bool]]) -> None:
+        self._solar_owner_fn = fn
+
+    # ------------------------------------------------------------------ #
+    #  Runtime-toestand (persistentie) en bevestigings-hooks              #
+    # ------------------------------------------------------------------ #
+
+    def runtime_to_dict(self) -> dict:
+        return {"restored_at": {k: ts_to_str(v) for k, v in self._restored_at.items()}}
+
+    def load_runtime(self, data) -> None:
+        self._restored_at.clear()
+        if not isinstance(data, dict):
+            return
+        for eid, raw in (data.get("restored_at") or {}).items():
+            ts = str_to_ts(raw)
+            if ts is not None:
+                self._restored_at[eid] = ts
+
+    def _on_apply_acked(self, device: BaseCascadeDevice, now: datetime) -> None:
+        # Het verbruik daalt pas nu: de volgende metingen zijn weer verouderd.
+        self._last_shed_at = now
+
+    def _on_restore_acked(self, device: BaseCascadeDevice, now: datetime) -> None:
+        self._restored_at[device.entity_id] = now
+
+    def _on_restore_given_up(self, device: BaseCascadeDevice) -> None:
+        self.peak_tracker.discard_pending(device.id)
+
+    def _on_snapshot_dropped(self, device: BaseCascadeDevice) -> None:
+        """Snapshot weg zonder bevestigd herstel (manuele bediening): niets boeken."""
+        if getattr(device, "action_type", None) != ACTION_EV_CHARGER:
+            self.peak_tracker.discard_pending(device.id)
+
+    @staticmethod
+    def _effective_min_on_s(device: BaseCascadeDevice) -> Optional[float]:
+        """min_on_s; met enkel max_off_s minstens PEAK_SWITCH_MIN_OFF_S (geen
+        20 min uit / 1 min aan bij een aanhoudende piek)."""
+        min_on_s = getattr(device, "min_on_s", None)
+        if min_on_s is None and getattr(device, "max_off_s", None) is not None:
+            return PEAK_SWITCH_MIN_OFF_S
+        return min_on_s
+
+    async def enforce_limits(self, now: datetime) -> None:
+        """
+        Zonder verbruiksmeting (run_tick(None)): bevestigingen verwerken en
+        max_off_s afdwingen, zodat een gepauzeerd apparaat niet blijft wachten
+        op een sensor die terugkomt.
+        """
+        if not self._snapshots:
+            return
+        await self._poll_acks(self._cascade, self._snapshots, "peak", now)
+        if await self._restore_max_off(now):
+            await self._save_fn()
+
+    def _min_on_blocks(self, device: BaseCascadeDevice, now: datetime) -> bool:
+        """min_on_s: na een herstel nog niet opnieuw afschakelen (de volgende apparaten wel)."""
+        min_on_s = self._effective_min_on_s(device)
+        if min_on_s is None or getattr(device, "action_type", None) == ACTION_EV_CHARGER:
+            return False
+        if device.entity_id in self._snapshots:
+            return False
+        restored_at = self._restored_at.get(device.entity_id)
+        if restored_at is None:
+            return False
+        elapsed = (now - restored_at).total_seconds()
+        if elapsed >= min_on_s:
+            return False
+        wait_s = min_on_s - elapsed
+        self.ev_guard.set_hold(
+            device.id, "min_on",
+            f"Wordt niet opnieuw afgeschakeld: na een herstel blijft dit apparaat minstens "
+            f"{min_on_s / 60:.0f} min aan (nog {wait_s:.0f} s). De piek-cascade "
+            f"schakelt intussen de volgende apparaten af.",
+            until=now + timedelta(seconds=wait_s),
+        )
+        return True
 
     def set_quarter_baseline_fn(
         self, fn: Optional[Callable[[], Optional[Tuple[datetime, float]]]]
@@ -116,6 +206,9 @@ class PeakDecider(BaseDecider):
         Controleer of het verbruik de maandpiek − buffer overschrijdt.
         Zo ja, start de piek-cascade.
         """
+        if now is None:
+            now = datetime.now(timezone.utc)
+        await self._poll_acks(self._cascade, self._snapshots, "peak", now)
         raw_peak = read_power_w(self.hass, self.config.get(CONF_PEAK_SENSOR))
         if raw_peak is None:
             _LOGGER.warning(
@@ -127,8 +220,6 @@ class PeakDecider(BaseDecider):
         # op een lagere piek dan dat minimum, ook al meldt de P1-meter minder.
         peak = effective_peak_w(raw_peak)
         buffer = float(self.config.get(CONF_BUFFER_WATTS, DEFAULT_BUFFER_WATTS))
-        if now is None:
-            now = datetime.now(timezone.utc)
         budget = self._budget(consumption, peak, buffer, now)
         excess = budget.excess_w
         _LOGGER.debug(
@@ -163,11 +254,17 @@ class PeakDecider(BaseDecider):
                 "Peak Guard: geen actieve apparaten in piek-cascade — niets te doen!"
             )
         before = set(self._snapshots)
-        remaining = await self._run_cascade(self._cascade, excess, self._snapshots, "peak", now)
+        remaining = await self._run_cascade(
+            self._cascade, excess, self._snapshots, "peak", now,
+            skip_fn=lambda d: self._min_on_blocks(d, now),
+        )
+        for entity_id in set(self._snapshots) - before:
+            # Typen zonder bevestiging (legacy throttle): afgeschakeld = nu.
+            snap = self._snapshots[entity_id]
+            if getattr(snap, "pending", None) is None and getattr(snap, "off_since", "x") is None:
+                snap.off_since = ts_to_str(now)
         if remaining < excess:
             self._last_shed_at = now
-        for entity_id in set(self._snapshots) - before:
-            self._shed_at[entity_id] = now
         if remaining > 0:
             # Alles wat kon, staat al uit: een piek in dit kwartier was niet te vermijden.
             self.peak_tracker.note_exhausted(now, remaining)
@@ -177,23 +274,29 @@ class PeakDecider(BaseDecider):
         Controleer of eerder uitgeschakelde apparaten veilig hersteld kunnen
         worden zonder de piekgrens opnieuw te overschrijden.
         """
+        if now is None:
+            now = datetime.now(timezone.utc)
+        self._prune_restored_at(now)
         if not self._snapshots:
+            return
+        await self._poll_acks(self._cascade, self._snapshots, "peak", now)
+        forced = await self._restore_max_off(now)
+        if not self._snapshots:
+            if forced:
+                await self._save_fn()
             return
         raw_peak = read_power_w(self.hass, self.config.get(CONF_PEAK_SENSOR))
         if raw_peak is None:
+            if forced:
+                await self._save_fn()
             return
         peak = effective_peak_w(raw_peak)
         buffer = float(self.config.get(CONF_BUFFER_WATTS, DEFAULT_BUFFER_WATTS))
-        if now is None:
-            now = datetime.now(timezone.utc)
         budget = self._budget(consumption, peak, buffer, now)
         headroom = budget.restore_headroom_w
         for entity_id in list(self._ev_restarts):
             if entity_id not in self._snapshots:
                 del self._ev_restarts[entity_id]
-        for entity_id in list(self._shed_at):
-            if entity_id not in self._snapshots:
-                del self._shed_at[entity_id]
         if headroom <= 0:
             _LOGGER.debug(
                 "Peak Guard [PIEK] herstel geblokkeerd: verbruik=%.0f W (herstel rekent "
@@ -206,6 +309,8 @@ class PeakDecider(BaseDecider):
                     continue
                 if self._skip_fn is not None and self._skip_fn(device):
                     continue
+                if getattr(self._snapshots[device.entity_id], "pending", None) is not None:
+                    continue   # eigen verklaring (bevestiging)
                 reduced_ev = (
                     getattr(device, "action_type", None) == ACTION_EV_CHARGER
                     and not self.ev_guard.peak_is_off(device)
@@ -218,12 +323,17 @@ class PeakDecider(BaseDecider):
                     + (f" en wat het kwartier nog toelaat ({min(budget.allowed_w, budget.limit_w):.0f} W)."
                        if budget.on_budget else f" ({peak - buffer:.0f} W)."),
                 )
+            if forced:
+                await self._save_fn()
             return
 
         snapshots_to_restore = self._get_restore_candidates(
-            self._cascade, self._snapshots, reverse=True, skip_fn=self._skip_fn
+            self._cascade, self._snapshots, reverse=True, skip_fn=self._skip_fn,
+            on_drop=self._on_snapshot_dropped,
         )
         if not snapshots_to_restore:
+            if forced:
+                await self._save_fn()
             return
 
         # Herstel kandidaten in omgekeerde prioriteitsvolgorde
@@ -231,11 +341,25 @@ class PeakDecider(BaseDecider):
         # Reduceer de beschikbare headroom per hersteld apparaat. Een apparaat
         # dat niet past, houdt de kleinere apparaten erna niet tegen.
         remaining_headroom = headroom
-        any_restored = False
+        any_restored = forced
         for device, snapshot in snapshots_to_restore:
             is_ev = getattr(device, "action_type", None) == ACTION_EV_CHARGER
             if is_ev:
                 ev_off = self.ev_guard.peak_is_off(device)
+                if (
+                    ev_off and consumption < 0
+                    and self._solar_owner_fn is not None and self._solar_owner_fn(device)
+                    and device.entity_id not in self._ev_restarts
+                ):
+                    # Injectie: de solar-cascade start deze EV op het overschot
+                    # (hand_over_to_solar neemt dan het snapshot over). Het
+                    # piekherstel zou hem op de originele stroom herstarten.
+                    self.ev_guard.set_hold(
+                        device.id, "peak_solar_handover",
+                        "Gestopt door de piekbeperking; er is nu injectie, dus de solar-cascade "
+                        "start de lader op het overschot in plaats van het piekherstel.",
+                    )
+                    continue
                 if self._ev_restart_pending(device, ev_off, now):
                     _ts, restart_a = self._ev_restarts[device.entity_id]
                     remaining_headroom -= restart_a * self.ev_guard.voltage(device)
@@ -283,10 +407,15 @@ class PeakDecider(BaseDecider):
                             )
                         continue
             else:
-                need_w = float(device.power_watts) if device.power_watts else 0.0
-                shed_at = self._shed_at.get(device.entity_id)
-                off_s = (now - shed_at).total_seconds() if shed_at is not None else None
-                if off_s is not None and off_s < PEAK_SWITCH_MIN_OFF_S:
+                if getattr(snapshot, "pending", None) == "apply":
+                    continue   # afschakeling nog niet bevestigd
+                need_w = restore_need_w(device, snapshot)
+                if getattr(snapshot, "pending", None) == "restore":
+                    # Herstel verstuurd, nog niet bevestigd: zijn vermogen komt terug.
+                    remaining_headroom -= need_w
+                    continue
+                off_s = age_s(getattr(snapshot, "off_since", None), now)
+                if off_s < PEAK_SWITCH_MIN_OFF_S:
                     wait_s = PEAK_SWITCH_MIN_OFF_S - off_s
                     self.ev_guard.set_hold(
                         device.id, "min_off",
@@ -314,13 +443,22 @@ class PeakDecider(BaseDecider):
 
             restored = await self._restore_device(device, snapshot, cascade_type="peak", now=now)
             if restored:
-                del self._snapshots[device.entity_id]
+                self._snapshots.pop(device.entity_id, None)
+                if not is_ev and getattr(snapshot, "pending", None) == "done":
+                    self._restored_at[device.entity_id] = now
                 remaining_headroom -= need_w
                 any_restored = True
                 _LOGGER.info(
                     "Peak Guard [PIEK]: '%s' terug AAN — headroom was %.0f W "
                     "(piek=%.0f W, buffer=%.0f W, verbruik=%.0f W)",
                     device.name, headroom, peak, buffer, consumption,
+                )
+            elif not is_ev and getattr(snapshot, "pending", None) == "restore":
+                remaining_headroom -= need_w
+                any_restored = True   # snapshot gewijzigd: opslaan
+                self.ev_guard.set_hold(
+                    device.id, "awaiting_ack",
+                    "Herstel verstuurd; wacht tot het apparaat de oorspronkelijke toestand meldt.",
                 )
             else:
                 self.ev_guard.set_hold(
@@ -369,7 +507,6 @@ class PeakDecider(BaseDecider):
             )
             del self._snapshots[device.entity_id]
             self._ev_restarts.pop(device.entity_id, None)
-            self._shed_at.pop(device.entity_id, None)
             # Een stop door de piek wacht op de herinschakeling: die is er nu.
             self.peak_tracker.start_measurement_on_turnon(
                 device_id=device.id, device_name=device.name, ts=now,
@@ -418,6 +555,54 @@ class PeakDecider(BaseDecider):
                 "Peak Guard [PIEK]: '%s' overgenomen van de solar-cascade — na de piek "
                 "terug naar %s", device.name, inject_snap.original_state,
             )
+
+    def _prune_restored_at(self, now: datetime) -> None:
+        longest = max(
+            (self._effective_min_on_s(d) or 0 for d in self._cascade), default=0
+        )
+        for eid, ts in list(self._restored_at.items()):
+            if (now - ts).total_seconds() > max(longest, 0):
+                del self._restored_at[eid]
+
+    async def _restore_max_off(self, now: datetime) -> bool:
+        """
+        max_off_s: een apparaat dat zo lang (bevestigd) afgeschakeld is, gaat
+        terug aan, ook zonder piekruimte. Bewuste afweging van de gebruiker
+        (bv. een gepauzeerde wasmachine): dit kan een nieuwe maandpiek zetten.
+        """
+        changed = False
+        for device in sorted(self._cascade, key=lambda d: d.priority, reverse=True):
+            snap = self._snapshots.get(device.entity_id)
+            max_off_s = getattr(device, "max_off_s", None)
+            if snap is None or getattr(snap, "pending", None) is not None or max_off_s is None:
+                continue
+            if getattr(device, "action_type", None) == ACTION_EV_CHARGER:
+                continue
+            if self._skip_fn is not None and self._skip_fn(device):
+                continue
+            if device.manual_override:
+                continue
+            off_s = age_s(getattr(snap, "off_since", None), now)
+            if off_s == float("inf") or off_s < max_off_s:
+                continue
+            self.ev_guard._warn(
+                "Peak Guard [PIEK]: '%s' %.0f min afgeschakeld — maximum (%.0f min) bereikt, "
+                "hersteld ongeacht de piekruimte",
+                device.name, off_s / 60, max_off_s / 60,
+            )
+            restored = await self._restore_device(device, snap, cascade_type="peak", now=now)
+            changed = True
+            if restored:
+                self._snapshots.pop(device.entity_id, None)
+                if getattr(snap, "pending", None) == "done":
+                    self._restored_at[device.entity_id] = now
+            self.ev_guard.set_hold(
+                device.id, "max_off",
+                f"Na {off_s / 60:.0f} min afgeschakeld hersteld: dit apparaat mag hoogstens "
+                f"{max_off_s / 60:.0f} min uit blijven, ook als dat de piek verhoogt."
+                + ("" if restored else " Wacht op bevestiging van het apparaat."),
+            )
+        return changed
 
     def _ev_restart_pending(self, device: BaseCascadeDevice, ev_off: bool, now: datetime) -> bool:
         """

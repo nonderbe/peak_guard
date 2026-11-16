@@ -753,6 +753,29 @@ class TestBudgetReserveAndUnreachable:
         await self.ev_guard.apply_action(self.device, 5000.0, {}, "solar", self.pt, self.st)
         assert len(self.hass.services.calls) == n, "volgende loop: niets naar een onbereikbare wagen"
 
+    @patch("custom_components.peak_guard.deciders.ev_guard.asyncio.sleep", new_callable=AsyncMock)
+    async def test_is_charging_refusal_counts_as_started(self, _mock_sleep):
+        """Veldlog nov 2026: de laadstatus loopt achter, Tesla weigert met
+        'is_charging' — dat is geen mislukking en wordt niet herhaald."""
+        self.hass.services._raise_on.add("turn_on")
+        self.hass.services.error_message = "Command was unsuccessful: is_charging"
+        ok, err = await self.ev_guard._turn_on_with_retry(
+            self.device, "switch.tesla_charge", "SCHEMA", "laadschema")
+        assert ok is True and err is not None   # ok met fout = laadt al
+        assert len(self.hass.services.calls_for("turn_on")) == 1
+
+    @pytest.mark.parametrize("msg", [
+        "Command was unsuccessful: complete", "Command was unsuccessful: disconnected",
+    ])
+    @patch("custom_components.peak_guard.deciders.ev_guard.asyncio.sleep", new_callable=AsyncMock)
+    async def test_final_refusal_not_retried(self, _mock_sleep, msg):
+        self.hass.services._raise_on.add("turn_on")
+        self.hass.services.error_message = msg
+        ok, err = await self.ev_guard._turn_on_with_retry(
+            self.device, "switch.tesla_charge", "SOLAR", "injectiepreventie")
+        assert ok is False and err is not None
+        assert len(self.hass.services.calls_for("turn_on")) == 1
+
 
 # ═══════════════════════════════════════════════════════════════════════════ #
 #  6. throttle_down_solar                                                     #
@@ -764,6 +787,8 @@ class TestThrottleDownSolar:
         self.hass = hass
         self.device = ev_device
         self.ev_guard = EVGuard(hass=hass, config={}, iteration_actions=[])
+        # Verlagen gaat enkel over een EV die laadt (sinds v1.9.7).
+        hass.states.set("switch.tesla_charge", "on")
 
     async def test_reduces_current_for_grid_import(self):
         """

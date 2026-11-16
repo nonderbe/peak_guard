@@ -30,6 +30,8 @@ from ..const import (
     EV_API_BUDGET_RESERVE,
     EV_UNREACHABLE_BACKOFF_S,
     EV_UNREACHABLE_ERRORS,
+    EV_CHARGING_CONFIRM_S,
+    PEAK_RESTART_CONFIRM_S,
     DEFAULT_EV_MAX_AMPERE,
     DEFAULT_EV_MIN_AMPERE,
     DEFAULT_EV_SOLAR_START_THRESHOLD_W,
@@ -64,6 +66,10 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 
+# Weigeringen van een turn_on die bij herhaling hetzelfde antwoord geven
+# (Tesla: batterij vol / kabel niet ingeplugd) — niet opnieuw proberen.
+EV_TURN_ON_FINAL_REFUSALS = ("unsuccessful: complete", "unsuccessful: disconnected")
+
 
 class EVCallBlocked(HomeAssistantError):
     """_svc() weigerde de call vóór er iets vertrok (budget, reserve, onbereikbaar)."""
@@ -86,6 +92,11 @@ class EVGuard:
         self.config = config
         self._iteration_actions = iteration_actions   # gedeelde mutable lijst
         self._guards: Dict[str, EVDeviceGuard] = {}
+        # Schakelaar-entity → (tijdstip, laadstatus in HA op dat moment) van een
+        # turn_on die de wagen weigerde met 'is_charging'. Per entity, niet per
+        # device.id, zodat alle kopieën (piek/injectie/schema) het delen; een
+        # geslaagde turn_off van die schakelaar wist het (_svc).
+        self._charging_confirmed: Dict[str, tuple] = {}
         self._rate_limiter = EVRateLimiter()
         self._recent_warnings: deque = deque(maxlen=100)
         # Wordt gezet door apply_action; BaseDecider leest dit na de aanroep.
@@ -466,6 +477,9 @@ class EVGuard:
         except Exception as err:
             error_str = str(err)
             raise
+        else:
+            if domain == "switch" and service == "turn_off":
+                self._charging_confirmed.pop(data.get("entity_id"), None)
         finally:
             self._record_call()
             self._note_result(domain, error_str)
@@ -485,6 +499,7 @@ class EVGuard:
                         success=error_str is None,
                         error=error_str,
                         duration_ms=(monotonic() - start) * 1000,
+                        charge_state=ctx.get("charge_state") or None,
                     )
                 except Exception:
                     pass  # logging mag EV-logica nooit onderbreken
@@ -817,7 +832,8 @@ class EVGuard:
     ) -> tuple:
         """switch.turn_on met retries; elke poging telt mee in de rate-limiter.
 
-        Geeft (ok, laatste_fout) terug. Vóór elke herhaling wordt de
+        Geeft (ok, laatste_fout) terug; ok met een fout = de wagen weigerde
+        omdat hij al laadt ('is_charging'). Vóór elke herhaling wordt de
         rate-limiter opnieuw gecontroleerd zodat een vol venster de lus stopt.
         """
         last_err: Optional[HomeAssistantError] = None
@@ -831,8 +847,20 @@ class EVGuard:
                 return True, None
             except HomeAssistantError as ha_err:
                 last_err = ha_err
+                msg = str(ha_err).lower()
+                if "is_charging" in msg:
+                    # Tesla weigert turn_on omdat de wagen al laadt: het doel is
+                    # bereikt (de laadstatus in HA loopt vaak minuten achter).
+                    _LOGGER.info(
+                        "Peak Guard [%s]: '%s' laadt al (turn_on geweigerd: %s)",
+                        label, device.name, ha_err,
+                    )
+                    self.confirm_charging(device)
+                    return True, ha_err
                 if isinstance(ha_err, EVCallBlocked) or self.unreachable_remaining_s(device.name) > 0:
                     break   # opnieuw proberen helpt niet (geblokkeerd of wagen onbereikbaar)
+                if any(r in msg for r in EV_TURN_ON_FINAL_REFUSALS):
+                    break   # vol of niet ingeplugd: opnieuw proberen geeft hetzelfde antwoord
                 if attempt < EV_CMD_MAX_RETRIES:
                     self._warn(
                         "Peak Guard [%s]: '%s' turn_on mislukt "
@@ -931,7 +959,7 @@ class EVGuard:
         """
         if now is None:
             now = datetime.now(timezone.utc)
-        self._log_ctx = {"device": device.name, "cascade": cascade_type, "surplus_w": 0.0}
+        self._log_ctx = {"charge_state": self._charge_state(device), "device": device.name, "cascade": cascade_type, "surplus_w": 0.0}
         try:
             sw_entity  = device.switch_entity or device.entity_id
             cur_entity = device.current_entity
@@ -945,8 +973,23 @@ class EVGuard:
 
             # ---- PIEKBEPERKING: schakelaar was aan, nu uitgeschakeld ---- #
             if snapshot.original_state == "on":
-                if sw_state.state != "on":
-                    await self._svc("switch", "turn_on", {"entity_id": sw_entity})
+                # Enkel inschakelen als de wagen niet laadt: na een verlaging
+                # (niet gestopt) laadt hij nog, en een Tesla-schakelaar die
+                # altijd 'unknown' meldt zou dan elke keer een turn_on krijgen.
+                # Tesla weigert die met 'is_charging', wat het herstel als
+                # mislukt liet tellen. Het EV-API-log bewaart de laadstatus bij
+                # elke call (charge_state), zodat te zien blijft of een turn_on
+                # nodig was.
+                if sw_state.state != "on" and self.peak_is_off(device):
+                    try:
+                        await self._svc("switch", "turn_on", {"entity_id": sw_entity})
+                    except HomeAssistantError as err:
+                        if "is_charging" not in str(err).lower():
+                            raise
+                        _LOGGER.info(
+                            "Peak Guard EV peak: '%s' laadt al (turn_on geweigerd: %s) — "
+                            "herstel gaat verder", device.name, err,
+                        )
                     _LOGGER.info(
                         "Peak Guard EV peak: '%s' terug ingeschakeld "
                         "(reden: herstel na piekbeperking)",
@@ -1025,8 +1068,26 @@ class EVGuard:
                 return True
 
             # ---- INJECTIEPREVENTIE: schakelaar was uit (of unknown), nu aangezet ---- #
-            if snapshot.original_state in ("off", "unknown"):
-                if sw_state.state != "off":
+            if snapshot.original_state != "on":
+                # Een gekende laadstatus die niet 'laden' is, telt als uit: geen
+                # turn_off naar een gestopte Tesla (schakelaar 'unknown').
+                # Net gestart door Peak Guard: de laadstatus loopt nog achter.
+                charge_state = self._charge_state(device)
+                _g = self.get_guard(device.id)
+                just_started = (
+                    _g.turned_on_at is not None
+                    and (now - _g.turned_on_at).total_seconds() < SCHEDULE_START_CONFIRM_S
+                )
+                # Enkel een schakelaar zonder bruikbare toestand (Tesla:
+                # 'unknown') wordt via de laadstatus beoordeeld; een schakelaar
+                # die 'on' meldt, gaat altijd uit (anders laadt een wagen die
+                # later weer ingeplugd wordt van het net).
+                stopped = sw_state.state == "off" or (
+                    sw_state.state in ("unknown", "unavailable")
+                    and not just_started
+                    and charge_state != "" and charge_state not in ("charging", "starting")
+                )
+                if not stopped:
                     await self._set_soc_override(
                         device, override=False, original_soc=snapshot.original_soc
                     )
@@ -1088,9 +1149,30 @@ class EVGuard:
                     await self._set_soc_override(
                         device, override=False, original_soc=snapshot.original_soc
                     )
+                    # Een eerder verlaagde stroom (vóór v1.9.7 verlaagde de
+                    # solar-cascade ook een stilstaande wagen) terugzetten.
+                    guard = self.get_guard(device.id)
+                    if (
+                        cur_entity and snapshot.original_current is not None
+                        and guard.last_sent_amps is not None
+                        and round(guard.last_sent_amps) != round(snapshot.original_current)
+                    ):
+                        try:
+                            await self._svc(
+                                "number", "set_value",
+                                {"entity_id": cur_entity,
+                                 "value": round(snapshot.original_current, 1)},
+                            )
+                            guard.last_sent_amps = float(snapshot.original_current)
+                            guard.last_current_update = now
+                        except HomeAssistantError as err:
+                            _LOGGER.debug(
+                                "Peak Guard EV solar: '%s' laadstroom niet hersteld (%s)",
+                                device.name, err,
+                            )
                     _LOGGER.debug(
-                        "Peak Guard EV solar: '%s' schakelaar al uit bij herstel — "
-                        "snapshot opgeruimd zonder service-call",
+                        "Peak Guard EV solar: '%s' laadt niet bij herstel — "
+                        "snapshot opgeruimd zonder stop",
                         device.name,
                     )
                     solar_tracker.complete_solar_calculation(
@@ -1178,7 +1260,7 @@ class EVGuard:
 
         Returns: het extra vermogen (W) dat de lader nu opeist (0 = niets gedaan).
         """
-        self._log_ctx = {"device": device.name, "cascade": "peak", "surplus_w": 0.0}
+        self._log_ctx = {"charge_state": self._charge_state(device), "device": device.name, "cascade": "peak", "surplus_w": 0.0}
         cur_entity = device.current_entity
         current_a = self.read_current_a(device)
         if not cur_entity or current_a is None:
@@ -1263,7 +1345,7 @@ class EVGuard:
             False — stroom staat al op hw-minimum of kan niet zinvol worden
                     verlaagd; aanroeper moet EV volledig stoppen.
         """
-        self._log_ctx = {"device": device.name, "cascade": "solar", "surplus_w": -consumption}
+        self._log_ctx = {"charge_state": self._charge_state(device), "device": device.name, "cascade": "solar", "surplus_w": -consumption}
         cur_entity = device.current_entity
         if not cur_entity:
             return False
@@ -1288,6 +1370,22 @@ class EVGuard:
         guard = self.get_guard(device.id)
         if now is None:
             now = datetime.now(timezone.utc)
+        recently_started = (
+            guard.turned_on_at is not None
+            and (now - guard.turned_on_at).total_seconds() < SCHEDULE_START_CONFIRM_S
+        )
+        charging = self.is_charging(device)
+        if not charging and not self._charge_state(device):
+            # Geen laadstatus en een schakelaar zonder toestand (Tesla zonder
+            # charge_state_sensor): val terug op wat Peak Guard zelf weet.
+            _sw = self.hass.states.get(device.switch_entity or device.entity_id)
+            if _sw is None or _sw.state in ("unknown", "unavailable"):
+                charging = guard.state == EVState.CHARGING and guard.last_switch_state is True
+        if not charging and not recently_started:
+            # Laadt niet (en Peak Guard startte hem niet net): niets te
+            # verlagen. Het herstel ruimt het snapshot op zonder de stroom
+            # van een stilstaande wagen te verlagen.
+            return False
         # Een Tesla meldt de nieuwe laadstroom vaak pas na een tijd: beslis op
         # de laatst verstuurde waarde zolang de sensor nog achterloopt.
         current_a = self._effective_current_amps(device, guard, cur_state, now, current_a)
@@ -1418,6 +1516,17 @@ class EVGuard:
                 return s
         return ""
 
+    def _read_float(self, entity_id: Optional[str]) -> Optional[float]:
+        if not entity_id:
+            return None
+        st = self.hass.states.get(entity_id)
+        if st is None:
+            return None
+        try:
+            return float(st.state)
+        except (TypeError, ValueError):
+            return None
+
     def is_charging(self, device: EVChargerDevice) -> bool:
         """True als de EV echt laadt.
 
@@ -1427,12 +1536,31 @@ class EVGuard:
         auto laadt niet.
         """
         charge_state = self._charge_state(device)
+        conf = self._charging_confirmed.get(device.switch_entity or device.entity_id)
+        if (
+            conf is not None and charge_state == conf[1]
+            and (datetime.now(timezone.utc) - conf[0]).total_seconds() < EV_CHARGING_CONFIRM_S
+        ):
+            # De wagen weigerde een turn_on met 'is_charging' en de laadstatus
+            # in HA is sindsdien niet veranderd (loopt achter): hij laadt.
+            return True
         if charge_state:
             # Een gekende laadstatus is leidend: een Tesla-schakelaar blijft
             # vaak 'on' na uitpluggen ('disconnected') of aan de limiet.
             return charge_state in ("charging", "starting")
         sw_state = self.hass.states.get(device.switch_entity or device.entity_id)
         return sw_state is not None and sw_state.state == "on"
+
+    def confirm_charging(self, device: EVChargerDevice) -> None:
+        """De wagen meldde zelf dat hij laadt (turn_on geweigerd met 'is_charging')."""
+        self._charging_confirmed[device.switch_entity or device.entity_id] = (
+            datetime.now(timezone.utc), self._charge_state(device),
+        )
+
+    def charging_confirmed_state(self, device: EVChargerDevice) -> Optional[str]:
+        """Laadstatus in HA bij de laatste 'is_charging'-weigering (None = geen)."""
+        conf = self._charging_confirmed.get(device.switch_entity or device.entity_id)
+        return conf[1] if conf is not None else None
 
     def charge_complete(self, device: EVChargerDevice) -> bool:
         """True als de laadstatus meldt dat de auto aan zijn laadlimiet zit."""
@@ -1467,7 +1595,7 @@ class EVGuard:
             return False
         if not self._rate_check(device.name, f"laadlimiet {value:.0f}% ({reason})"):
             return False
-        self._log_ctx = {"device": device.name, "cascade": "schedule", "surplus_w": 0.0}
+        self._log_ctx = {"charge_state": self._charge_state(device), "device": device.name, "cascade": "schedule", "surplus_w": 0.0}
         try:
             await self._svc(
                 "number", "set_value",
@@ -1490,7 +1618,7 @@ class EVGuard:
     ) -> Optional[str]:
         """Start het laden voor het laadschema. None = gestart, anders de reden waarom niet."""
         guard = self.get_guard(device.id)
-        self._log_ctx = {"device": device.name, "cascade": "schedule", "surplus_w": 0.0}
+        self._log_ctx = {"charge_state": self._charge_state(device), "device": device.name, "cascade": "schedule", "surplus_w": 0.0}
         sw_entity = device.switch_entity or device.entity_id
 
         if (
@@ -1516,7 +1644,9 @@ class EVGuard:
             )
             return "turn_on mislukt"
 
-        self._track_action(sw_entity, "switch.turn_on")
+        already = err is not None   # geweigerd met 'is_charging': laadt al
+        if not already:
+            self._track_action(sw_entity, "switch.turn_on")
         guard.state             = EVState.CHARGING
         guard.scheduled         = True
         guard.skip_reason       = ""
@@ -1525,6 +1655,10 @@ class EVGuard:
         guard.turned_off_at     = None
         guard.turned_off_by_pg  = False
         self._reset_debounce(guard)
+        if already:
+            # De laadstatus in HA liep achter; de stroom blijft zoals hij is
+            # (de toelating rekende de lading niet mee, ze zou te laag zijn).
+            return "laadt al (turn_on geweigerd: is_charging)"
         _LOGGER.info("Peak Guard [SCHEMA]: → '%s' laden gestart met %d A", device.name, amps)
         await self.schedule_set_current(device, amps, now)
         return None
@@ -1539,7 +1673,7 @@ class EVGuard:
         guard = self.get_guard(device.id)
         if not self._rate_check(device.name, f"set_value {amps} A voor laadschema"):
             return False
-        self._log_ctx = {"device": device.name, "cascade": "schedule", "surplus_w": 0.0}
+        self._log_ctx = {"charge_state": self._charge_state(device), "device": device.name, "cascade": "schedule", "surplus_w": 0.0}
         try:
             await self._svc(
                 "number", "set_value", {"entity_id": cur_entity, "value": float(amps)},
@@ -1561,7 +1695,7 @@ class EVGuard:
         sw_entity = device.switch_entity or device.entity_id
         if not self._rate_check(device.name, f"turn_off ({reason})", reducing=True):
             return False
-        self._log_ctx = {"device": device.name, "cascade": "schedule", "surplus_w": 0.0}
+        self._log_ctx = {"charge_state": self._charge_state(device), "device": device.name, "cascade": "schedule", "surplus_w": 0.0}
         try:
             await self._svc("switch", "turn_off", {"entity_id": sw_entity})
         except HomeAssistantError as err:
@@ -1605,7 +1739,7 @@ class EVGuard:
     ) -> float:
         """Dispatch to _apply_peak or _apply_solar after shared setup."""
         self.last_skip_reason = ""
-        self._log_ctx = {"device": device.name, "cascade": cascade_type, "surplus_w": excess}
+        self._log_ctx = {"charge_state": self._charge_state(device), "device": device.name, "cascade": cascade_type, "surplus_w": excess}
 
         min_a   = float(device.min_value if device.min_value is not None else DEFAULT_EV_MIN_AMPERE)
         max_a   = float(device.max_value if device.max_value is not None else DEFAULT_EV_MAX_AMPERE)
@@ -1636,6 +1770,10 @@ class EVGuard:
                         sw_entity, sw_state.state, device.status_sensor, _st_fallback.state,
                     )
                     sw_on = True
+        if not sw_on and sw_state.state in ("unknown", "unavailable") and self.is_charging(device):
+            # Zelfde fallback via de laadstatus (charge_state_sensor) of een
+            # bevestigde 'is_charging'-weigering, ook zonder status-sensor.
+            sw_on = True
 
         current_a: Optional[float] = None
         cur_state = None
@@ -1660,7 +1798,12 @@ class EVGuard:
         # Piekpad: een EV die niet laadt, wordt niet afgeschakeld en krijgt dus
         # geen snapshot. Een 'off'/'unknown'-snapshot in de piek-cascade zou bij
         # herstel de injectie-tak nemen en de lader uitschakelen.
-        if snap_key not in snapshots and (cascade_type != "peak" or sw_on):
+        # Solarpad: enkel een lopende lading krijgt hier een snapshot (Peak
+        # Guard neemt ze over). Een EV die uit staat, krijgt er pas een op het
+        # moment dat Peak Guard hem start (_apply_solar): anders stuurt het
+        # herstel stroom- en limietcommando's naar een wagen die niet thuis is
+        # of nooit gestart werd.
+        if snap_key not in snapshots and sw_on:
             # Gebruik de effectieve staat: als de status-sensor aangeeft dat de auto
             # laadt terwijl de schakelaar 'unknown' meldt, sla 'on' op zodat restore
             # weet dat de auto al actief was en niet uitgeschakeld moet worden.
@@ -1683,15 +1826,8 @@ class EVGuard:
                 voltage, min_a, max_a, phases, now, guard,
             )
 
-        # ── Solar pre-setup (before _apply_solar) ──────────────────── #
-        # SOC-override: apply as soon as snapshot is created so that a
-        # Tesla stopped at its charge limit (but switch still "on") will
-        # resume.  Must happen before the solar path reads guard state.
-        if device.max_soc is not None and not guard.soc_override_active:
-            if self._rate_check(device.name, "SOC-override activeren"):
-                await self._set_soc_override(device, override=True)
-                guard.soc_override_active = True
-
+        # De SoC-override volgt pas na de kabel- en thuis-check (_apply_solar):
+        # niet de laadlimiet verzetten van een wagen die niet thuis is.
         current_a = self._effective_current_amps(device, guard, cur_state, now, current_a)
 
         hw_min_a = float(
@@ -1731,6 +1867,40 @@ class EVGuard:
                 "Peak Guard EV peak: '%s' overgeslagen — EV laadt niet", device.name
             )
             return excess
+        charge_state = self._charge_state(device)
+        just_stopped = (
+            guard.turned_off_by_pg and guard.turned_off_at is not None
+            and (now - guard.turned_off_at).total_seconds() < PEAK_RESTART_CONFIRM_S
+        )
+        if guard.last_switch_state is False and (
+            just_stopped or not self.is_charging(device)
+        ):
+            # Vlak na de eigen turn_off toont een Tesla vaak nog 'charging'.
+            # Door Peak Guard gestopt en niet herstart (een Tesla-schakelaar
+            # blijft 'unknown', de status-fallback zegt dan 'aan'): niets af te
+            # schakelen. Enkel een laadstatus 'charging' (manueel herstart) telt.
+            self.last_skip_reason = "al gestopt door Peak Guard"
+            return excess
+        recently_started = (
+            guard.last_switch_state is True and guard.turned_on_at is not None
+            and (now - guard.turned_on_at).total_seconds() < EV_CHARGING_CONFIRM_S
+        )
+        if (
+            charge_state and not self.is_charging(device)
+            # Vlak na een eigen start toont een Tesla nog minuten 'stopped':
+            # de lading loopt wel en is hier de enige rem (het schema verlaagt
+            # niet zelf). 'complete'/'disconnected' blijven wel gelden.
+            and not (recently_started and charge_state == "stopped")
+        ):
+            # Een gekende laadstatus zegt dat de wagen niet laadt (vol, gestopt,
+            # uitgeplugd): er valt niets af te schakelen. De status-fallback in
+            # apply_action of een 'on'-schakelaar mag hier geen vermogen tellen
+            # dat er niet is — anders worden de apparaten erachter niet afgeschakeld.
+            self.last_skip_reason = f"laadt niet (laadstatus {charge_state})"
+            _LOGGER.debug(
+                "Peak Guard EV peak: '%s' overgeslagen — laadstatus '%s'", device.name, charge_state
+            )
+            return excess
 
         eff_current_a    = current_a if current_a is not None else max_a
         current_w        = eff_current_a * voltage
@@ -1742,12 +1912,16 @@ class EVGuard:
             # Below minimum → turn the charger off entirely.
 
             if guard.last_switch_state is False:
+                # Al gestopt door Peak Guard: het verbruik weerspiegelt dat al
+                # (PEAK_SETTLE_S dekt de eerste seconden). Niets meetellen,
+                # anders blijven de apparaten erachter aan.
                 _LOGGER.debug(
                     "Peak Guard EV peak: '%s' uitschakelen OVERGESLAGEN — "
-                    "schakelaar al uit (redundant call vermeden)",
+                    "al gestopt door Peak Guard (redundant call vermeden)",
                     device.name,
                 )
-                return excess - current_w
+                self.last_skip_reason = "al gestopt door Peak Guard"
+                return excess
 
             if not self._rate_check(device.name, "turn_off voor piekbeperking", reducing=True):
                 return excess
@@ -2040,6 +2214,15 @@ class EVGuard:
             self.last_skip_reason = guard.skip_reason
             return excess
 
+        # Lopende lading (switch aan) die Peak Guard overneemt: verhoog de
+        # laadlimiet, zodat een Tesla die aan zijn limiet stopte (schakelaar
+        # blijft 'on') verder laadt. Een gestopte EV krijgt de override pas
+        # bij de start hieronder.
+        if sw_on and device.max_soc is not None and not guard.soc_override_active:
+            if self._rate_check(device.name, "SOC-override activeren"):
+                await self._set_soc_override(device, override=True)
+                guard.soc_override_active = True
+
         # Detect manual start
         if sw_on and guard.last_switch_state is not True:
             _LOGGER.info(
@@ -2135,6 +2318,18 @@ class EVGuard:
                     self.last_skip_reason = guard.skip_reason
                     return excess
 
+                # Peak Guard start de lading: nu pas een snapshot. Een
+                # 'unknown'/'unavailable'-schakelaar telt als uit: het herstel
+                # kent enkel 'on' en 'off'.
+                created_snap = snap_key not in snapshots
+                if created_snap:
+                    snapshots[snap_key] = DeviceSnapshot(
+                        entity_id=snap_key,
+                        original_state="off",
+                        original_current=current_a,
+                        original_soc=self._read_float(device.soc_entity),
+                    )
+
                 # If Tesla was asleep when the snapshot was made (original_soc=None),
                 # force a fresh poll so we can restore correctly later.
                 _snap_now = snapshots.get(snap_key)
@@ -2184,16 +2379,35 @@ class EVGuard:
                         device, override=False,
                         original_soc=_snap_now.original_soc if _snap_now else None,
                     )
+                    guard.soc_override_active = False
+                    if created_snap:
+                        snapshots.pop(snap_key, None)
                     return excess
 
-                self._track_action(sw_entity, "switch.turn_on")
+                already = _last_err is not None   # geweigerd met 'is_charging'
+                # Enkel de eigen SoC-override kan een volle wagen hervat hebben;
+                # stond hij niet op 'complete', dan is het een manuele/app-start
+                # met een verouderde laadstatus: na het overschot blijft hij laden.
+                manual = already and self.charging_confirmed_state(device) not in (
+                    "complete", "fully_charged",
+                )
+                if manual:
+                    _snap_m = snapshots.get(snap_key)
+                    if created_snap and _snap_m is not None:
+                        _snap_m.original_state = "on"
+                if not already:
+                    self._track_action(sw_entity, "switch.turn_on")
                 guard.state           = EVState.CHARGING
                 guard.skip_reason     = ""
                 guard.last_switch_state = True
                 guard.turned_on_at    = now
                 self._reset_debounce(guard)
 
-                if cur_entity:
+                if already and solar_tracker.has_active_measurement(device.id):
+                    # Loopt al: geen nieuwe meting en geen stroomwijziging.
+                    return excess   # zijn verbruik zit al in de gemeten afname
+
+                if cur_entity and not manual:
                     if self._rate_check(device.name, f"set_value {new_a} A bij turn_on"):
                         try:
                             await self._svc(
