@@ -162,6 +162,9 @@ class DeviceSnapshot:
     # het overschot). Het piekherstel herstart hem dan niet; de solar-cascade
     # beslist (v1.9.8).
     solar_started:    bool = False
+    # Thermostaat met peak_setback: de doeltemperatuur die Peak Guard zette
+    # (verlaagd bij verwarmen, verhoogd bij koelen) in plaats van 'off'.
+    set_temp:         Optional[float] = None
 
 
 def ts_to_str(ts: datetime) -> str:
@@ -929,15 +932,63 @@ class ClimateDevice(BaseCascadeDevice):
     inject_temp: Optional[float] = None
     # Leeg: de verwarmingsmodus die de thermostaat aanbiedt (heat, heat_cool, auto …).
     heat_mode:   str = ""
+    # Piek-cascade: de doeltemperatuur zoveel °C bijstellen (lager bij
+    # verwarmen, hoger bij koelen) in plaats van uitschakelen. None/0 = uit.
+    peak_setback: Optional[float] = None
 
     @classmethod
     def _from_dict(cls, base: dict, d: dict) -> "ClimateDevice":
-        inject_temp = d.get("inject_temp")
-        try:
-            inject_temp = float(inject_temp) if inject_temp not in (None, "") else None
-        except (TypeError, ValueError):
-            inject_temp = None
-        return cls(**base, inject_temp=inject_temp, heat_mode=d.get("heat_mode") or "")
+        def _opt_float(value):
+            try:
+                return float(value) if value not in (None, "") else None
+            except (TypeError, ValueError):
+                return None
+        setback = _opt_float(d.get("peak_setback"))
+        return cls(
+            **base, inject_temp=_opt_float(d.get("inject_temp")),
+            heat_mode=d.get("heat_mode") or "",
+            peak_setback=abs(setback) if setback else None,
+        )
+
+    @staticmethod
+    def _setback_sign(state) -> Optional[int]:
+        """
+        Richting van de bijstelling bij piekdreiging: -1 = doeltemperatuur
+        omlaag (verwarmen), +1 = omhoog (koelen), None = niet bij te stellen
+        (ventileren, ontvochtigen, auto zonder gekende richting).
+        """
+        mode = state.state
+        if mode == "heat":
+            return -1
+        if mode == "cool":
+            return 1
+        if mode in ("heat_cool", "auto"):
+            action = state.attributes.get("hvac_action")
+            if action == "heating":
+                return -1
+            if action == "cooling":
+                return 1
+            room = _float_attr(state, "current_temperature")
+            target = _float_attr(state, "temperature")
+            if room is not None and target is not None and abs(room - target) >= 0.5:
+                return -1 if room < target else 1
+        return None
+
+    def _setback_target(self, state, sign: int) -> Optional[float]:
+        """Bijgestelde doeltemperatuur (binnen min/max, op de stapgrootte), of None."""
+        target = _float_attr(state, "temperature")
+        if target is None or not self.peak_setback:
+            return None
+        step = _float_attr(state, "target_temp_step") or 0.5
+        new = target + sign * float(self.peak_setback)
+        new = round(round(new / step) * step, 2)
+        lo = _float_attr(state, "min_temp")
+        hi = _float_attr(state, "max_temp")
+        if lo is not None:
+            new = max(new, lo)
+        if hi is not None:
+            new = min(new, hi)
+        return new if abs(new - target) >= step - 0.01 else None
 
     def _heat_mode_for(self, state) -> str:
         """Ingestelde modus, anders de eerste niet-'off'-modus van de thermostaat."""
@@ -975,9 +1026,10 @@ class ClimateDevice(BaseCascadeDevice):
         """
         original = snapshot.original_temp
         target = _float_attr(state, "temperature")
-        if original is None or target is None or self.inject_temp is None:
+        ours = snapshot.set_temp if snapshot.set_temp is not None else self.inject_temp
+        if original is None or target is None or ours is None:
             return False
-        return abs(target - self.inject_temp) < 0.01 and abs(target - original) >= 0.01
+        return abs(target - ours) < 0.01 and abs(target - original) >= 0.01
 
     @staticmethod
     def _original_mode(snapshot: DeviceSnapshot) -> str:
@@ -989,6 +1041,9 @@ class ClimateDevice(BaseCascadeDevice):
 
     def applied(self, state, snapshot: DeviceSnapshot, cascade_type: str) -> bool:
         if cascade_type == "peak":
+            if snapshot.set_temp is not None:
+                target = _float_attr(state, "temperature")
+                return target is not None and abs(target - snapshot.set_temp) <= 0.25
             return state.state == "off"
         target = _float_attr(state, "temperature")
         return (
@@ -998,6 +1053,11 @@ class ClimateDevice(BaseCascadeDevice):
         )
 
     def restored(self, state, snapshot: DeviceSnapshot, cascade_type: str) -> bool:
+        if snapshot.set_temp is not None and self._original_mode(snapshot) != "off":
+            # Enkel de doeltemperatuur werd bijgesteld: terug = niet meer op
+            # de bijgestelde waarde (de oude, of wat de gebruiker koos).
+            target = _float_attr(state, "temperature")
+            return target is None or abs(target - snapshot.set_temp) > 0.25
         return state.state == self._original_mode(snapshot)
 
     async def _call(self, ctx: CascadeContext, service: str, data: dict) -> None:
@@ -1024,6 +1084,8 @@ class ClimateDevice(BaseCascadeDevice):
         if state.state in _CLIMATE_OFF_STATES:
             ctx.last_skip_reason = f"thermostaat staat al uit ({state.state or '?'})"
             return excess
+        if self.peak_setback:
+            return await self._apply_setback(excess, snapshots, ctx, state)
         if not self._is_heating(state):
             # Op temperatuur: niets af te schakelen. Uitzetten zou het eigen
             # tijdschema van de thermostaat onderbreken (een Tuya-thermostaat
@@ -1058,6 +1120,63 @@ class ClimateDevice(BaseCascadeDevice):
         _LOGGER.info(
             "Peak Guard: → thermostaat '%s' UITgeschakeld (piekbeperking, -%.0f W, overschot was %.0f W)",
             self.name, power_w, excess,
+        )
+        await self._confirm_apply(snapshot, ctx, power_w)
+        return excess - power_w
+
+    async def _apply_setback(self, excess, snapshots, ctx, state) -> float:
+        """Piek: doeltemperatuur bijstellen (airco, warmtepomp) i.p.v. uitschakelen."""
+        existing = snapshots.get(self.entity_id)
+        target = _float_attr(state, "temperature")
+        if (
+            existing is not None and existing.set_temp is not None
+            and target is not None and abs(target - existing.set_temp) <= 0.25
+        ):
+            # Al bijgesteld: nooit een tweede keer (anders telkens 2 °C verder).
+            ctx.last_skip_reason = f"al bijgesteld naar {existing.set_temp:.1f} °C"
+            return excess
+        action = state.attributes.get("hvac_action")
+        if action in ("idle", "off", "fan", "drying"):
+            ctx.last_skip_reason = f"draait niet ({action}) — niets af te schakelen"
+            return excess
+        sign = self._setback_sign(state)
+        if sign is None:
+            ctx.last_skip_reason = f"modus '{state.state}': richting van bijstellen onbekend"
+            return excess
+        new_temp = self._setback_target(state, sign)
+        if new_temp is None:
+            ctx.last_skip_reason = "doeltemperatuur onbekend of al aan de grens"
+            return excess
+        if self.draws_nothing(ctx.hass):
+            ctx.last_skip_reason = (
+                f"verbruikt nu niets ({self.live_power_w(ctx.hass):.0f} W volgens "
+                f"{self.power_sensor})"
+            )
+            return excess
+        power_w = self.shed_power_w(ctx.hass)
+        created = existing is None
+        if created:
+            snapshots[self.entity_id] = DeviceSnapshot(
+                entity_id=self.entity_id, original_state=state.state, original_temp=target,
+            )
+        snapshot = snapshots[self.entity_id]
+        previous_set = snapshot.set_temp
+        snapshot.set_temp = new_temp
+        try:
+            await self._call(ctx, "set_temperature", {"temperature": new_temp})
+        except HomeAssistantError as err:
+            ctx.warn(
+                "Peak Guard: '%s' niet bereikbaar om bij te stellen — "
+                "volgende cyclus opnieuw (%s)", self.name, err,
+            )
+            if created:
+                snapshots.pop(self.entity_id, None)
+            else:
+                snapshot.set_temp = previous_set
+            return excess
+        _LOGGER.info(
+            "Peak Guard: → thermostaat '%s' %.1f → %.1f °C (piekbeperking, -%.0f W, overschot was %.0f W)",
+            self.name, target, new_temp, power_w, excess,
         )
         await self._confirm_apply(snapshot, ctx, power_w)
         return excess - power_w
@@ -1122,7 +1241,17 @@ class ClimateDevice(BaseCascadeDevice):
         original_mode = self._original_mode(snapshot)
         try:
             sent = False
-            if original_mode != "off" and self._setpoint_still_ours(state, snapshot):
+            if snapshot.set_temp is not None and original_mode != "off":
+                # Bijgesteld (peak_setback): enkel de temperatuur terug, en
+                # alleen als ze nog op de bijgestelde waarde staat en de
+                # airco aan staat. De modus heeft Peak Guard niet gewijzigd.
+                if (
+                    state.state not in _CLIMATE_OFF_STATES
+                    and self._setpoint_still_ours(state, snapshot)
+                ):
+                    await self._call(ctx, "set_temperature", {"temperature": snapshot.original_temp})
+                    sent = True
+            elif original_mode != "off" and self._setpoint_still_ours(state, snapshot):
                 data = {"temperature": snapshot.original_temp}
                 if state.state != original_mode:
                     data["hvac_mode"] = original_mode

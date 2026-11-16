@@ -1060,7 +1060,7 @@ class PeakGuardPanel extends HTMLElement {
       switch_on:   "Dit apparaat wordt ingeschakeld bij overtollige zonne-energie om de injectie naar het net te beperken.",
       throttle:    "Het vermogen van dit apparaat wordt verminderd via een instelbare number-entiteit (legacy modus).",
       ev_charger:  "Elektrisch voertuig met variabele laadstroom. Peak Guard past de laadsnelheid aan op basis van beschikbaar vermogen.",
-      climate:     "Thermostaat: gaat uit bij piekdreiging en verwarmt op de ingestelde doeltemperatuur bij zonne-overschot; daarna terug naar de vorige instelling.",
+      climate:     "Thermostaat: gaat uit (of wordt enkele graden bijgesteld) bij piekdreiging en verwarmt op de ingestelde doeltemperatuur bij zonne-overschot; daarna terug naar de vorige instelling.",
     };
 
     return `
@@ -1732,7 +1732,7 @@ class PeakGuardPanel extends HTMLElement {
             <b>Uitschakelen</b>: schakelaar die tijdelijk uitgaat bij piekdreiging.<br>
             <b>Inschakelen</b>: schakelaar die aangaat bij zonne-overschot.<br>
             <b>EV Charger</b>: laadpaal met variabele stroomsterkte.<br>
-            <b>Thermostaat</b>: gaat uit bij piekdreiging, verwarmt op een doeltemperatuur bij zonne-overschot.
+            <b>Thermostaat</b>: gaat uit (of enkele graden lager) bij piekdreiging, verwarmt op een doeltemperatuur bij zonne-overschot.
           </div>
         </div>
 
@@ -1752,6 +1752,15 @@ class PeakGuardPanel extends HTMLElement {
             <input id="f-inject-temp" type="number" min="5" max="35" step="0.5"
               value="${d.inject_temp ?? 24}" />
             <div class="field-hint">Zolang er overschot is, verwarmt de thermostaat op deze temperatuur. Daarna keert hij terug naar zijn vorige modus en temperatuur.</div>
+          </div>
+        </div>
+
+        <div id="climate-peak-fields" ${isClimate && !isInject ? "" : 'style="display:none"'}>
+          <div class="form-group">
+            <label>Bij piekdreiging bijstellen met (°C)</label>
+            <input id="f-peak-setback" type="number" min="0" max="10" step="0.5"
+              value="${d.peak_setback ?? ""}" placeholder="leeg = uitschakelen" />
+            <div class="field-hint">Leeg: de thermostaat gaat uit bij piekdreiging. Ingevuld (bv. 2): de doeltemperatuur gaat tijdelijk zoveel graden omlaag bij verwarmen (omhoog bij koelen) en daarna terug — handig voor airco's en warmtepompen.</div>
           </div>
         </div>
 
@@ -2319,6 +2328,11 @@ class PeakGuardPanel extends HTMLElement {
             climateFields.style.display =
               v === "climate" && this._editCascadeType === "inject" ? "" : "none";
           }
+          const climatePeakFields = root.querySelector("#climate-peak-fields");
+          if (climatePeakFields) {
+            climatePeakFields.style.display =
+              v === "climate" && this._editCascadeType !== "inject" ? "" : "none";
+          }
         });
       }
 
@@ -2399,6 +2413,7 @@ class PeakGuardPanel extends HTMLElement {
         alert("Een thermostaat heeft een climate.*-entiteit nodig."); return;
       }
       const injectTemp  = parseFloat(val("#f-inject-temp"));
+      const peakSetback = parseFloat(val("#f-peak-setback"));
       const minutes = (sel) => {
         const m = parseFloat(val(sel));
         return isNaN(m) || m <= 0 ? null : Math.round(m * 60);
@@ -2414,6 +2429,9 @@ class PeakGuardPanel extends HTMLElement {
         max_value:      isThrottle ? (parseFloat(val("#f-max")) || 32)  : null,
         power_per_unit: isThrottle ? (parseFloat(val("#f-ppu")) || 690) : null,
         inject_temp:    isClimate ? (isNaN(injectTemp) ? (this._editDevice?.inject_temp ?? null) : injectTemp) : null,
+        heat_mode:      isClimate ? (this._editDevice?.heat_mode || "") : "",
+        peak_setback:   isClimate && isPeakLimit ? (peakSetback > 0 ? peakSetback : null)
+                          : (isClimate ? (this._editDevice?.peak_setback ?? null) : null),
         power_sensor:   isPeakLimit ? (val("#f-power-sensor") || "") : "",
         max_off_s:      isPeakLimit ? minutes("#f-max-off") : null,
         min_on_s:       isPeakLimit ? minutes("#f-min-on") : null,

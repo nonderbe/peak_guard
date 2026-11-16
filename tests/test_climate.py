@@ -305,3 +305,117 @@ class TestTuyaThermostat:
         self._tuya(hass, temp=24.0, room=19.0)
         ctx = _ctx(hass, ev_guard, "peak")
         assert await _device().apply(2500.0, {}, ctx) == pytest.approx(700.0)
+
+
+class TestPeakSetback:
+    """peak_setback: doeltemperatuur bijstellen i.p.v. uitschakelen (airco)."""
+
+    def _ac(self, **kw):
+        return _device(peak_setback=2, inject_temp=None, power_watts=800, **kw)
+
+    def test_serialisation(self):
+        dev = self._ac()
+        assert dev.peak_setback == 2.0
+        assert from_dict(asdict(dev)) == dev
+        assert _device(peak_setback="").peak_setback is None
+        assert _device(peak_setback=0).peak_setback is None
+
+    async def test_heating_lowers_the_setpoint(self, hass, ev_guard):
+        _set(hass, "heat", temp=21.0, room=20.0, action=None)
+        snaps: dict = {}
+        ctx = _ctx(hass, ev_guard, "peak")
+        left = await self._ac().apply(2500.0, snaps, ctx)
+        assert left == pytest.approx(1700.0)
+        (call,) = hass.services.calls
+        assert call["service"] == "set_temperature"
+        assert call["data"] == {"entity_id": ENTITY, "temperature": 19.0}
+        snap = snaps[ENTITY]
+        assert (snap.original_state, snap.original_temp, snap.set_temp) == ("heat", 21.0, 19.0)
+        assert snap.pending is None
+        assert ctx.peak_tracker.pending_avoids == [{"id": "dev_bad", "kw": 0.8, "deferred": False}]
+
+    async def test_cooling_raises_the_setpoint(self, hass, ev_guard):
+        _set(hass, "cool", temp=24.0, room=26.0, action=None)
+        snaps: dict = {}
+        await self._ac().apply(2500.0, snaps, _ctx(hass, ev_guard, "peak"))
+        (call,) = hass.services.calls
+        assert call["data"]["temperature"] == 26.0
+
+    async def test_auto_mode_follows_hvac_action(self, hass, ev_guard):
+        _set(hass, "heat_cool", temp=21.0, room=21.0, action="heating")
+        snaps: dict = {}
+        await self._ac().apply(2500.0, snaps, _ctx(hass, ev_guard, "peak"))
+        assert hass.services.calls[0]["data"]["temperature"] == 19.0
+
+    async def test_fan_only_and_unknown_direction_are_skipped(self, hass, ev_guard):
+        for mode in ("fan_only", "dry"):
+            _set(hass, mode, action=None)
+            assert await self._ac().apply(2500.0, {}, _ctx(hass, ev_guard, "peak")) == 2500.0
+        _set(hass, "auto", temp=21.0, room=21.0, action=None)
+        assert await self._ac().apply(2500.0, {}, _ctx(hass, ev_guard, "peak")) == 2500.0
+        assert hass.services.calls == []
+
+    async def test_idle_unit_is_skipped(self, hass, ev_guard):
+        _set(hass, "heat", action="idle")
+        assert await self._ac().apply(2500.0, {}, _ctx(hass, ev_guard, "peak")) == 2500.0
+        assert hass.services.calls == []
+
+    async def test_not_lowered_twice(self, hass, ev_guard):
+        _set(hass, "heat", temp=21.0, action=None)
+        snaps: dict = {}
+        dev = self._ac()
+        await dev.apply(2500.0, snaps, _ctx(hass, ev_guard, "peak"))
+        left = await dev.apply(2500.0, snaps, _ctx(hass, ev_guard, "peak"))
+        assert left == 2500.0
+        assert len(hass.services.calls) == 1
+        assert hass.states.get(ENTITY).attributes["temperature"] == 19.0
+
+    async def test_clamped_to_min_temp(self, hass, ev_guard):
+        hass.states.set(ENTITY, "heat", {"temperature": 11.0, "min_temp": 10.0})
+        await self._ac().apply(2500.0, {}, _ctx(hass, ev_guard, "peak"))
+        assert hass.services.calls[0]["data"]["temperature"] == 10.0
+        hass.services.calls.clear()
+        hass.states.set(ENTITY, "heat", {"temperature": 10.0, "min_temp": 10.0})
+        assert await self._ac().apply(2500.0, {}, _ctx(hass, ev_guard, "peak")) == 2500.0
+        assert hass.services.calls == []
+
+    async def test_restore_sets_the_original_temperature_only(self, hass, ev_guard):
+        _set(hass, "heat", temp=19.0, action=None)
+        ctx = _ctx(hass, ev_guard, "peak")
+        snap = DeviceSnapshot(entity_id=ENTITY, original_state="heat",
+                              original_temp=21.0, set_temp=19.0)
+        assert await self._ac().restore(snap, ctx) is True
+        (call,) = hass.services.calls
+        assert call["service"] == "set_temperature"
+        assert call["data"] == {"entity_id": ENTITY, "temperature": 21.0}
+        assert ctx.peak_tracker.turn_on_measurements == ["dev_bad"]
+
+    async def test_restore_keeps_a_user_change(self, hass, ev_guard):
+        """Gebruiker zette tijdens de piek 23 °C, of zette de airco uit: niets terugzetten."""
+        for mode, temp in (("heat", 23.0), ("off", 19.0)):
+            hass.services.calls.clear()
+            _set(hass, mode, temp=temp, action=None)
+            snap = DeviceSnapshot(entity_id=ENTITY, original_state="heat",
+                                  original_temp=21.0, set_temp=19.0)
+            assert await self._ac().restore(snap, _ctx(hass, ev_guard, "peak")) is True
+            assert hass.services.calls == []
+
+    async def test_unacknowledged_setback_then_late_ack(self, hass, ev_guard):
+        """Cloud-airco die het commando nog niet uitvoerde: open tot de nieuwe setpoint."""
+        _set(hass, "heat", temp=21.0, action=None)
+        hass.services.no_reflect.add(ENTITY)
+        snaps: dict = {}
+        ctx = _ctx(hass, ev_guard, "peak")
+        dev = self._ac()
+        assert await dev.apply(2500.0, snaps, ctx) == pytest.approx(1700.0)
+        snap = snaps[ENTITY]
+        assert snap.pending == "apply"
+        assert ctx.peak_tracker.pending_avoids == []
+        assert dev.applied(hass.states.get(ENTITY), snap, "peak") is False
+        _set(hass, "heat", temp=19.0, action=None)
+        assert dev.applied(hass.states.get(ENTITY), snap, "peak") is True
+
+    async def test_snapshot_round_trip_keeps_set_temp(self):
+        snap = DeviceSnapshot(entity_id=ENTITY, original_state="heat",
+                              original_temp=21.0, set_temp=19.0)
+        assert DeviceSnapshot(**asdict(snap)) == snap
