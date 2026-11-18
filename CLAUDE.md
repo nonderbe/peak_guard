@@ -20,7 +20,7 @@ python3 -m venv .venv && .venv/bin/python -m pip install -r requirements-test.tx
 
 `requirements-test.txt` (pytest, pytest-asyncio) is test tooling only — the integration itself still has no third-party dependencies.
 
-The test suite uses stub modules in `tests/conftest.py` to avoid a live HA install; the stubbed `homeassistant.util.dt.as_local` uses a fixed Europe/Brussels time zone. Sixteen test files:
+The test suite uses stub modules in `tests/conftest.py` to avoid a live HA install; the stubbed `homeassistant.util.dt.as_local` uses a fixed Europe/Brussels time zone. Seventeen test files:
 - `tests/test_ev_guard.py` — 60 tests covering the EV state machine, rate limiter and its reserve, daily-budget reserve, unreachable-vehicle back-off, turn_on refusals, debounce, and Tesla-specific paths
 - `tests/test_tracker.py` — 32 tests covering the financial calculations in `PeakAvoidTracker` and `SolarShiftTracker`, incl. per-event and per-device hypothetical peaks, shift bookkeeping and measurement lifecycle
 - `tests/test_peak_floor.py` — 24 tests covering the 2.5 kW capacity-tariff floor (decider, savings, billed peak, decision log)
@@ -35,6 +35,7 @@ The test suite uses stub modules in `tests/conftest.py` to avoid a live HA insta
 - `tests/test_schedule.py` — 69 tests covering the charging schedule: window logic (midnight, DST, overlap, tariff sensor), serialisation, `ScheduleDecider`, and the peak > schedule > injection interplay through `deciders/dispatch.run_tick`
 - `tests/test_field_fixes.py` — 45 tests covering the fixes from the October 2026 field data (v1.9.3): quarter-boundary interpolation and the calculator restart state, the quarter budget (`quarter_budget.py`) and `PeakDecider` on it (spike vs. sustained overload, settle after own shedding, switch min-OFF, exhausted cascade), EV deferral bookkeeping, and raising the month record to the P1 meter, plus the DST change with local-time timer callbacks (real `zoneinfo`) and the 15-min bound on EV deferrals, and (v1.9.8) the slow-energy-sensor extrapolation (`PowerHistory`)
 - `tests/test_climate.py` — 50 tests covering `ClimateDevice` (thermostat): serialisation, switching off in the peak cascade (an idle thermostat is left alone), the inject temperature in the solar cascade (surplus rule, room already warm, no inject temperature), restore of the mode (setpoint only when it is still `inject_temp`), rollback on a failed call, the same thermostat in both cascades through `run_tick` (peak takes over from solar, solar takes over from peak), and a Tuya thermostat (`heat_cool` mode, no `hvac_action`), plus (v1.9.9) the `peak_setback` path (lower when heating / raise when cooling, never twice, clamped to `min_temp`, restore only while the setpoint is still Peak Guard's, late ack) and its review fixes (unavailable at restore, no escalation on resend, user change during the peak, warm room reading without `hvac_action` still sets back, setback removed mid-peak, both cascades, default `min_on`), and (v1.9.11) the climate trigger log (start/end lines, end reasons, nothing for an unacknowledged apply or the solar cascade, a failing log never breaks the cascade, the JSONL writer)
+- `tests/test_event_archive.py` — 15 tests covering the event archive (v1.9.12): appending completed events, seeding from the trackers without duplicates, more than the trackers' 100, live peak values for events that left the tracker log, freezing at the month change (also through `SharedCapacityState`), a missed month change closed late, pruning after 12 closed months, and the sensor attributes kept out of the recorder and capped
 - `tests/test_status_holds.py` — 25 tests covering the status explanations (`holds`) and the control fixes found with them: inject switch start rule, inject restore past a held EV, peak restore without `break`, stepwise EV restore after a peak, min-OFF on peak restore (also with a stale charge state), giving up a capped restart that never charges, headroom reservation for a restarted EV, and the hand-over of a peak-limited EV to the solar cascade
 - `tests/test_ack.py` — 74 tests covering v1.9.7 (incl. regressions for the Fable review findings, bugs 1, 2, 9, 10 of the first review, and a stale Tesla charge state) and the v1.9.8 fixes (solar-started EV after a peak, charger without charge state, restored pendings, repeated device errors): acknowledgement of switch/thermostat actions (immediate, laggy, no-ack timeout and resend, restore ack/resend/give-up, solar side), the `power_sensor` field, `max_off_s`/`min_on_s`, the stale-pending fix (bug 5) and the solar path on a stopped EV (bug 3)
 
@@ -65,7 +66,7 @@ The integration lives entirely in `custom_components/peak_guard/`.
 
 6. **Frontend panel** (`frontend/peak_guard_panel.js`): A ~3500-line custom Web Component (no framework) that polls `/api/peak_guard/cascade` every 15 seconds, shows real-time status (countdown, last loop timestamp), and lets users drag-drop reorder devices and configure EV charger setups.
 
-7. **Persistence** (HA `Store` API): Nine stores survive restarts (plus the append-only thermostat trigger log `peak_guard/climate_events.jsonl`) — cascade config (incl. the charging schedule and its runtime state), quarter history with monthly peaks, the running-quarter calculator state, peak and solar year savings, peak and solar month state (events), per-device monthly savings, and the EV daily call budget. Keys are in `const.py` (`STORAGE_KEY_*`) and `sensor.py` (`_STORAGE_KEY_*_STATE`).
+7. **Persistence** (HA `Store` API): Nine stores survive restarts (plus the append-only thermostat trigger log `peak_guard/climate_events.jsonl` and the event archive `peak_guard/events/`) — cascade config (incl. the charging schedule and its runtime state), quarter history with monthly peaks, the running-quarter calculator state, peak and solar year savings, peak and solar month state (events), per-device monthly savings, and the EV daily call budget. Keys are in `const.py` (`STORAGE_KEY_*`) and `sensor.py` (`_STORAGE_KEY_*_STATE`).
 
 ### Key classes
 
@@ -265,6 +266,17 @@ Pruning counts back from the current local month; a future-dated record (wrong c
 
 Every query (`get_month_peak`, `get_monthly_peaks`, the 12-month average and the billed peak) reads the merge of both layers (`_peaks_by_month`). The billed peak and rolling average use the last 12 months; the history sensor exposes all stored months. With fewer than 12 months of history the average runs over the months available.
 
+### Event archive (v1.9.12)
+
+The trackers keep at most `MAX_EVENTS` (100) events per month in memory and in the month state (solar reaches that in ~11 days in November). `event_archive.py` keeps every event for the running month plus 12 closed months (`EVENT_ARCHIVE_MONTHS` = 13) in `<config>/peak_guard/events/` — outside `custom_components`:
+- `YYYY-MM.jsonl`: running month, one line per completed event, appended via the tracker hook `on_event` (`_emit`, a failing hook never breaks the tracker; writes go to the executor). Records use the sensor-attribute field names plus `key` (`p|device_id|avoid_ts` / `s|device_id|turnon_ts`) and, for peak events, `avoid_quarters`. The running month is also held in memory.
+- `YYYY-MM.json`: closed month with `totals` (`SharedCapacityState.month_totals()`), `maandpiek` (`month_peak_info()` of the last update before the change) and the final per-event values. Written by `async_close_month` in the rollover, before `reset_month`.
+- Peak per-event values are recalculated from the tracker (`PeakAvoidTracker.evaluate_quarters`, the same rule as `_recalc`): live for the running month (also for events that fell out of the 100), once more at the month change.
+- `async_load` (in `sensor.py` setup, after the trackers are restored) seeds tracker events that aren't archived yet, closes a `.jsonl` of an earlier month as `late` (month change missed while HA was down: last written values, no totals), and prunes months ≥ 13 back (future-dated files stay).
+- The savings tab fetches `/api/peak_guard/events` (month picker; the running month refreshes on the 15-s poll) and falls back to the sensor attributes until the first fetch. ~1.5 MB/year at November's rate.
+
+The event sensors' attributes (`events` on `sensor.peak_guard_peak_avoided_events` / `_solar_avoided_events`, the three tables on the overview "recente gebeurtenissen" sensor) are capped at `SENSOR_EVENT_ROWS` (25) and listed in `_unrecorded_attributes`: they exceeded the recorder's 16 KB attribute limit, and a dropped attribute row also drops the unit, which suspended the long-term statistics of the overview sensor.
+
 ### Simulation mode
 
 `/api/peak_guard/simulate` pins the consumption the controller steers on (`_simulation_consumption`, W). `/api/peak_guard/cascade` reports it under `simulation`; the panel shows that value instead of the real sensor, with a "Simulatie" note on the consumption card. The panel only refreshes it on its 15-second poll.
@@ -310,6 +322,7 @@ Accepted as-is; listed so they are not rediscovered as bugs.
 |---|---|---|
 | `/api/peak_guard/cascade` | GET, POST | Fetch or update the full cascade configuration (`type`: `peak`, `inject` or `schedule`); GET also returns `config.version` (from `manifest.json`, also set as `sw_version` on the devices and shown in the panel header) |
 | `/api/peak_guard/force_check` | POST | Trigger an immediate monitoring cycle |
+| `/api/peak_guard/events` | GET | Event archive: all peak and solar events of one month (`?month=YYYY-MM`, default the running month), plus `months`, `totals`, `maandpiek`, `final`/`late` |
 | `/api/peak_guard/simulate` | GET, POST | Read or set simulation mode (`consumption_w` in W, `null` to switch it off) |
 
 ## No external Python dependencies

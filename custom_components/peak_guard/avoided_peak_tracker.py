@@ -25,7 +25,7 @@ import logging
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from .const import CAPACITY_MIN_KW
 from .utils import quarter_start as _quarter_start
@@ -120,6 +120,16 @@ def _parse_ts(value) -> datetime:
     return ts if ts.tzinfo is not None else ts.replace(tzinfo=timezone.utc)
 
 
+def _emit(callback, event) -> None:
+    """Meld een afgerond event (event-archief); een fout breekt de tracker niet."""
+    if callback is None:
+        return
+    try:
+        callback(event)
+    except Exception as exc:   # noqa: BLE001
+        _LOGGER.debug("Event-hook fout: %s", exc)
+
+
 class PeakAvoidTracker:
     """Berekent vermeden piekbijdrage (kW) en besparing via capaciteitstarief."""
 
@@ -139,6 +149,8 @@ class PeakAvoidTracker:
 
         # Events log (max 100, FIFO)
         self.events: deque[PeakEvent] = deque(maxlen=MAX_EVENTS)
+        # Called with every completed event (event archive); never raises.
+        self.on_event: Optional[Callable[[PeakEvent], None]] = None
 
         # Maand-cumulatieven (holistisch herberekend, niet per event opgeteld)
         self.avoided_kw_this_month:   float = 0.0
@@ -359,6 +371,7 @@ class PeakAvoidTracker:
         )
         self.events.append(event)
         self._recalc()
+        _emit(self.on_event, event)
         _LOGGER.info(
             "PeakAvoidTracker: '%s' lading %.1f min uitgesteld (max. 15) (%.3f kWh) "
             "hypo=%.3fkW event_vermeden=%.3fkW €%.4f",
@@ -440,6 +453,7 @@ class PeakAvoidTracker:
         )
         self.events.append(event)
         self._recalc()
+        _emit(self.on_event, event)
 
         _LOGGER.info(
             "PeakAvoidTracker: '%s' duur=%.1fmin hypo=%.3fkW event_vermeden=%.3fkW €%.4f "
@@ -656,12 +670,22 @@ class PeakAvoidTracker:
         for event in self.events:
             if not event.avoid_quarters:
                 continue   # event van vóór v1.9.2: opgeslagen waarden behouden
-            hypo = max(self._hypo_quarter(q, totals) for q in event.avoid_quarters)
-            event.hypothetical_peak_kw = round(hypo, 4)
-            event.avoided_peak_kw = self._avoided_kw(hypo)
-            event.savings_euro = round(event.avoided_peak_kw * self._tarief / 12.0, 4)
+            (event.hypothetical_peak_kw, event.avoided_peak_kw,
+             event.savings_euro) = self.evaluate_quarters(event.avoid_quarters)
 
         self._recalc_month_savings()
+
+    def evaluate_quarters(self, quarters: List[datetime]) -> Tuple[float, float, float]:
+        """
+        Waarden van één event met deze avoid_quarters in de huidige maandstaat:
+        (hypothetisch kwartier kW, vermeden kW, besparing €). Ook voor events
+        die al uit de log van 100 vielen (event-archief).
+        """
+        if not quarters:
+            return 0.0, 0.0, 0.0
+        hypo = max(self._hypo_quarter(q, self.extra_dict) for q in quarters)
+        avoided = self._avoided_kw(hypo)
+        return round(hypo, 4), avoided, round(avoided * self._tarief / 12.0, 4)
 
     def _avoided_kw(self, hypo_kw: float) -> float:
         """
@@ -708,8 +732,10 @@ class SolarShiftTracker:
     def __init__(self) -> None:
         self._active: Dict[str, ActiveSolarMeasurement] = {}
 
-        # Events log (max 50, FIFO)
+        # Events log (max 100, FIFO)
         self.events: deque[SolarEvent] = deque(maxlen=MAX_EVENTS)
+        # Called with every completed event (event archive); never raises.
+        self.on_event: Optional[Callable[[SolarEvent], None]] = None
 
         # Maand-cumulatieven
         self.shifted_kwh_this_month:   float = 0.0
@@ -805,6 +831,7 @@ class SolarShiftTracker:
             savings_euro=savings,
         )
         self.events.append(event)
+        _emit(self.on_event, event)
         _LOGGER.info("SolarShiftTracker: '%s' duur=%.1fmin verschoven=%.4fkWh €%.4f",
                      meas.device_name, duration_min, shifted_kwh, savings)
         return event

@@ -108,6 +108,55 @@ class PeakGuardEvLogView(HomeAssistantView):
         })
 
 
+class PeakGuardEventsView(HomeAssistantView):
+    """REST endpoint voor het event-archief: alle events van één maand.
+
+    GET ?month=YYYY-MM (standaard de lopende maand). Antwoord: month,
+    current, final, late, months (beschikbare maanden, nieuwste eerst),
+    totals, maandpiek, peak[], solar[] (nieuwste eerst). Piek-events van de
+    lopende maand krijgen hun actuele waarden uit de tracker.
+    """
+
+    url = "/api/peak_guard/events"
+    name = "peak_guard:events"
+    requires_auth = True
+
+    async def get(self, request):
+        hass = request.app["hass"]
+        data = hass.data.get(DOMAIN, {})
+        archive = data.get("event_archive")
+        if archive is None or archive.current_month is None:
+            return self.json_message("Event-archief niet beschikbaar", status_code=503)
+        current = archive.current_month
+        month_q = request.query.get("month")
+        if month_q:
+            try:
+                year_s, month_s = month_q.split("-")
+                year, month = int(year_s), int(month_s)
+                if not 1 <= month <= 12:
+                    raise ValueError
+            except ValueError:
+                return self.json_message("'month' moet YYYY-MM zijn", status_code=400)
+        else:
+            year, month = current
+        live = (year, month) == current
+        controller = data.get("controller")
+        shared = data.get("shared")
+        result = await archive.async_month(
+            year, month,
+            peak_tracker=controller.peak_tracker if live and controller else None,
+            totals=shared.month_totals() if live and shared else None,
+            maandpiek=shared.month_peak_info() if live and shared else None,
+        ) or {"year": year, "month": month, "final": False, "late": False,
+              "totals": None, "maandpiek": None, "peak": [], "solar": []}
+        for rec in result.get("peak", []):
+            rec.pop("avoid_quarters", None)   # intern, enkel voor de herberekening
+        result["month"] = f"{year:04d}-{month:02d}"
+        result["current"] = live
+        result["months"] = await archive.async_months()
+        return self.json(result)
+
+
 class PeakGuardSimulateView(HomeAssistantView):
     """REST endpoint voor simulatiemodus: injecteer een kunstmatige verbruikswaarde."""
 
@@ -185,6 +234,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.http.register_view(PeakGuardForceCheckView())
     hass.http.register_view(PeakGuardSimulateView())
     hass.http.register_view(PeakGuardEvLogView())
+    hass.http.register_view(PeakGuardEventsView())
 
     # Frontend panel (eenmalig)
     if not hass.data.get(_PANEL_REGISTERED_KEY):
@@ -270,6 +320,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     hass.data.get(DOMAIN, {}).pop("ev_api_logger", None)
     hass.data.get(DOMAIN, {}).pop("ev_call_budget", None)
+    hass.data.get(DOMAIN, {}).pop("event_archive", None)
     hass.data.pop(_PANEL_REGISTERED_KEY, None)
     hass.services.async_remove(DOMAIN, "get_dashboard_yaml")
     frontend.async_remove_panel(hass, PANEL_URL)

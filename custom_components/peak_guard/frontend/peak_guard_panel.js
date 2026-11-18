@@ -30,6 +30,12 @@ class PeakGuardPanel extends HTMLElement {
     // Logboek tab: Tesla API call log (geladen on-demand via /api/peak_guard/ev_log)
     this._evLogData    = null;
     this._evLogLoading = false;
+
+    // Besparingen tab: event-archief per maand (/api/peak_guard/events).
+    // _eventsMonth null = lopende maand (ververst bij elke poll).
+    this._eventsData    = null;
+    this._eventsMonth   = null;
+    this._eventsLoading = false;
   }
 
   // ------------------------------------------------------------------ //
@@ -88,6 +94,9 @@ class PeakGuardPanel extends HTMLElement {
         this._log('_fetchData() data ontvangen. modalVisible=' + this._modalVisible);
         // Bereken wanneer de volgende controller-check verwacht wordt
         this._recalcNextCheck();
+        if (this._activeTab === "savings" && this._eventsMonth === null) {
+          await this._fetchEvents(null);
+        }
         if (!this._modalVisible) {
           this._log('_fetchData() => _render() aanroepen');
           this._render();
@@ -2513,6 +2522,11 @@ class PeakGuardPanel extends HTMLElement {
         this._render();
         if (t.dataset.tab === "savings") {
           setTimeout(() => this._initSavingsCharts(), 80);
+          if (!this._eventsLoading) {
+            this._fetchEvents(this._eventsMonth).then(() => {
+              if (this._activeTab === "savings" && !this._modalVisible) this._render();
+            });
+          }
         }
         if (t.dataset.tab === "logboek") {
           if (!this._evLogData && !this._evLogLoading) {
@@ -2540,6 +2554,13 @@ class PeakGuardPanel extends HTMLElement {
     });
     this.shadowRoot.querySelector("#btn-force-check")?.addEventListener("click", () => {
       this._forceCheck();
+    });
+
+    // Maandkeuze van het event-archief in de savings tab
+    this.shadowRoot.querySelector("#events-month")?.addEventListener("change", (ev) => {
+      const val = ev.target.value;
+      this._eventsMonth = (this._eventsData?.months?.[0] === val) ? null : val;
+      this._fetchEvents(this._eventsMonth).then(() => this._render());
     });
 
     // Chart selector in savings tab
@@ -3227,6 +3248,16 @@ class PeakGuardPanel extends HTMLElement {
         .no-data { color: var(--secondary-text-color, #bdbdbd); }
 
         /* Chart toggle */
+        .events-title {
+          display: flex; align-items: center; justify-content: space-between;
+          gap: 12px; flex-wrap: wrap;
+        }
+        .events-month-select {
+          font: inherit; font-size: 13px; padding: 4px 8px; border-radius: 6px;
+          border: 1px solid var(--divider-color, #ccc);
+          background: var(--card-background-color, #fff);
+          color: var(--primary-text-color, #000);
+        }
         .chart-toggle-row {
           display: flex; gap: 8px; margin-bottom: 12px;
         }
@@ -3395,11 +3426,19 @@ class PeakGuardPanel extends HTMLElement {
       : null;
 
     // ---- Events-log ophalen ------------------------------------ //
-    const peakEvents  = this._hass?.states["sensor.peak_guard_peak_avoided_events"]
-                          ?.attributes?.events ?? [];
+    // Alle events van de gekozen maand uit het event-archief; tot dat
+    // geladen is de laatste events uit de sensor-attributen.
+    const arch        = this._eventsData;
+    const sensorPeak  = this._hass?.states["sensor.peak_guard_peak_avoided_events"]?.attributes;
+    const peakEvents  = arch ? (arch.peak ?? []) : (sensorPeak?.events ?? []);
+    const evMonths    = arch?.months ?? [];
+    const evMonth     = arch?.month ?? null;
+    const evCurrent   = !arch || arch.current;
+    const maandNamen  = ["januari","februari","maart","april","mei","juni","juli","augustus","september","oktober","november","december"];
+    const monthLabel  = (ym) => { const [y, m] = ym.split("-").map(Number); return `${maandNamen[m-1]} ${y}`; };
     // Wanneer viel de maandpiek, en kon Peak Guard toen nog iets afschakelen?
-    const monthPeak   = this._hass?.states["sensor.peak_guard_peak_avoided_events"]
-                          ?.attributes?.maandpiek ?? null;
+    const monthPeak   = (arch && !arch.current) ? (arch.maandpiek ?? null)
+                                                : (sensorPeak?.maandpiek ?? null);
     const monthPeakKw = monthPeak?.kw != null ? Number(monthPeak.kw) : null;
     let monthPeakNote = "";
     if (monthPeakKw !== null && monthPeak.kwartier_start) {
@@ -3412,10 +3451,24 @@ class PeakGuardPanel extends HTMLElement {
         : "";
       monthPeakNote = `Maandpiek ${monthPeakKw.toFixed(3)} kW in het kwartier van ${when}.${why}`;
     }
-    const solarEvents = this._hass?.states["sensor.peak_guard_solar_avoided_events"]
-                          ?.attributes?.events ?? [];
+    const solarEvents = arch ? (arch.solar ?? [])
+      : (this._hass?.states["sensor.peak_guard_solar_avoided_events"]?.attributes?.events ?? []);
 
-    // ---- Gecombineerde events gesorteerd op tijd (max 100) ---------- //
+    // Maandtotalen van een afgesloten maand (de lopende staat bovenaan).
+    let pastTotals = "";
+    if (arch && !arch.current) {
+      const t = arch.totals;
+      const eur = (v) => v != null ? `€ ${Number(v).toFixed(2)}` : "—";
+      pastTotals = t
+        ? `<div class="field-hint" style="margin-bottom:8px;">${this._esc(monthLabel(evMonth))}: piekbeperking ${t.piek_vermeden_kw != null ? Number(t.piek_vermeden_kw).toFixed(3) + " kW vermeden, " : ""}${eur(t.piek_besparing_eur)} · injectiepreventie ${t.solar_verschoven_kwh != null ? Number(t.solar_verschoven_kwh).toFixed(1) + " kWh verschoven, " : ""}${eur(t.solar_besparing_eur)}.</div>`
+        : `<div class="field-hint" style="margin-bottom:8px;">${this._esc(monthLabel(evMonth))}: geen maandtotalen bewaard (de maandwissel viel terwijl Home Assistant uit stond); de events hebben hun laatst berekende waarden.</div>`;
+    }
+    const monthSelect = evMonths.length > 0 ? `
+      <select id="events-month" class="events-month-select">
+        ${evMonths.map(m => `<option value="${m}" ${m === evMonth ? "selected" : ""}>${monthLabel(m)}</option>`).join("")}
+      </select>` : "";
+
+    // ---- Gecombineerde events gesorteerd op tijd ---------------- //
     const allEvents = [
       ...peakEvents.map(e => ({
         ts:        e.timestamp_start_uitstel,
@@ -3437,7 +3490,7 @@ class PeakGuardPanel extends HTMLElement {
         hypo_kw:   null,
         eur:       e.besparing_eur,
       })),
-    ].sort((a, b) => b.ts.localeCompare(a.ts)).slice(0, 100);
+    ].sort((a, b) => b.ts.localeCompare(a.ts));
 
     // Tijdstempels zijn UTC; tijd en dag worden in lokale tijd getoond.
     const fmtTs = (iso) => {
@@ -3469,7 +3522,7 @@ class PeakGuardPanel extends HTMLElement {
     // Groepeer events per dag
     let eventsRows = "";
     if (allEvents.length === 0) {
-      eventsRows = `<tr><td colspan="6" class="ev-empty">Nog geen events bijgehouden</td></tr>`;
+      eventsRows = `<tr><td colspan="6" class="ev-empty">${evCurrent ? "Nog geen events bijgehouden deze maand" : "Geen events in deze maand"}</td></tr>`;
     } else {
       let lastDay = null;
       for (const e of allEvents) {
@@ -3563,9 +3616,11 @@ class PeakGuardPanel extends HTMLElement {
         <!-- ======================================================= -->
         <!-- Sectie 3: Events-tabel                                   -->
         <!-- ======================================================= -->
-        <div class="savings-section-title" style="margin-top:28px;">
-          📋 Recente gebeurtenissen (laatste 100)
+        <div class="savings-section-title events-title" style="margin-top:28px;">
+          <span>📋 Gebeurtenissen${arch ? ` — ${allEvents.length}` : " (laatste)"}</span>
+          ${monthSelect}
         </div>
+        ${pastTotals}
 
         ${monthPeakNote ? `<div class="field-hint" style="margin-bottom:8px;">${this._esc(monthPeakNote)}</div>` : ""}
         <div class="events-table-wrap">
@@ -3591,7 +3646,8 @@ class PeakGuardPanel extends HTMLElement {
           Ligt die onder de maandpiek${monthPeakKw !== null ? ` (${monthPeakKw.toFixed(3)} kW)` : ""},
           dan spaarde dat event niets uit: het kwartier bleef ook zonder ingreep onder de piek.
           Een EV laadt de uitgestelde energie later in de sessie bij; die telt in de kwartieren
-          waarin de lader uit stond. Waarden worden bijgewerkt tot de maand afsluit. Events in
+          waarin de lader uit stond. Waarden worden bijgewerkt tot de maand afsluit; afgesloten
+          maanden blijven 12 maanden bewaard. Events in
           hetzelfde kwartier overlappen, dus de som van de rijen is niet het maandtotaal (dat staat bovenaan).
         </div>
 
@@ -3883,6 +3939,19 @@ class PeakGuardPanel extends HTMLElement {
   // ------------------------------------------------------------------ //
   //  Logboek tab — data ophalen                                          //
   // ------------------------------------------------------------------ //
+
+  async _fetchEvents(month) {
+    this._eventsLoading = true;
+    try {
+      const url = month ? `/api/peak_guard/events?month=${encodeURIComponent(month)}` : "/api/peak_guard/events";
+      const resp = await this._hass.fetchWithAuth(url);
+      if (resp.ok) this._eventsData = await resp.json();
+    } catch (e) {
+      console.error("[PeakGuard] events ophalen mislukt:", e);
+    } finally {
+      this._eventsLoading = false;
+    }
+  }
 
   async _fetchEvLog(date) {
     this._evLogLoading = true;

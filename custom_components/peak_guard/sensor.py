@@ -60,9 +60,20 @@ from .quarter_store import QuarterStore
 from .monthly_device_savings_store import MonthlyDeviceSavingsStore
 from .avoided_peak_tracker import PeakAvoidTracker, PeakEvent, SolarShiftTracker, SolarEvent
 from .utils import local_year_month
+from .event_archive import EventArchive
 from .deciders.base import read_energy_kwh, read_power_w
 
 _LOGGER = logging.getLogger(__name__)
+
+# Rijen in de event-attributen van de sensoren: genoeg voor een dashboard,
+# klein genoeg voor de state machine. Alle events staan in het event-archief
+# (/api/peak_guard/events, tab Besparingen).
+SENSOR_EVENT_ROWS = 25
+
+
+def _newest(events) -> list:
+    """De laatste SENSOR_EVENT_ROWS events, nieuwste eerst."""
+    return list(events)[-SENSOR_EVENT_ROWS:][::-1]
 
 # Sensorupdate: elke minuut op seconde 0, zodat de eerste meting van een
 # kwartier (bijna) op de grens valt.
@@ -292,6 +303,20 @@ async def async_setup_entry(
                 len(solar_tracker.events),
             )
 
+    # Archief van alle events (12 maanden + lopende maand). Laden ná het
+    # herstel van de trackers: hun events van deze maand vullen het aan.
+    event_archive = EventArchive(hass)
+    try:
+        await event_archive.async_load(
+            current_year, current_month, peak_tracker.events, solar_tracker.events
+        )
+        peak_tracker.on_event = event_archive.record
+        solar_tracker.on_event = event_archive.record
+        hass.data[DOMAIN]["event_archive"] = event_archive
+    except Exception:   # noqa: BLE001 — zonder archief draait de rest gewoon
+        _LOGGER.exception("Peak Guard: event-archief niet geladen")
+        event_archive = None
+
     # Gedeelde state-container — alle afhankelijkheden volledig beschikbaar bij constructie
     shared = SharedCapacityState(
         hass=hass,
@@ -310,6 +335,7 @@ async def async_setup_entry(
         # Zelfde samenvoeging als de controller: opties gaan voor op de initiële config.
         peak_sensor_id={**entry.data, **entry.options}.get(CONF_PEAK_SENSOR),
         calc_store=calc_store,
+        event_archive=event_archive,
     )
 
     entities = [
@@ -378,8 +404,13 @@ class SharedCapacityState:
         device_savings_store,
         peak_sensor_id: Optional[str] = None,
         calc_store=None,
+        event_archive=None,
     ) -> None:
         self.hass = hass
+        self.event_archive = event_archive
+        # Maandpiek-uitleg van de vorige update: bij de maandwissel zijn de
+        # maandpiekwaarden hierboven al die van de nieuwe maand.
+        self._last_month_peak_info: Optional[dict] = None
         self._calc_store = calc_store
         self.energy_sensor_id = energy_sensor_id
         # Maandpiek-sensor van de P1-meter: referentie om eigen kwartierwaarden
@@ -436,6 +467,40 @@ class SharedCapacityState:
         if self._unsub:
             self._unsub()
             self._unsub = None
+
+    def month_peak_info(self) -> dict:
+        """
+        Wanneer viel de maandpiek, en was er toen nog iets af te schakelen?
+        cascade_uitgeput: in dat kwartier stonden alle apparaten van de
+        piek-cascade al uit of op minimum en bleef er toch overschot.
+        """
+        ts = self.monthly_peak_ts
+        exhausted_w = None
+        if ts and self._peak_tracker is not None:
+            try:
+                exhausted_w = self._peak_tracker.exhausted_quarters.get(datetime.fromisoformat(ts))
+            except (TypeError, ValueError):
+                exhausted_w = None
+        kw = self.monthly_peak_kw
+        return {
+            "kw": round(kw, 3) if kw is not None else None,
+            "kwartier_start": ts,
+            "meter_kw": round(self.meter_peak_kw, 3)
+                        if self.meter_peak_kw is not None else None,
+            "cascade_uitgeput": exhausted_w is not None,
+            "overschot_na_cascade_w": exhausted_w,
+        }
+
+    def month_totals(self) -> dict:
+        """Maandtotalen van beide modi (event-archief)."""
+        p, so = self._peak_tracker, self._solar_tracker
+        return {
+            "piek_vermeden_kw":   p.avoided_kw_this_month if p else None,
+            "piek_besparing_eur": p.savings_euro_this_month if p else None,
+            "hypothetische_maandpiek_kw": p.hypothetical_monthly_peak_kw if p else None,
+            "solar_verschoven_kwh": so.shifted_kwh_this_month if so else None,
+            "solar_besparing_eur":  so.savings_euro_this_month if so else None,
+        }
 
     async def _async_update(self, now: datetime) -> None:
         """Lees energiesensor, bereken kwartierpiek, update alle sensoren."""
@@ -522,6 +587,14 @@ class SharedCapacityState:
                     "Peak Guard: maandbesparing per apparaat bevroren voor %04d-%02d",
                     self._current_year, self._current_month,
                 )
+            # Bevries het event-archief van de afgelopen maand met de
+            # definitieve waarden per event, vóór de trackers gereset worden.
+            if self.event_archive is not None and self._peak_tracker:
+                await self.event_archive.async_close_month(
+                    self._peak_tracker, current_year, current_month,
+                    totals=self.month_totals(),
+                    maandpiek=self._last_month_peak_info,
+                )
             if self._peak_tracker:
                 self._peak_tracker.reset_month()
             if self._solar_tracker:
@@ -568,6 +641,7 @@ class SharedCapacityState:
                 actual_quarters=actual_quarters,
                 actual_monthly_peak=actual_peak,
             )
+            self._last_month_peak_info = self.month_peak_info()
 
         # Persist piek-jaarbesparingen bij wijziging
         if self._peak_tracker and self._savings_store:
@@ -1103,7 +1177,9 @@ class PeakSavingsEuroThisYearSensor(_TrackerSensorBase):
 
 
 class PeakAvoidedEventsSensor(_TrackerSensorBase):
-    """Log van de laatste 100 piek-vermijdings-events, plus uitleg bij de maandpiek."""
+    """De laatste piek-vermijdings-events (SENSOR_EVENT_ROWS), plus uitleg bij
+    de maandpiek. Alle events: /api/peak_guard/events (event-archief)."""
+    _unrecorded_attributes = frozenset({"events"})
     _DEF = _SensorDef(
         unique_suffix="peak_avoided_events",
         name="Peak Guard Piek Events Log",
@@ -1121,33 +1197,10 @@ class PeakAvoidedEventsSensor(_TrackerSensorBase):
     def native_value(self) -> int:
         return len(self._tracker.events)
 
-    def _month_peak_info(self) -> dict:
-        """
-        Wanneer viel de maandpiek, en was er toen nog iets af te schakelen?
-        cascade_uitgeput: in dat kwartier stonden alle apparaten van de
-        piek-cascade al uit of op minimum en bleef er toch overschot.
-        """
-        ts = self._shared.monthly_peak_ts
-        exhausted_w = None
-        if ts:
-            try:
-                exhausted_w = self._tracker.exhausted_quarters.get(datetime.fromisoformat(ts))
-            except (TypeError, ValueError):
-                exhausted_w = None
-        kw = self._shared.monthly_peak_kw
-        return {
-            "kw": round(kw, 3) if kw is not None else None,
-            "kwartier_start": ts,
-            "meter_kw": round(self._shared.meter_peak_kw, 3)
-                        if self._shared.meter_peak_kw is not None else None,
-            "cascade_uitgeput": exhausted_w is not None,
-            "overschot_na_cascade_w": exhausted_w,
-        }
-
     @property
     def extra_state_attributes(self) -> dict:
         return {
-            "maandpiek": self._month_peak_info(),
+            "maandpiek": self._shared.month_peak_info(),
             "events": [
                 {
                     "timestamp_start_uitstel": e.avoid_ts.isoformat(),
@@ -1157,7 +1210,7 @@ class PeakAvoidedEventsSensor(_TrackerSensorBase):
                     "hypothetische_piek_kw":   e.hypothetical_peak_kw,
                     "besparing_eur":           e.savings_euro,
                 }
-                for e in reversed(list(self._tracker.events))
+                for e in _newest(self._tracker.events)
             ],
         }
 
@@ -1237,7 +1290,9 @@ class SolarSavingsEuroThisYearSensor(_TrackerSensorBase):
 
 
 class SolarAvoidedEventsSensor(_TrackerSensorBase):
-    """Log van de laatste 100 solar-shift-events."""
+    """De laatste solar-shift-events (SENSOR_EVENT_ROWS). Alle events:
+    /api/peak_guard/events (event-archief)."""
+    _unrecorded_attributes = frozenset({"events"})
     _DEF = _SensorDef(
         unique_suffix="solar_avoided_events",
         name="Peak Guard Solar Events Log",
@@ -1266,7 +1321,7 @@ class SolarAvoidedEventsSensor(_TrackerSensorBase):
                     "verschoven_kwh":                e.shifted_kwh,
                     "besparing_eur":                 e.savings_euro,
                 }
-                for e in reversed(list(self._tracker.events))
+                for e in _newest(self._tracker.events)
             ],
         }
 
@@ -1635,8 +1690,11 @@ class OverviewSolarSavingsEuroMonthlySensor(_OverviewBase):
 
 class OverviewRecentEventsSensor(_OverviewBase):
     """
-    Toont de laatste 10 events van beide modi als geformatteerde
-    tekst in de state-attributen.
+    Toont de laatste SENSOR_EVENT_ROWS events van beide modi als
+    geformatteerde tekst in de state-attributen. De tabellen gaan niet naar
+    de recorder (_unrecorded_attributes): ze passen niet in de 16 KB-limiet
+    voor attributen, en zonder opgeslagen attributen kent de recorder de
+    eenheid niet en stopt hij de statistieken.
 
     State: totaal aantal events deze maand (int).
 
@@ -1652,6 +1710,9 @@ class OverviewRecentEventsSensor(_OverviewBase):
     _attr_icon              = "mdi:history"
     _attr_state_class       = SensorStateClass.MEASUREMENT
     _attr_native_unit_of_measurement = "events"
+    _unrecorded_attributes  = frozenset({
+        "piek_events_tabel", "solar_events_tabel", "gecombineerd_tabel",
+    })
 
     def __init__(self, shared: SharedCapacityState,
                  peak_tracker: PeakAvoidTracker,
@@ -1690,7 +1751,7 @@ class OverviewRecentEventsSensor(_OverviewBase):
             return iso[:16].replace("T", " ")
 
     def _build_peak_table(self) -> str:
-        events = list(self._peak.events)[-100:]
+        events = list(self._peak.events)[-SENSOR_EVENT_ROWS:]
         if not events:
             return "Nog geen piek-events deze maand."
         header = (
@@ -1708,7 +1769,7 @@ class OverviewRecentEventsSensor(_OverviewBase):
         return f"{header}\n{rows}"
 
     def _build_solar_table(self) -> str:
-        events = list(self._solar.events)[-100:]
+        events = list(self._solar.events)[-SENSOR_EVENT_ROWS:]
         if not events:
             return "Nog geen solar-events deze maand."
         header = (
@@ -1747,7 +1808,7 @@ class OverviewRecentEventsSensor(_OverviewBase):
                 "besparing": e.savings_euro,
             })
         combined.sort(key=lambda x: x["ts"], reverse=True)
-        recent = combined[:100]
+        recent = combined[:SENSOR_EVENT_ROWS]
         if not recent:
             return "Nog geen events deze maand."
         header = (
