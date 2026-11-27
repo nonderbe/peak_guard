@@ -36,7 +36,6 @@ from ..const import (
     DEFAULT_EV_MAX_AMPERE,
     DEFAULT_EV_MIN_AMPERE,
     DEFAULT_EV_SOLAR_START_THRESHOLD_W,
-    SCHEDULE_START_CONFIRM_S,
 )
 from .base import track_action
 from .charger_state import (
@@ -63,8 +62,6 @@ from ..models import (
     EV_RATE_LIMIT_WINDOW_S,
     EV_CMD_MAX_RETRIES,
     EV_CMD_RETRY_DELAY_S,
-    EV_VOLTS_1PHASE,
-    EV_VOLTS_3PHASE,
     EV_WAKE_COOLDOWN_S,
     EV_WAKE_TIMEOUT_S,
 )
@@ -1489,8 +1486,7 @@ class EVGuard:
 
         if (
             guard.scheduled and guard.last_switch_state is True
-            and guard.turned_on_at is not None
-            and (now - guard.turned_on_at).total_seconds() < SCHEDULE_START_CONFIRM_S
+            and self.view(device).just_started(now)
         ):
             return "wacht op start na turn_on"
 
@@ -1608,10 +1604,13 @@ class EVGuard:
         self.last_skip_reason = ""
         self._log_ctx = {"charge_state": self._charge_state(device), "device": device.name, "cascade": cascade_type, "surplus_w": excess}
 
+        # min_a = ondergrens van de stroom-entity (min_value), bewust niet
+        # hw_min_amps (die ook min_current kent): het piekpad mag tot de
+        # entity-ondergrens verlagen.
         min_a   = float(device.min_value if device.min_value is not None else DEFAULT_EV_MIN_AMPERE)
         max_a   = float(device.max_value if device.max_value is not None else DEFAULT_EV_MAX_AMPERE)
         phases  = int(device.phases) if device.phases else 1
-        voltage = EV_VOLTS_3PHASE if phases == 3 else EV_VOLTS_1PHASE
+        voltage = charger_voltage(device)
 
         sw_entity  = device.switch_entity or device.entity_id
         cur_entity = device.current_entity
@@ -1621,29 +1620,11 @@ class EVGuard:
             self._warn("Peak Guard EV: schakelaar '%s' niet gevonden", sw_entity)
             return excess
 
-        sw_on = sw_state.state == "on"
-
-        # Fallback: als de Tesla-schakelaar 'unknown'/'unavailable' rapporteert maar de
-        # status-sensor aangeeft dat de wagen aan het laden is, behandel als 'aan'.
-        # Dit voorkomt dat een onnodige turn_on gestuurd wordt aan een al ladende wagen
-        # én dat het snapshot 'unknown' vastlegt als originele staat terwijl de auto actief was.
-        if not sw_on and sw_state.state in ("unknown", "unavailable") and device.status_sensor:
-            _st_fallback = self.hass.states.get(device.status_sensor)
-            if _st_fallback is not None and _st_fallback.state not in ("unknown", "unavailable", ""):
-                if _st_fallback.state in ("on", "charging", "connected", "complete"):
-                    _LOGGER.debug(
-                        "Peak Guard EV: schakelaar '%s' = '%s' maar status-sensor '%s' = '%s' — "
-                        "behandeld als AAN (auto laadt al)",
-                        sw_entity, sw_state.state, device.status_sensor, _st_fallback.state,
-                    )
-                    sw_on = True
-        if not sw_on and sw_state.state in ("unknown", "unavailable") and self.charging_for_control(
-            device, now or datetime.now(timezone.utc)
-        ):
-            # Zelfde fallback via de laadstatus (charge_state_sensor), een
-            # bevestigde 'is_charging'-weigering, of een 'stopped' die nog van
-            # vóór de eigen start dateert — ook zonder status-sensor.
-            sw_on = True
+        # Schakelaar, of bij 'unknown'/'unavailable' de status-sensor of de
+        # laadstatus: zie ChargerView.switch_on_for_apply.
+        sw_on = self.view(device).switch_on_for_apply(
+            sw_state, now or datetime.now(timezone.utc)
+        )
 
         current_a: Optional[float] = None
         cur_state = None
@@ -1700,10 +1681,7 @@ class EVGuard:
         # niet de laadlimiet verzetten van een wagen die niet thuis is.
         current_a = self._effective_current_amps(device, guard, cur_state, now, current_a)
 
-        hw_min_a = float(
-            device.min_current if device.min_current is not None
-            else (device.min_value if device.min_value is not None else DEFAULT_EV_MIN_AMPERE)
-        )
+        hw_min_a = charger_hw_min_amps(device)
         return await self._apply_solar(
             device, excess, snapshots, peak_tracker, solar_tracker,
             sw_entity, cur_entity, sw_on, current_a, cur_state,
@@ -2256,9 +2234,7 @@ class EVGuard:
                 # Enkel de eigen SoC-override kan een volle wagen hervat hebben;
                 # stond hij niet op 'complete', dan is het een manuele/app-start
                 # met een verouderde laadstatus: na het overschot blijft hij laden.
-                manual = already and self.charging_confirmed_state(device) not in (
-                    "complete", "fully_charged",
-                )
+                manual = already and self.view(device).refusal_was_manual_start()
                 if manual:
                     _snap_m = snapshots.get(snap_key)
                     if created_snap and _snap_m is not None:
