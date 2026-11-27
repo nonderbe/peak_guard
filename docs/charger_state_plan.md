@@ -1,6 +1,6 @@
 # Plan: één module die de toestand van de lader vaststelt (stap 1)
 
-Status: 1a–1d klaar (2026-11-27). Aanleiding: v1.9.13 — de piek-cascade
+Status: stap 1 klaar (1a–1e, 2026-11-27, v1.9.14). Aanleiding: v1.9.13 — de piek-cascade
 kende de regel voor een verouderde `stopped` al, de solar-cascade niet; de
 reviews vonden telkens plekken die elk op hun eigen manier beslisten of de
 wagen laadt.
@@ -87,6 +87,14 @@ niet in één keer moeten veranderen.
   `status_dict()` blijft dezelfde velden geven.
 - **1e.** Sectie "Charger state" in `CLAUDE.md` (vensters en definities in één
   tabel); release 1.9.14.
+  *Uitgevoerd 1b–1e*: `ChargerMemory` / `ChargerView` in
+  `deciders/charger_state.py`; de eigen afleidingen zijn benoemde methodes
+  van de view (`just_started`, `just_stopped_by_pg`, `switch_on_for_apply`,
+  `peak_not_charging`, …). De baseline bleef in 1b en 1c ongewijzigd. In 1d
+  bleek `_sync_guards` bij verschillende ids een piekstop te wissen (schema
+  herstartte na 1 min i.p.v. na de min-OFF); nu gedragen beide configuraties
+  zich gelijk. `explain()` is nog niet gebouwd (de bestaande `holds` volstaan
+  voorlopig).
 
 ## Bewust niet in stap 1
 
