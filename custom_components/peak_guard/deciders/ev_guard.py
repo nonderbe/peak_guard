@@ -1592,27 +1592,37 @@ class EVGuard:
             )
             return False
         self._track_action(sw_entity, "switch.turn_off")
-        self.release_schedule(device)
+        self.release_schedule(device, now, keep_pg_stop=False)
         guard.turned_off_at    = now
         guard.turned_off_by_pg = True
         _LOGGER.info("Peak Guard [SCHEMA]: '%s' laden gestopt (%s)", device.name, reason)
         return True
 
-    def release_schedule(self, device: EVChargerDevice) -> None:
+    def release_schedule(
+        self, device: EVChargerDevice, now: Optional[datetime] = None,
+        *, keep_pg_stop: bool = True,
+    ) -> None:
         """Het schema laat de lader los; andere cascades zien hem weer als vrij.
 
         last_switch_state=None zodat de solar-cascade een laadsessie die
         daarna start (bv. na een SOC-override) als handmatige start herkent.
-        Een stop door Peak Guard die nog geldt (last_switch_state False,
-        turned_off_by_pg — bv. de piek-cascade stopte de wagen) blijft staan:
-        de guard is gedeeld met de andere kopieën, en zonder die stop ziet
-        peak_is_off een achterlopende 'charging' als een lopende lading. De
-        solar-cascade herkent een manuele start ook vanuit False.
+        Een stop door Peak Guard die nog geldt blijft staan (keep_pg_stop):
+        de guard is gedeeld met de andere kopieën (bv. de piek-cascade stopte
+        de wagen), en zonder die stop ziet peak_is_off een achterlopende
+        'charging' als een lopende lading. "Nog geldt" = dezelfde regel als
+        het piekpad (ChargerView.peak_already_stopped): net gestopt, of de
+        wagen meldt niet dat hij laadt — een oude stop met een manuele herstart
+        erna telt niet. schedule_stop geeft keep_pg_stop=False: zijn eigen stop
+        legt het zelf vast (turned_off_at/turned_off_by_pg), zoals vroeger.
+        De solar-cascade herkent een manuele start ook vanuit False.
         """
         guard = self.guard_for(device)
+        keep = keep_pg_stop and bool(guard.turned_off_by_pg) and self.view(
+            device
+        ).peak_already_stopped(now or datetime.now(timezone.utc))
         guard.scheduled         = False
         guard.state             = EVState.IDLE
-        if not (guard.last_switch_state is False and guard.turned_off_by_pg):
+        if not keep:
             guard.last_switch_state = None
         guard.skip_reason       = ""
         self._reset_debounce(guard)

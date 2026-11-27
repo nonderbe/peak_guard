@@ -93,8 +93,8 @@ async def test_peak_stop_by_one_copy_is_seen_by_the_inject_copy():
 
 
 async def test_release_schedule_keeps_a_peak_stop():
-    """Bekende beperking t.e.m. v1.9.14: het schema laat de wagen los (doel
-    bereikt / entry verwijderd) terwijl de piek-cascade hem gestopt heeft;
+    """Het schema laat de wagen los (doel bereikt / entry verwijderd) terwijl
+    de piek-cascade hem net gestopt heeft;
     de stop mag niet vergeten worden, ook al meldt de Tesla nog 'charging'."""
     hass, ev = _guard()
     hass.states.set(SW, "on")
@@ -108,7 +108,7 @@ async def test_release_schedule_keeps_a_peak_stop():
     await ev.apply_action(peak, 5000.0, {}, "peak", MockPeakTracker(),
                           MockSolarTracker(), now=T0)
     assert hass.services.has_call("turn_off")
-    ev.release_schedule(sched)
+    ev.release_schedule(sched, T0 + timedelta(seconds=10))
     assert g.scheduled is False
     assert ev.peak_is_off(peak) is True
     assert ev.view(peak).stopped_by_pg_not_restarted()
@@ -127,3 +127,33 @@ def test_release_schedule_still_forgets_its_own_running_charge():
     g.state, g.last_switch_state, g.scheduled = EVState.CHARGING, True, True
     ev.release_schedule(sched)
     assert g.last_switch_state is None and g.state == EVState.IDLE
+
+
+def test_release_schedule_forgets_an_old_stop_after_a_manual_restart():
+    """Review: piekstop lang geleden, daarna manueel herstart (laadstatus
+    'charging'): die oude stop blijft niet hangen."""
+    hass, ev = _guard()
+    hass.states.set(SW, "on")
+    hass.states.set("sensor.tesla_charging", "charging")
+    sched = _ev("ev_sched")
+    g = ev.guard_for(sched)
+    g.last_switch_state, g.turned_off_by_pg = False, True
+    g.turned_off_at, g.scheduled = T0 - timedelta(hours=4), True
+    ev.release_schedule(sched, T0)
+    assert g.last_switch_state is None
+
+
+async def test_schedule_stop_ends_with_its_own_stop_as_before():
+    """schedule_stop: last_switch_state None, turned_off_by_pg True,
+    turned_off_at = nu — ook als er nog een oude piekstop op de guard stond."""
+    hass, ev = _guard()
+    hass.states.set(SW, "on")
+    hass.states.set("sensor.tesla_charging", "stopped")
+    sched = _ev("ev_sched")
+    g = ev.guard_for(sched)
+    g.last_switch_state, g.turned_off_by_pg = False, True
+    g.turned_off_at, g.scheduled = T0 - timedelta(minutes=1), True
+    assert await ev.schedule_stop(sched, T0, "test") is True
+    assert g.last_switch_state is None
+    assert g.turned_off_by_pg is True and g.turned_off_at == T0
+    assert g.scheduled is False

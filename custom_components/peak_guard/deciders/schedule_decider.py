@@ -525,7 +525,7 @@ class ScheduleDecider(BaseDecider):
             rs.fulfilled = True
             changed = True
             if guard.scheduled:
-                ev.release_schedule(dev)
+                ev.release_schedule(dev, now)
             _LOGGER.info(
                 "Peak Guard [SCHEMA]: '%s' doel %d%% bereikt — vrijgegeven voor zonne-overschot",
                 dev.name, target,
@@ -793,7 +793,7 @@ class ScheduleDecider(BaseDecider):
                 rs.stop_pending = True
                 rs.status = "stoppen mislukt — volgende iteratie opnieuw"
         else:
-            ev.release_schedule(dev)
+            ev.release_schedule(dev, now)
             rs.status = "buiten venster"
         rs.rest_pending = entry.rest_soc is not None
         rs.started_by_schedule = False
