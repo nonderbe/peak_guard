@@ -182,17 +182,22 @@ class MockStateRegistry:
         self._states: dict[str, str] = {}
         self._attributes: dict[str, dict] = {}
         self._reported: dict = {}
+        self._changed: dict = {}
 
     def set(self, entity_id: str, state_str: str, attributes: dict | None = None,
-            reported=None) -> None:
+            reported=None, changed=None) -> None:
         """reported: tijdstip van de laatste melding (last_reported/last_updated);
-        standaard 'nu' bij elke get()."""
+        standaard 'nu' bij elke get(). changed: last_changed (standaard = reported)."""
         self._states[entity_id] = state_str
         self._attributes[entity_id] = attributes or {}
         if reported is not None:
             self._reported[entity_id] = reported
         else:
             self._reported.pop(entity_id, None)
+        if changed is not None:
+            self._changed[entity_id] = changed
+        else:
+            self._changed.pop(entity_id, None)
 
     def get(self, entity_id: str):
         val = self._states.get(entity_id)
@@ -201,6 +206,7 @@ class MockStateRegistry:
         st = MockState(val, self._attributes.get(entity_id))
         if entity_id in self._reported:
             st.last_updated = st.last_reported = self._reported[entity_id]
+        st.last_changed = self._changed.get(entity_id, st.last_updated)
         return st
 
 

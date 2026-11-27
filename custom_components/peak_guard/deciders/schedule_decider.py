@@ -570,11 +570,13 @@ class ScheduleDecider(BaseDecider):
             rs.status = "EV niet thuis"
             return changed
 
+        # Bewust enkel wat de wagen meldt (niet charging_for_control): de
+        # startbevestiging en de back-off moeten een mislukte start zien.
         charging = ev.is_charging(dev)
         voltage = ev.voltage(dev)
         hw_min = ev.hw_min_amps(dev)
         max_a = float(entry.max_current or dev.max_value or DEFAULT_EV_MAX_AMPERE)
-        allowance = self._allowance_w(consumption, ev.charging_draw_w(dev))
+        allowance = self._allowance_w(consumption, ev.charging_draw_w(dev, now))
         amps_allowed = (
             None if allowance is None
             else int(min(max_a, math.floor(allowance / voltage)))
@@ -696,7 +698,7 @@ class ScheduleDecider(BaseDecider):
         if cur >= max_a:
             return f"maximum {max_a:.0f} A bereikt"
 
-        own_w = ev.charging_draw_w(dev)
+        own_w = ev.charging_draw_w(dev, now)
         room = (
             f"ruimte {allowance:.0f} W (piekgrens − buffer − huisverbruik "
             f"{consumption - own_w:.0f} W) → {amps_allowed} A"
@@ -795,8 +797,10 @@ class ScheduleDecider(BaseDecider):
             guard = ev.get_guard(dev.id)
             guard.scheduled = False
             rs.status = "laden op zonne-overschot"
-        elif ev.is_charging(dev):
-            draw = ev.charging_draw_w(dev)
+        elif ev.charging_for_control(dev, now):
+            # Ook een verouderde 'stopped' na de eigen start: anders laadt de
+            # wagen na het venster door.
+            draw = ev.charging_draw_w(dev, now)
             if self._surplus_without(consumption, draw) and self._in_inject_cascade(dev.entity_id):
                 self._handover_to_solar(entry, now, draw)
                 rs.status = "overgedragen aan zonne-overschot"
@@ -836,7 +840,9 @@ class ScheduleDecider(BaseDecider):
             rs.status = "uitgeschakeld"
             return changed
 
-        charging = ev.is_charging(dev)
+        # Buiten het venster: ook een verouderde 'stopped' na de eigen start
+        # telt als laden, anders vervalt een mislukte stop (stop_pending).
+        charging = ev.charging_for_control(dev, now)
         solar_owned = eid in self._inject_snapshots
         blocks = (entry.block_unplanned or rs.stop_pending) and not solar_owned
 
@@ -860,7 +866,7 @@ class ScheduleDecider(BaseDecider):
             rs.status = "handmatige bediening — niet gestopt"
             return changed
 
-        draw = ev.charging_draw_w(dev)
+        draw = ev.charging_draw_w(dev, now)
         if self._surplus_without(consumption, draw) and self._in_inject_cascade(eid):
             self._handover_to_solar(entry, now, draw)
             rs.unplanned_since = None

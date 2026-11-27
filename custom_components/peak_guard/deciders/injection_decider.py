@@ -139,6 +139,11 @@ class InjectionDecider(BaseDecider):
                 "Peak Guard: inject-herstel geblokkeerd — verbruik nog negatief (%.0f W)",
                 consumption,
             )
+            # Weer overschot: een lopende solar-stopbevestiging telt niet meer
+            # (twee losse pieken met overschot ertussen mogen niet stoppen).
+            for device in self._cascade:
+                if device.action_type == ACTION_EV_CHARGER:
+                    self.ev_guard.clear_solar_stop(device)
             return
         snapshots_to_restore = [
             (device, snap)
@@ -175,6 +180,8 @@ class InjectionDecider(BaseDecider):
                     hold = self.ev_guard.hold_for(device.id) or {}
                     if hold.get("code") == "solar_share":
                         continue  # EV laadt door zonder ingreep: volgende apparaat
+                    # Ook bij 'solar_stop_confirm': de netafname kan een korte
+                    # piek zijn — dan ook geen ander apparaat uitzetten.
                     return        # stroom verlaagd of verlaging volgt: één ingreep per cyclus
             for waiting, _snap in snapshots_to_restore[index + 1:]:
                 self.ev_guard.set_hold(

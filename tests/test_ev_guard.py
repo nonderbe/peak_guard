@@ -831,10 +831,15 @@ class TestThrottleDownSolar:
     async def test_at_hw_min_solar_gone_returns_false(self):
         """
         Op hardware-minimum (6 A = 1380 W) én consumption >= ev_draw_w (1500 W ≥ 1380 W):
-        solar levert niets meer → Returns False (aanroeper mag EV stoppen).
+        solar levert niets meer → eerst bevestiging (True, hold solar_stop_confirm),
+        bij een meting ≥ EV_SOLAR_STOP_CONFIRM_S later False (aanroeper mag EV stoppen).
         """
         self.hass.states.set("number.tesla_charge_current", "6")
-        result = await self.ev_guard.throttle_down_solar(self.device, consumption=1500.0)
+        t0 = datetime.now(timezone.utc)
+        assert await self.ev_guard.throttle_down_solar(self.device, consumption=1500.0, now=t0) is True
+        assert self.ev_guard.hold_for(self.device.id)["code"] == "solar_stop_confirm"
+        result = await self.ev_guard.throttle_down_solar(
+            self.device, consumption=1500.0, now=t0 + timedelta(seconds=60))
         assert result is False
         assert not self.hass.services.has_call("set_value")
 

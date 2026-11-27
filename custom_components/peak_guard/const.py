@@ -123,6 +123,23 @@ EV_UNREACHABLE_BACKOFF_S: float = 900.0
 # ook als die laadstatus nog een oude waarde toont.
 EV_CHARGING_CONFIRM_S = 600
 PEAK_RESTART_CONFIRM_S: float = 180.0
+# Na een eigen start geldt een laadstatus 'stopped' die de integratie vóór die
+# start meldde nog zo lang als verouderd (de wagen laadt). De Tesla-integratie
+# peilt om de ~10 min: twee peilingen ruimte.
+EV_STALE_STOPPED_S: float = 1200.0
+# Een melding 'stopped' telt pas als echt wanneer ze minstens zo lang na de
+# eigen start kwam: een peiling vlak na de turn_on toont nog de oude waarde.
+EV_STALE_REPORT_GRACE_S: float = 120.0
+# Solar-herstel van een EV op zijn minimum: de zon draagt niets meer bij
+# (netafname ≥ laadvermogen). Pas stoppen als dat nog zo is bij een meting
+# minstens zo lang na de eerste, zodat één piek van een ander toestel
+# (waterkoker, oven) de lading niet stopt. De metingen moeten opeenvolgend
+# zijn: weer overschot wist de bevestiging (InjectionDecider.check_restore),
+# en ligt de vorige vaststelling meer dan EV_SOLAR_STOP_MAX_GAP_S terug
+# (een overgeslagen cyclus), dan begint ze opnieuw. Ruim boven 60 s + de
+# duur van een trage cyclus (wake-up, retries), anders stopt de EV nooit.
+EV_SOLAR_STOP_CONFIRM_S: float = 45.0
+EV_SOLAR_STOP_MAX_GAP_S: float = 150.0
 
 # Piekbeperking op het kwartierbudget (zie quarter_budget.py).
 # Het toegelaten vermogen voor de rest van het kwartier wordt nooit hoger dan

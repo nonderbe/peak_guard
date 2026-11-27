@@ -31,7 +31,7 @@ async def run_tick(
       om vensters af te sluiten en limieten te herstellen.
     """
     # Verklaringen in de status-popup gelden voor deze iteratie.
-    peak.ev_guard.begin_tick()
+    peak.ev_guard.begin_tick(now)
     peak.set_inject_snapshots(injection.snapshots)
     peak.note_consumption(now, consumption)
     if consumption is None:

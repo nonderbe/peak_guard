@@ -902,7 +902,8 @@ class TestStaleChargeState:
     async def test_peak_reduces_a_freshly_started_car_with_stale_stopped(self, stale_hass):
         """R1: schema start de wagen, HA toont nog 'stopped' — de piek moet
         hem toch kunnen verlagen (het schema verlaagt zelf niet)."""
-        stale_hass.states.set("sensor.tesla_opladen", "stopped")
+        # Laadstatus voor het laatst gewijzigd vóór de start.
+        stale_hass.states.set("sensor.tesla_opladen", "stopped", reported=T0 - timedelta(minutes=3))
         stale_hass.states.set("binary_sensor.tesla_status", "on")
         stale_hass.services.no_reflect.add("switch.tesla_charge")
         g = EVGuard(hass=stale_hass, config={}, iteration_actions=[])

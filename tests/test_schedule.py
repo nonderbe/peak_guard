@@ -542,6 +542,23 @@ class TestWindowEnd:
         assert ("set_value", SOC, 50.0) in services(env)
         assert not env.sd._run["sch1"].rest_pending
 
+    async def test_stale_stopped_at_window_end_is_stopped_and_retried(self):
+        """v1.9.13 review 4 #1: Peak Guard startte de wagen, de laadstatus toont nog
+        een 'stopped' van vóór die start. Het venster sluit → stoppen; mislukt
+        de stop, dan blijft hij openstaan en volgt een nieuwe poging."""
+        env = build([entry_dict([WEEKNIGHT])], inject=False)
+        charging_in_window(env)
+        start = TUE_06 - timedelta(minutes=5)
+        env.hass.states.set(CHG, "stopped", reported=start - timedelta(minutes=3))
+        env.ev.note_charge_start(tesla(), start)
+        env.hass.services._raise_on.add("turn_off")
+        await env.tick(2500.0, TUE_06)
+        assert env.sd._run["sch1"].stop_pending
+        env.hass.services._raise_on.discard("turn_off")
+        n = len(env.calls)
+        await env.tick(2500.0, TUE_06 + timedelta(minutes=1))
+        assert any(c["service"] == "turn_off" for c in env.calls[n:])
+
     async def test_window_end_without_consumption_still_stops(self):
         env = build([entry_dict([WEEKNIGHT])])
         charging_in_window(env)

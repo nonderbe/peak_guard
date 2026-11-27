@@ -32,6 +32,10 @@ from ..const import (
     EV_UNREACHABLE_BACKOFF_S,
     EV_UNREACHABLE_ERRORS,
     EV_CHARGING_CONFIRM_S,
+    EV_STALE_STOPPED_S,
+    EV_STALE_REPORT_GRACE_S,
+    EV_SOLAR_STOP_CONFIRM_S,
+    EV_SOLAR_STOP_MAX_GAP_S,
     PEAK_RESTART_CONFIRM_S,
     DEFAULT_EV_MAX_AMPERE,
     DEFAULT_EV_MIN_AMPERE,
@@ -102,6 +106,16 @@ class EVGuard:
         # device.id, zodat alle kopieën (piek/injectie/schema) het delen; een
         # geslaagde turn_off van die schakelaar wist het (_svc).
         self._charging_confirmed: Dict[str, tuple] = {}
+        # Laatste echte turn_on per schakelaar (alle kopieën van de wagen
+        # delen hem); een geslaagde turn_off wist hem. Zie stale_stopped_after_start.
+        self._charge_started: Dict[str, datetime] = {}
+        # Solar-stop op het minimum: (eerste, laatste) vaststelling dat de zon
+        # niets meer bijdraagt, per schakelaar (alle kopieën van de wagen).
+        self._solar_stop: Dict[str, tuple] = {}
+        # (tick-'now', monotonic()) bij het begin van de lopende iteratie: zo
+        # is een startmoment 'now' + verstreken tijd (wake-up, retries, eerdere
+        # apparaten in dezelfde tick tellen mee).
+        self._tick_clock: Optional[tuple] = None
         # Sleutel → laatste melding van een onverwachte apparaatfout.
         self._reported_errors: Dict[str, datetime] = {}
         self._rate_limiter = EVRateLimiter()
@@ -219,8 +233,9 @@ class EVGuard:
             self._guards[device_id] = EVDeviceGuard()
         return self._guards[device_id]
 
-    def begin_tick(self) -> None:
+    def begin_tick(self, now: Optional[datetime] = None) -> None:
         """Start van een loop-iteratie: verklaringen en skip-redenen opnieuw opbouwen."""
+        self._tick_clock = (now, monotonic()) if now is not None else None
         self._holds.clear()
         for guard in self._guards.values():
             guard.skip_reason = ""
@@ -508,6 +523,10 @@ class EVGuard:
         else:
             if domain == "switch" and service == "turn_off":
                 self._charging_confirmed.pop(data.get("entity_id"), None)
+                self._charge_started.pop(data.get("entity_id"), None)
+                # Gestopt: een volgende sessie bevestigt opnieuw. Een mislukte
+                # stop houdt de bevestiging (meteen opnieuw proberen).
+                self._solar_stop.pop(data.get("entity_id"), None)
         finally:
             self._record_call()
             self._note_result(domain, error_str)
@@ -1011,6 +1030,7 @@ class EVGuard:
                 if sw_state.state != "on" and self.peak_is_off(device):
                     try:
                         await self._svc("switch", "turn_on", {"entity_id": sw_entity})
+                        self.note_charge_start(device, now)
                     except HomeAssistantError as err:
                         if "is_charging" not in str(err).lower():
                             raise
@@ -1113,7 +1133,7 @@ class EVGuard:
                 stopped = sw_state.state == "off" or (
                     sw_state.state in ("unknown", "unavailable")
                     and not just_started
-                    and charge_state != "" and charge_state not in ("charging", "starting")
+                    and charge_state != "" and not self.charging_for_control(device, now)
                 )
                 if not stopped:
                     await self._set_soc_override(
@@ -1407,7 +1427,7 @@ class EVGuard:
             # een wagen die stilstaat is een nutteloze API-call (een Tesla
             # meldt na turn_off nog even 'charging').
             return False
-        charging = self.is_charging(device)
+        charging = self.charging_for_control(device, now)
         if not charging and not self._charge_state(device):
             # Geen laadstatus en een schakelaar zonder toestand (Tesla zonder
             # charge_state_sensor): val terug op wat Peak Guard zelf weet.
@@ -1454,9 +1474,38 @@ class EVGuard:
                         f"Laadt door: netafname {consumption:.0f} W valt binnen de marge van 1 A "
                         f"die ook bij het verhogen gebruikt wordt (afronding naar boven)."
                     )
+                self.clear_solar_stop(device)
                 self.set_hold(device.id, "solar_share", text)
                 return True   # solar still covers part of EV draw: keep charging
-            return False      # solar gone entirely: allow restore to stop the EV
+            # Zon draagt niets meer bij. Eén meting kan een piek van een ander
+            # toestel zijn: pas stoppen als het bij een latere meting nog zo is.
+            key = self._sw_key(device)
+            since, seen = self._solar_stop.get(key, (None, None))
+            if (
+                since is None or seen is None
+                or (now - seen).total_seconds() > EV_SOLAR_STOP_MAX_GAP_S
+                or now < since
+            ):
+                since = now
+            self._solar_stop[key] = (since, now)
+            waited = (now - since).total_seconds()
+            if waited < EV_SOLAR_STOP_CONFIRM_S:
+                self.set_hold(
+                    device.id, "solar_stop_confirm",
+                    f"Netafname {consumption:.0f} W is minstens het laadvermogen "
+                    f"({ev_draw_w:.0f} W): de zon draagt niets meer bij. De lader stopt "
+                    f"pas als dat bij een meting na {EV_SOLAR_STOP_CONFIRM_S:.0f} s nog "
+                    f"zo is, zodat een korte piek van een ander toestel hem niet stopt.",
+                    until=since + timedelta(seconds=EV_SOLAR_STOP_CONFIRM_S),
+                )
+                return True
+            # Timers blijven staan: lukt de stop niet (rate limit, fout), dan
+            # volgt hij de volgende cyclus zonder nieuwe wachttijd. Na een
+            # geslaagde stop vervallen ze via EV_SOLAR_STOP_MAX_GAP_S.
+            return False      # solar gone entirely (bevestigd): allow restore to stop the EV
+
+        # Verlagen volstaat: een lopende stop-bevestiging vervalt.
+        self.clear_solar_stop(device)
 
         # GATE: minimum update-interval — geef vorige commando tijd om effect te hebben.
         if guard.last_current_update is not None:
@@ -1537,6 +1586,10 @@ class EVGuard:
         status-sensor ('on'/'off' = online/slaap) levert hier niets bruikbaars
         op; enkel tekstuele laadstatussen tellen.
         """
+        return self._charge_state_with_state(device)[0]
+
+    def _charge_state_with_state(self, device: EVChargerDevice):
+        """(laadstatus, HA-state-object waar hij vandaan komt) — ('', None) als onbekend."""
         for entity_id in (device.charge_state_sensor, device.status_sensor):
             if not entity_id:
                 continue
@@ -1546,8 +1599,67 @@ class EVGuard:
             s = st.state.lower().strip()
             if s in ("charging", "starting", "stopped", "complete", "fully_charged",
                      "disconnected", "no_power", "nopower"):
-                return s
-        return ""
+                return s, st
+        return "", None
+
+    @staticmethod
+    def _sw_key(device: EVChargerDevice) -> str:
+        return device.switch_entity or device.entity_id
+
+    def clear_solar_stop(self, device: EVChargerDevice) -> None:
+        """Vergeet een lopende solar-stopbevestiging (zon dekt weer, of nieuwe sessie)."""
+        self._solar_stop.pop(self._sw_key(device), None)
+
+    def note_charge_start(self, device: EVChargerDevice, now: datetime) -> None:
+        """Peak Guard stuurde net een geslaagde switch.turn_on naar deze wagen.
+
+        Is 'now' het tijdstip van de lopende iteratie (begin_tick), dan telt
+        de sindsdien verstreken tijd mee: de start is het moment van de
+        geslaagde turn_on, na wake-up, retries en eerdere apparaten.
+        """
+        if self._tick_clock is not None and self._tick_clock[0] == now:
+            now = now + timedelta(seconds=max(0.0, monotonic() - self._tick_clock[1]))
+        self._charge_started[self._sw_key(device)] = now
+        # Een nieuwe sessie: een oude solar-stopbevestiging telt niet meer.
+        self.clear_solar_stop(device)
+
+    def stale_stopped_after_start(self, device: EVChargerDevice, now: datetime) -> bool:
+        """True als de laadstatus 'stopped' een overblijfsel van vóór de eigen start is.
+
+        Peak Guard stuurde minder dan EV_STALE_STOPPED_S geleden een echte
+        turn_on (note_charge_start; een turn_off wist hem) en de integratie
+        meldde sindsdien geen nieuwe laadstatus: de Tesla-integratie peilt maar
+        om de ~10 min (veldlog 27-11-2026: 'stopped' van een peiling tijdens
+        een eigen stop bleef staan terwijl de wagen weer 8 A laadde).
+        Echt is een 'stopped' die na de start veranderde (last_changed), of
+        die minstens EV_STALE_REPORT_GRACE_S na de start (opnieuw) gemeld werd
+        (last_reported) — een peiling vlak na de turn_on toont nog de oude
+        toestand. 'complete'/'disconnected' gelden altijd.
+        """
+        started = self._charge_started.get(device.switch_entity or device.entity_id)
+        if started is None or not (0 <= (now - started).total_seconds() < EV_STALE_STOPPED_S):
+            return False
+        charge_state, st = self._charge_state_with_state(device)
+        if charge_state != "stopped":
+            return False
+        reported = getattr(st, "last_reported", None) or getattr(st, "last_updated", None)
+        changed = getattr(st, "last_changed", None) or reported
+        if isinstance(changed, datetime) and changed > started:
+            return False
+        return not (
+            isinstance(reported, datetime)
+            and (reported - started).total_seconds() >= EV_STALE_REPORT_GRACE_S
+        )
+
+    def charging_for_control(self, device: EVChargerDevice, now: datetime) -> bool:
+        """Laadt de wagen, voor het bijsturen van een lopende lading?
+
+        is_charging plus een verouderde 'stopped' na de eigen start. Voor het
+        verlagen, stoppen en het geschatte laadvermogen (piek, solar, einde
+        laadvenster). Niet voor startbevestigingen (schema-herstart,
+        peak_is_off): daar telt enkel wat de wagen echt meldt.
+        """
+        return self.is_charging(device) or self.stale_stopped_after_start(device, now)
 
     def _read_float(self, entity_id: Optional[str]) -> Optional[float]:
         if not entity_id:
@@ -1566,7 +1678,7 @@ class EVGuard:
         Schakelaar 'on', of een laadstatus 'charging'/'starting' (Tesla-
         schakelaars die 'unknown' melden). Bewust NIET 'connected' of
         'complete' zoals de fallback in apply_action: een ingeplugde of volle
-        auto laadt niet.
+        auto laadt niet. Zie ook charging_for_control.
         """
         charge_state = self._charge_state(device)
         conf = self._charging_confirmed.get(device.switch_entity or device.entity_id)
@@ -1610,9 +1722,9 @@ class EVGuard:
         except (ValueError, TypeError):
             return None
 
-    def charging_draw_w(self, device: EVChargerDevice) -> float:
+    def charging_draw_w(self, device: EVChargerDevice, now: Optional[datetime] = None) -> float:
         """Geschat laadvermogen (W); 0 als de EV niet laadt."""
-        if not self.is_charging(device):
+        if not self.charging_for_control(device, now or datetime.now(timezone.utc)):
             return 0.0
         guard = self._guards.get(device.id)
         amps = self.read_current_a(device)
@@ -1680,6 +1792,7 @@ class EVGuard:
         already = err is not None   # geweigerd met 'is_charging': laadt al
         if not already:
             self._track_action(sw_entity, "switch.turn_on")
+            self.note_charge_start(device, now)
         guard.state             = EVState.CHARGING
         guard.scheduled         = True
         guard.skip_reason       = ""
@@ -1803,9 +1916,12 @@ class EVGuard:
                         sw_entity, sw_state.state, device.status_sensor, _st_fallback.state,
                     )
                     sw_on = True
-        if not sw_on and sw_state.state in ("unknown", "unavailable") and self.is_charging(device):
-            # Zelfde fallback via de laadstatus (charge_state_sensor) of een
-            # bevestigde 'is_charging'-weigering, ook zonder status-sensor.
+        if not sw_on and sw_state.state in ("unknown", "unavailable") and self.charging_for_control(
+            device, now or datetime.now(timezone.utc)
+        ):
+            # Zelfde fallback via de laadstatus (charge_state_sensor), een
+            # bevestigde 'is_charging'-weigering, of een 'stopped' die nog van
+            # vóór de eigen start dateert — ook zonder status-sensor.
             sw_on = True
 
         current_a: Optional[float] = None
@@ -1921,16 +2037,19 @@ class EVGuard:
             # schakelen. Enkel een laadstatus 'charging' (manueel herstart) telt.
             self.last_skip_reason = "al gestopt door Peak Guard"
             return excess
-        recently_started = (
-            guard.last_switch_state is True and guard.turned_on_at is not None
-            and (now - guard.turned_on_at).total_seconds() < EV_CHARGING_CONFIRM_S
-        )
         if (
-            charge_state and not self.is_charging(device)
             # Vlak na een eigen start toont een Tesla nog minuten 'stopped':
-            # de lading loopt wel en is hier de enige rem (het schema verlaagt
-            # niet zelf). 'complete'/'disconnected' blijven wel gelden.
-            and not (recently_started and charge_state == "stopped")
+            # charging_for_control telt dat als ladend (de piek is hier de
+            # enige rem, het schema verlaagt niet zelf). Daarnaast de oude
+            # regel op turned_on_at (ook een manuele start, of een start van
+            # vóór een herstart van HA): liever een call te veel dan een piek.
+            # 'complete'/'disconnected' gelden altijd.
+            charge_state and not self.charging_for_control(device, now)
+            and not (
+                charge_state == "stopped" and guard.last_switch_state is True
+                and guard.turned_on_at is not None
+                and (now - guard.turned_on_at).total_seconds() < EV_CHARGING_CONFIRM_S
+            )
         ):
             # Een gekende laadstatus zegt dat de wagen niet laadt (vol, gestopt,
             # uitgeplugd): er valt niets af te schakelen. De status-fallback in
@@ -2425,6 +2544,8 @@ class EVGuard:
                     return excess
 
                 already = _last_err is not None   # geweigerd met 'is_charging'
+                if not already:
+                    self.note_charge_start(device, now)
                 # Enkel de eigen SoC-override kan een volle wagen hervat hebben;
                 # stond hij niet op 'complete', dan is het een manuele/app-start
                 # met een verouderde laadstatus: na het overschot blijft hij laden.
