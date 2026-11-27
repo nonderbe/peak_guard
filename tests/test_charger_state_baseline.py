@@ -79,11 +79,17 @@ def _frozen_datetime(at: datetime):
 
 @pytest.fixture(autouse=True)
 def _frozen_clock(monkeypatch):
-    """De klok van ev_guard staat stil op NOW: datetime.now() in de code
+    """De klok van ev_guard en charger_state staat stil op NOW: datetime.now() in de code
     (is_charging, confirm_charging, charging_draw_w, …) en de tijden van de
     scenario's lopen niet uit elkaar, hoe lang de test ook duurt."""
+    _freeze(monkeypatch, NOW)
+
+
+def _freeze(monkeypatch, at: datetime) -> None:
+    from custom_components.peak_guard.deciders import charger_state as _cs_mod
     from custom_components.peak_guard.deciders import ev_guard as _ev_mod
-    monkeypatch.setattr(_ev_mod, "datetime", _frozen_datetime(NOW))
+    for mod in (_ev_mod, _cs_mod):
+        monkeypatch.setattr(mod, "datetime", _frozen_datetime(at))
 
 
 @pytest.fixture(autouse=True)
@@ -459,13 +465,15 @@ async def test_charger_state_matches_baseline():
 
 
 async def test_baseline_survives_clock_drift(monkeypatch):
-    """De klok van de code (datetime.now() in ev_guard) staat stil op NOW, en de
+    """De klok van de code (datetime.now() in ev_guard en charger_state) staat stil op NOW, en de
     antwoorden veranderen niet als die klok 20 s verschuift t.o.v. de scenario's.
     De meeste paden krijgen 'now' expliciet mee; dit bewaakt de paden die de
     eigen klok gebruiken (o.a. de 'is_charging'-bevestiging) en dat er niets van
     het absolute tijdstip afhangt."""
+    from custom_components.peak_guard.deciders import charger_state as _cs_mod
     from custom_components.peak_guard.deciders import ev_guard as _ev_mod
     assert _ev_mod.datetime.now(timezone.utc) == NOW
+    assert _cs_mod.datetime.now(timezone.utc) == NOW
     base = await _all_results()
-    monkeypatch.setattr(_ev_mod, "datetime", _frozen_datetime(NOW + timedelta(seconds=20)))
+    _freeze(monkeypatch, NOW + timedelta(seconds=20))
     assert await _all_results() == base

@@ -171,9 +171,9 @@ class TestStaleStoppedSolar:
         """Review 3 #4: de start is het moment van de geslaagde turn_on, niet het begin van de tick."""
         from time import monotonic
         ev_guard.begin_tick(T0)
-        ev_guard._tick_clock = (T0, monotonic() - 70)   # 70 s wake-up/retries in deze tick
+        ev_guard.memory.tick_clock = (T0, monotonic() - 70)   # 70 s wake-up/retries in deze tick
         ev_guard.note_charge_start(_tesla(), T0)
-        started = ev_guard._charge_started["switch.tesla_charge"]
+        started = ev_guard.memory.charge_started["switch.tesla_charge"]
         assert (started - T0).total_seconds() == pytest.approx(70, abs=2)
 
     async def test_peak_keeps_the_turned_on_at_rule(self, hass, ev_guard):

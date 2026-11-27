@@ -1,6 +1,6 @@
 # Plan: één module die de toestand van de lader vaststelt (stap 1)
 
-Status: 1a klaar (2026-11-27), review vóór 1b. Aanleiding: v1.9.13 — de piek-cascade
+Status: 1a en 1b klaar (2026-11-27). Aanleiding: v1.9.13 — de piek-cascade
 kende de regel voor een verouderde `stopped` al, de solar-cascade niet; de
 reviews vonden telkens plekken die elk op hun eigen manier beslisten of de
 wagen laadt.

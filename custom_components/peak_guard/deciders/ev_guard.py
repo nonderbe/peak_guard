@@ -32,8 +32,6 @@ from ..const import (
     EV_UNREACHABLE_BACKOFF_S,
     EV_UNREACHABLE_ERRORS,
     EV_CHARGING_CONFIRM_S,
-    EV_STALE_STOPPED_S,
-    EV_STALE_REPORT_GRACE_S,
     EV_SOLAR_STOP_CONFIRM_S,
     EV_SOLAR_STOP_MAX_GAP_S,
     PEAK_RESTART_CONFIRM_S,
@@ -43,6 +41,14 @@ from ..const import (
     SCHEDULE_START_CONFIRM_S,
 )
 from .base import track_action
+from .charger_state import (
+    ChargerMemory,
+    ChargerView,
+    hw_min_amps as charger_hw_min_amps,
+    read_float,
+    sw_key,
+    voltage as charger_voltage,
+)
 from ..models import (
     EVChargerDevice,
     DeviceSnapshot,
@@ -59,7 +65,6 @@ from ..models import (
     EV_RATE_LIMIT_WINDOW_S,
     EV_CMD_MAX_RETRIES,
     EV_CMD_RETRY_DELAY_S,
-    EV_SENSOR_STALE_S,
     EV_VOLTS_1PHASE,
     EV_VOLTS_3PHASE,
     EV_WAKE_COOLDOWN_S,
@@ -101,21 +106,12 @@ class EVGuard:
         self.config = config
         self._iteration_actions = iteration_actions   # gedeelde mutable lijst
         self._guards: Dict[str, EVDeviceGuard] = {}
-        # Schakelaar-entity → (tijdstip, laadstatus in HA op dat moment) van een
-        # turn_on die de wagen weigerde met 'is_charging'. Per entity, niet per
-        # device.id, zodat alle kopieën (piek/injectie/schema) het delen; een
-        # geslaagde turn_off van die schakelaar wist het (_svc).
-        self._charging_confirmed: Dict[str, tuple] = {}
-        # Laatste echte turn_on per schakelaar (alle kopieën van de wagen
-        # delen hem); een geslaagde turn_off wist hem. Zie stale_stopped_after_start.
-        self._charge_started: Dict[str, datetime] = {}
+        # Wat Peak Guard zelf met elke lader deed (start, 'is_charging'-
+        # bevestiging), per schakelaar; ChargerView leest het.
+        self._memory = ChargerMemory()
         # Solar-stop op het minimum: (eerste, laatste) vaststelling dat de zon
         # niets meer bijdraagt, per schakelaar (alle kopieën van de wagen).
         self._solar_stop: Dict[str, tuple] = {}
-        # (tick-'now', monotonic()) bij het begin van de lopende iteratie: zo
-        # is een startmoment 'now' + verstreken tijd (wake-up, retries, eerdere
-        # apparaten in dezelfde tick tellen mee).
-        self._tick_clock: Optional[tuple] = None
         # Sleutel → laatste melding van een onverwachte apparaatfout.
         self._reported_errors: Dict[str, datetime] = {}
         self._rate_limiter = EVRateLimiter()
@@ -156,6 +152,14 @@ class EVGuard:
     @property
     def rate_limiter(self) -> EVRateLimiter:
         return self._rate_limiter
+
+    @property
+    def memory(self) -> ChargerMemory:
+        return self._memory
+
+    def view(self, device: EVChargerDevice) -> ChargerView:
+        """Alleen-lezen beeld van de lader (deciders/charger_state.py)."""
+        return ChargerView(self.hass, self._memory, self._guards, device)
 
     def set_daily_budget(self, budget) -> None:
         """Koppel het dagelijkse EV-API-budget (aangeroepen vanuit __init__.py)."""
@@ -235,7 +239,7 @@ class EVGuard:
 
     def begin_tick(self, now: Optional[datetime] = None) -> None:
         """Start van een loop-iteratie: verklaringen en skip-redenen opnieuw opbouwen."""
-        self._tick_clock = (now, monotonic()) if now is not None else None
+        self._memory.begin_tick(now)
         self._holds.clear()
         for guard in self._guards.values():
             guard.skip_reason = ""
@@ -405,20 +409,7 @@ class EVGuard:
         current_a: Optional[float],
     ) -> Optional[float]:
         """Return current_a, substituting guard.last_sent_amps when the sensor is stale."""
-        if cur_state is None or guard.last_sent_amps is None or current_a is None:
-            return current_a
-        last_upd = cur_state.last_updated
-        if last_upd.tzinfo is None:
-            last_upd = last_upd.replace(tzinfo=timezone.utc)
-        age_s = (now - last_upd).total_seconds()
-        if age_s > EV_SENSOR_STALE_S:
-            _LOGGER.warning(
-                "Peak Guard [SOLAR]: '%s' stroom-sensor stale (%.0f s oud) — "
-                "eigen sturing (%.1f A) als referentie i.p.v. sensor (%.1f A)",
-                device.name, age_s, guard.last_sent_amps, current_a,
-            )
-            return guard.last_sent_amps
-        return current_a
+        return self.view(device).effective_current_a(guard, cur_state, now, current_a)
 
     # ------------------------------------------------------------------ #
     #  GUI-waarschuwingsbuffer                                            #
@@ -522,8 +513,7 @@ class EVGuard:
             raise
         else:
             if domain == "switch" and service == "turn_off":
-                self._charging_confirmed.pop(data.get("entity_id"), None)
-                self._charge_started.pop(data.get("entity_id"), None)
+                self._memory.forget_on_turn_off(data.get("entity_id"))
                 # Gestopt: een volgende sessie bevestigt opnieuw. Een mislukte
                 # stop houdt de bevestiging (meteen opnieuw proberen).
                 self._solar_stop.pop(data.get("entity_id"), None)
@@ -556,101 +546,16 @@ class EVGuard:
     # ------------------------------------------------------------------ #
 
     def cable_connected(self, device: EVChargerDevice) -> bool:
-        """
-        Geeft True als de laadkabel aangesloten is, of als er geen kabelentity
-        expliciet geconfigureerd is.
-
-        Truthy-states: on, true, connected, charging, complete, fully_charged,
-        pending, stopped, starting, nopower, 1 — of een numerieke waarde > 0.
-        "stopped"/"starting"/"nopower" zijn Tesla-laderstaten waarbij de kabel
-        WEL aangesloten is maar het laden tijdelijk gestopt/gepauzeerd is.
-        Bij unavailable/unknown: True (niet blokkeren bij tijdelijke storing).
-        """
-        # Gebruik alleen de expliciet geconfigureerde kabelentity.
-        # Geen fallback op DEFAULT_EV_CABLE_ENTITY: als de gebruiker geen kabel-
-        # sensor heeft ingesteld, nemen we aan dat de kabel aangesloten is.
-        cable_entity = device.cable_entity
-        if not cable_entity:
-            return True
-
-        state = self.hass.states.get(cable_entity)
-        if state is None:
-            _LOGGER.debug(
-                "Peak Guard EV: kabelentity '%s' niet gevonden voor '%s' — "
-                "kabelcheck overgeslagen (aanname: aangesloten)",
-                cable_entity, device.name,
-            )
-            return True
-
-        s = state.state.lower().strip()
-        if s in ("unavailable", "unknown", ""):
-            return True
-
-        # Truthy-states: kabel fysiek aangesloten (ook als opladen gepauzeerd is).
-        # "stopped" / "starting" / "nopower" zijn Tesla-laderstaten waarbij
-        # de kabel WEL aangesloten is maar het laden (tijdelijk) gestopt is.
-        CABLE_ON = {"on", "true", "connected", "charging", "complete",
-                    "fully_charged", "pending", "1",
-                    "stopped", "starting", "nopower"}
-        if s in CABLE_ON:
-            return True
-
-        try:
-            return float(s) > 0
-        except (ValueError, TypeError):
-            pass
-
-        return False
+        """Laadkabel aangesloten (of geen kabelentity)? Zie ChargerView.cable_connected."""
+        return self.view(device).cable_connected()
 
     # ------------------------------------------------------------------ #
     #  Verbindingsstatus (wake-up check)                                   #
     # ------------------------------------------------------------------ #
 
     def is_connected(self, device: EVChargerDevice) -> bool:
-        """
-        Geeft True als de EV verbonden/wakker is.
-
-        States die als "verbonden/wakker" gelden: on, true, connected, online, home,
-        charging, fully_charged, pending, 1.
-        "complete" is bewust weggelaten: Tesla-auto's slapen vaak in die staat.
-        "unavailable"/"unknown": als een wake-button geconfigureerd is, beschouwen we
-        dit als slapend (False) zodat de wake-up getriggerd wordt. Zonder wake-button
-        blokkeren we niet (True).
-        Bij ontbrekende sensor: True (geen blokkering).
-        """
-        status_entity = device.status_sensor
-        if not status_entity:
-            return True
-
-        state = self.hass.states.get(status_entity)
-        if state is None:
-            _LOGGER.debug(
-                "Peak Guard EV: status-sensor '%s' niet gevonden voor '%s' — "
-                "wake-up check overgeslagen (aanname: verbonden)",
-                status_entity, device.name,
-            )
-            return True
-
-        s = state.state.lower().strip()
-        if s in ("unavailable", "unknown", ""):
-            # Tesla-sensoren worden unavailable als de auto slaapt. Als er een
-            # wake-button is, triggeren we de wake-up; anders blokkeren we niet.
-            return not bool(device.wake_button)
-
-        # "complete" = lading gestopt omdat limiet bereikt; auto is wakker en verbonden.
-        # "off"     = Tesla binary sensor die aangeeft "niet aan het laden" — auto IS wakker.
-        # Slapen → "unavailable"/"unknown" (Tesla integration gaat offline bij slaap).
-        CONNECTED = {"on", "off", "true", "false", "connected", "online", "home",
-                     "charging", "complete", "fully_charged", "pending", "1", "0"}
-        if s in CONNECTED:
-            return True
-
-        try:
-            return float(s) > 0
-        except (ValueError, TypeError):
-            pass
-
-        return False
+        """EV verbonden/wakker? Zie ChargerView.awake."""
+        return self.view(device).awake()
 
     # ------------------------------------------------------------------ #
     #  Locatie helper                                                      #
@@ -661,58 +566,8 @@ class EVGuard:
         device: EVChargerDevice,
         guard: "Optional[EVDeviceGuard]" = None,
     ) -> bool:
-        """
-        Geeft True als de EV thuis is, of als er geen locatie-tracker is.
-
-        Ondersteunt device_tracker (home/not_home) en binary_sensor (on/off).
-
-        Wanneer de tracker 'unknown'/'unavailable' rapporteert:
-        - Als de guard een eerder bekende locatiestand heeft → gebruik die.
-        - Als de locatie nooit werd waargenomen → return True (aanname: thuis;
-          kabeldetectie is de primaire aanwezigheidscheck).
-        Dit voorkomt dat 'unknown' bij een auto thuis het laden blokkeert,
-        maar houdt de blokkering in stand als de auto op vakantie was en
-        de API inslaapt (last_known_home=False).
-        """
-        tracker_entity = device.location_tracker
-        if not tracker_entity:
-            return True
-
-        state = self.hass.states.get(tracker_entity)
-        if state is None:
-            _LOGGER.debug(
-                "Peak Guard EV: locatie-tracker '%s' niet gevonden voor '%s' — "
-                "locatiecheck overgeslagen (aanname: thuis)",
-                tracker_entity, device.name,
-            )
-            return True
-
-        s = state.state.lower().strip()
-
-        if s not in ("unavailable", "unknown", ""):
-            # Bekende staat: onthoud voor toekomstige 'unknown' cycli.
-            result = s in ("home", "on", "true", "1")
-            if guard is not None:
-                guard.last_known_home = result
-            return result
-
-        # Locatie is onbekend (auto slaapt of integratie tijdelijk offline).
-        if guard is not None and guard.last_known_home is not None:
-            _LOGGER.debug(
-                "Peak Guard EV: locatie-tracker '%s' rapporteert '%s' voor '%s' — "
-                "terugval op laatste bekende staat: %s",
-                tracker_entity, s, device.name,
-                "thuis" if guard.last_known_home else "niet thuis",
-            )
-            return guard.last_known_home
-
-        # Nooit een bekende locatie gezien (bv. tracker werkt nooit): aanname thuis.
-        _LOGGER.debug(
-            "Peak Guard EV: locatie-tracker '%s' rapporteert '%s' voor '%s' — "
-            "nooit bekende locatie gezien; aanname thuis (kabeldetectie is primaire check)",
-            tracker_entity, s, device.name,
-        )
-        return True
+        """EV thuis (of geen locatie-tracker)? Zie ChargerView.home."""
+        return self.view(device).home(guard)
 
     # ------------------------------------------------------------------ #
     #  Dynamische ondergrens-detectie                                      #
@@ -1255,14 +1110,8 @@ class EVGuard:
     # ------------------------------------------------------------------ #
 
     def peak_is_off(self, device: EVChargerDevice) -> bool:
-        """Staat de lader uit voor het herstel na piekbeperking?"""
-        guard = self._guards.get(device.id)
-        if guard is not None and guard.last_switch_state is False and guard.turned_off_by_pg:
-            # Door Peak Guard gestopt en niet herstart: de laadstatus van een
-            # Tesla meldt na turn_off vaak nog een of meer cycli 'charging'.
-            return True
-        # Laadstatus i.p.v. de schakelaar: die van een Tesla blijft vaak 'unknown'.
-        return not self.is_charging(device)
+        """Staat de lader uit voor het herstel na piekbeperking? Zie ChargerView.stopped_by_pg."""
+        return self.view(device).stopped_by_pg()
 
     def peak_restore_need_w(
         self, device: EVChargerDevice, snapshot: DeviceSnapshot,
@@ -1569,42 +1418,23 @@ class EVGuard:
 
     @staticmethod
     def voltage(device: EVChargerDevice) -> float:
-        phases = int(device.phases) if device.phases else 1
-        return EV_VOLTS_3PHASE if phases == 3 else EV_VOLTS_1PHASE
+        return charger_voltage(device)
 
     @staticmethod
     def hw_min_amps(device: EVChargerDevice) -> float:
-        return float(
-            device.min_current if device.min_current is not None
-            else (device.min_value if device.min_value is not None else DEFAULT_EV_MIN_AMPERE)
-        )
+        return charger_hw_min_amps(device)
 
     def _charge_state(self, device: EVChargerDevice) -> str:
-        """Laadstatus in kleine letters; '' als onbekend.
-
-        Bron: charge_state_sensor, anders status_sensor. Een binaire
-        status-sensor ('on'/'off' = online/slaap) levert hier niets bruikbaars
-        op; enkel tekstuele laadstatussen tellen.
-        """
-        return self._charge_state_with_state(device)[0]
+        """Laadstatus in kleine letters; '' als onbekend. Zie ChargerView.charge_state."""
+        return self.view(device).charge_state()
 
     def _charge_state_with_state(self, device: EVChargerDevice):
-        """(laadstatus, HA-state-object waar hij vandaan komt) — ('', None) als onbekend."""
-        for entity_id in (device.charge_state_sensor, device.status_sensor):
-            if not entity_id:
-                continue
-            st = self.hass.states.get(entity_id)
-            if st is None:
-                continue
-            s = st.state.lower().strip()
-            if s in ("charging", "starting", "stopped", "complete", "fully_charged",
-                     "disconnected", "no_power", "nopower"):
-                return s, st
-        return "", None
+        """(laadstatus, HA-state-object) — ('', None) als onbekend."""
+        return self.view(device).charge_state_with_state()
 
     @staticmethod
     def _sw_key(device: EVChargerDevice) -> str:
-        return device.switch_entity or device.entity_id
+        return sw_key(device)
 
     def clear_solar_stop(self, device: EVChargerDevice) -> None:
         """Vergeet een lopende solar-stopbevestiging (zon dekt weer, of nieuwe sessie)."""
@@ -1613,126 +1443,45 @@ class EVGuard:
     def note_charge_start(self, device: EVChargerDevice, now: datetime) -> None:
         """Peak Guard stuurde net een geslaagde switch.turn_on naar deze wagen.
 
-        Is 'now' het tijdstip van de lopende iteratie (begin_tick), dan telt
-        de sindsdien verstreken tijd mee: de start is het moment van de
-        geslaagde turn_on, na wake-up, retries en eerdere apparaten.
+        Zie ChargerMemory.note_charge_start; een nieuwe sessie wist ook een
+        oude solar-stopbevestiging.
         """
-        if self._tick_clock is not None and self._tick_clock[0] == now:
-            now = now + timedelta(seconds=max(0.0, monotonic() - self._tick_clock[1]))
-        self._charge_started[self._sw_key(device)] = now
-        # Een nieuwe sessie: een oude solar-stopbevestiging telt niet meer.
+        self._memory.note_charge_start(device, now)
         self.clear_solar_stop(device)
 
     def stale_stopped_after_start(self, device: EVChargerDevice, now: datetime) -> bool:
-        """True als de laadstatus 'stopped' een overblijfsel van vóór de eigen start is.
-
-        Peak Guard stuurde minder dan EV_STALE_STOPPED_S geleden een echte
-        turn_on (note_charge_start; een turn_off wist hem) en de integratie
-        meldde sindsdien geen nieuwe laadstatus: de Tesla-integratie peilt maar
-        om de ~10 min (veldlog 27-11-2026: 'stopped' van een peiling tijdens
-        een eigen stop bleef staan terwijl de wagen weer 8 A laadde).
-        Echt is een 'stopped' die na de start veranderde (last_changed), of
-        die minstens EV_STALE_REPORT_GRACE_S na de start (opnieuw) gemeld werd
-        (last_reported) — een peiling vlak na de turn_on toont nog de oude
-        toestand. 'complete'/'disconnected' gelden altijd.
-        """
-        started = self._charge_started.get(device.switch_entity or device.entity_id)
-        if started is None or not (0 <= (now - started).total_seconds() < EV_STALE_STOPPED_S):
-            return False
-        charge_state, st = self._charge_state_with_state(device)
-        if charge_state != "stopped":
-            return False
-        reported = getattr(st, "last_reported", None) or getattr(st, "last_updated", None)
-        changed = getattr(st, "last_changed", None) or reported
-        if isinstance(changed, datetime) and changed > started:
-            return False
-        return not (
-            isinstance(reported, datetime)
-            and (reported - started).total_seconds() >= EV_STALE_REPORT_GRACE_S
-        )
+        """'stopped' is een overblijfsel van vóór de eigen start? Zie ChargerView."""
+        return self.view(device).stale_stopped_after_start(now)
 
     def charging_for_control(self, device: EVChargerDevice, now: datetime) -> bool:
-        """Laadt de wagen, voor het bijsturen van een lopende lading?
-
-        is_charging plus een verouderde 'stopped' na de eigen start. Voor het
-        verlagen, stoppen en het geschatte laadvermogen (piek, solar, einde
-        laadvenster). Niet voor startbevestigingen (schema-herstart,
-        peak_is_off): daar telt enkel wat de wagen echt meldt.
-        """
-        return self.is_charging(device) or self.stale_stopped_after_start(device, now)
+        """Laadt de wagen, voor het bijsturen van een lopende lading? Zie ChargerView."""
+        return self.view(device).charging_for_control(now)
 
     def _read_float(self, entity_id: Optional[str]) -> Optional[float]:
-        if not entity_id:
-            return None
-        st = self.hass.states.get(entity_id)
-        if st is None:
-            return None
-        try:
-            return float(st.state)
-        except (TypeError, ValueError):
-            return None
+        return read_float(self.hass, entity_id)
 
     def is_charging(self, device: EVChargerDevice) -> bool:
-        """True als de EV echt laadt.
-
-        Schakelaar 'on', of een laadstatus 'charging'/'starting' (Tesla-
-        schakelaars die 'unknown' melden). Bewust NIET 'connected' of
-        'complete' zoals de fallback in apply_action: een ingeplugde of volle
-        auto laadt niet. Zie ook charging_for_control.
-        """
-        charge_state = self._charge_state(device)
-        conf = self._charging_confirmed.get(device.switch_entity or device.entity_id)
-        if (
-            conf is not None and charge_state == conf[1]
-            and (datetime.now(timezone.utc) - conf[0]).total_seconds() < EV_CHARGING_CONFIRM_S
-        ):
-            # De wagen weigerde een turn_on met 'is_charging' en de laadstatus
-            # in HA is sindsdien niet veranderd (loopt achter): hij laadt.
-            return True
-        if charge_state:
-            # Een gekende laadstatus is leidend: een Tesla-schakelaar blijft
-            # vaak 'on' na uitpluggen ('disconnected') of aan de limiet.
-            return charge_state in ("charging", "starting")
-        sw_state = self.hass.states.get(device.switch_entity or device.entity_id)
-        return sw_state is not None and sw_state.state == "on"
+        """True als de EV echt laadt. Zie ChargerView.observed_charging."""
+        return self.view(device).observed_charging()
 
     def confirm_charging(self, device: EVChargerDevice) -> None:
         """De wagen meldde zelf dat hij laadt (turn_on geweigerd met 'is_charging')."""
-        self._charging_confirmed[device.switch_entity or device.entity_id] = (
-            datetime.now(timezone.utc), self._charge_state(device),
-        )
+        self._memory.confirm_charging(device, self._charge_state(device))
 
     def charging_confirmed_state(self, device: EVChargerDevice) -> Optional[str]:
         """Laadstatus in HA bij de laatste 'is_charging'-weigering (None = geen)."""
-        conf = self._charging_confirmed.get(device.switch_entity or device.entity_id)
-        return conf[1] if conf is not None else None
+        return self.view(device).confirmed_state()
 
     def charge_complete(self, device: EVChargerDevice) -> bool:
         """True als de laadstatus meldt dat de auto aan zijn laadlimiet zit."""
-        return self._charge_state(device) in ("complete", "fully_charged")
+        return self.view(device).charge_complete()
 
     def read_current_a(self, device: EVChargerDevice) -> Optional[float]:
-        if not device.current_entity:
-            return None
-        st = self.hass.states.get(device.current_entity)
-        if st is None:
-            return None
-        try:
-            return float(st.state)
-        except (ValueError, TypeError):
-            return None
+        return self.view(device).current_a()
 
     def charging_draw_w(self, device: EVChargerDevice, now: Optional[datetime] = None) -> float:
         """Geschat laadvermogen (W); 0 als de EV niet laadt."""
-        if not self.charging_for_control(device, now or datetime.now(timezone.utc)):
-            return 0.0
-        guard = self._guards.get(device.id)
-        amps = self.read_current_a(device)
-        if amps is None and guard is not None:
-            amps = guard.last_sent_amps
-        if amps is None:
-            amps = self.hw_min_amps(device)
-        return max(0.0, amps) * self.voltage(device)
+        return self.view(device).draw_w(now)
 
     async def set_soc_limit(self, device: EVChargerDevice, value: float, reason: str) -> bool:
         """Zet de laadlimiet (SoC) los van max_soc; True bij succes."""
