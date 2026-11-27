@@ -31,10 +31,8 @@ from ..const import (
     EV_API_BUDGET_RESERVE,
     EV_UNREACHABLE_BACKOFF_S,
     EV_UNREACHABLE_ERRORS,
-    EV_CHARGING_CONFIRM_S,
     EV_SOLAR_STOP_CONFIRM_S,
     EV_SOLAR_STOP_MAX_GAP_S,
-    PEAK_RESTART_CONFIRM_S,
     DEFAULT_EV_MAX_AMPERE,
     DEFAULT_EV_MIN_AMPERE,
     DEFAULT_EV_SOLAR_START_THRESHOLD_W,
@@ -1739,41 +1737,27 @@ class EVGuard:
                 "Peak Guard EV peak: '%s' overgeslagen — EV laadt niet", device.name
             )
             return excess
-        charge_state = self._charge_state(device)
-        just_stopped = (
-            guard.turned_off_by_pg and guard.turned_off_at is not None
-            and (now - guard.turned_off_at).total_seconds() < PEAK_RESTART_CONFIRM_S
-        )
-        if guard.last_switch_state is False and not charge_state and not just_stopped:
+        view = self.view(device)
+        charge_state = view.charge_state()
+        if (
+            guard.last_switch_state is False and not charge_state
+            and not view.just_stopped_by_pg(now)
+        ):
             _sw = self.hass.states.get(sw_entity)
             if _sw is not None and _sw.state == "on":
                 # Zonder laadstatus is een echte 'on'-schakelaar het enige
                 # signaal: iemand zette hem terug aan (het piek-snapshot kan
                 # verdwenen zijn zonder herstel, bv. manuele bediening).
                 guard.last_switch_state = None
-        if guard.last_switch_state is False and (
-            just_stopped or not self.is_charging(device)
-        ):
-            # Vlak na de eigen turn_off toont een Tesla vaak nog 'charging'.
+        if view.peak_already_stopped(now):
             # Door Peak Guard gestopt en niet herstart (een Tesla-schakelaar
             # blijft 'unknown', de status-fallback zegt dan 'aan'): niets af te
             # schakelen. Enkel een laadstatus 'charging' (manueel herstart) telt.
             self.last_skip_reason = "al gestopt door Peak Guard"
             return excess
-        if (
-            # Vlak na een eigen start toont een Tesla nog minuten 'stopped':
-            # charging_for_control telt dat als ladend (de piek is hier de
-            # enige rem, het schema verlaagt niet zelf). Daarnaast de oude
-            # regel op turned_on_at (ook een manuele start, of een start van
-            # vóór een herstart van HA): liever een call te veel dan een piek.
-            # 'complete'/'disconnected' gelden altijd.
-            charge_state and not self.charging_for_control(device, now)
-            and not (
-                charge_state == "stopped" and guard.last_switch_state is True
-                and guard.turned_on_at is not None
-                and (now - guard.turned_on_at).total_seconds() < EV_CHARGING_CONFIRM_S
-            )
-        ):
+        if view.peak_not_charging(now):
+            # De piek is hier de enige rem (het schema verlaagt niet zelf):
+            # een verouderde 'stopped' na een eigen start telt als ladend.
             # Een gekende laadstatus zegt dat de wagen niet laadt (vol, gestopt,
             # uitgeplugd): er valt niets af te schakelen. De status-fallback in
             # apply_action of een 'on'-schakelaar mag hier geen vermogen tellen
