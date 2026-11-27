@@ -778,7 +778,7 @@ class PeakDecider(BaseDecider):
         if entry is None:
             return False
         ts, restart_a = entry
-        turned_off_at = self.ev_guard.get_guard(device.id).turned_off_at
+        turned_off_at = self.ev_guard.guard_for(device).turned_off_at
         if not ev_off or (turned_off_at is not None and turned_off_at > ts):
             # Laadt (verder stapsgewijs), of opnieuw gestopt door de piek.
             del self._ev_restarts[device.entity_id]

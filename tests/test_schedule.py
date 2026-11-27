@@ -359,7 +359,7 @@ class TestEVInWindow:
         env.hass.states.set(CHG, "charging")
         env.hass.states.set(SOC, "65")
         env.hass.states.set(CUR, "6")
-        env.ev.get_guard("ev_peak_copy").last_current_update = MON_23 - timedelta(seconds=5)
+        env.ev.guard_for(tesla("ev_peak_copy")).last_current_update = MON_23 - timedelta(seconds=5)
         await env.tick(-500.0, MON_23)
         assert not any(e == CUR for _, e, _ in services(env))
 
@@ -368,7 +368,7 @@ class TestEVInWindow:
         # na de min-OFF-tijd, ook al is er meteen weer ruimte.
         env = build([entry_dict([WEEKNIGHT])], peak=False)
         env.sd._peak_cascade.append(tesla("ev_peak_copy"))
-        pg = env.ev.get_guard("ev_peak_copy")
+        pg = env.ev.guard_for(tesla("ev_peak_copy"))
         pg.turned_off_at, pg.turned_off_by_pg = MON_23 - timedelta(seconds=120), True
         await env.tick(500.0, MON_23)
         assert not any(s == "turn_on" for s, _, _ in services(env))
@@ -742,6 +742,9 @@ class TestReviewRegressions:
     async def test_peak_sheds_again_with_distinct_ids_per_cascade(self):
         # Zelfde EV met een ander id in de piek-cascade: na een herstart door
         # het schema moet de piek-cascade hem opnieuw kunnen afschakelen.
+        # Sinds stap 1d (guard per schakelaar) ziet het schema de piekstop
+        # zoals bij gelijke ids: herstart pas na de min-OFF-tijd (vroeger
+        # wiste _sync_guards de stop van de piekkopie → herstart na 1 min).
         env = build([entry_dict([WEEKNIGHT])])
         env.peak._cascade[0].id = "ev_peak"
         plugged_in_charging(env)
@@ -752,11 +755,40 @@ class TestReviewRegressions:
         env.hass.states.set(CHG, "stopped")
         env.hass.states.set(SOC, "65")
         await env.tick(1000.0, MON_23 + timedelta(minutes=1))
+        assert ("turn_on", SW, None) not in services(env)
+        assert "herstart over 240 s" in env.sd.status_dict()["sch1"]["detail"]
+        await env.tick(1000.0, MON_23 + timedelta(minutes=6))
         assert ("turn_on", SW, None) in services(env)
         env.calls.clear()
         plugged_in_charging(env)
-        await env.tick(6000.0, MON_23 + timedelta(minutes=10))
+        await env.tick(6000.0, MON_23 + timedelta(minutes=15))
         assert ("turn_off", SW, None) in services(env)
+
+    async def test_same_outcome_with_same_or_distinct_ids(self):
+        # Stap 1d: dezelfde reeks met gelijke en met verschillende ids geeft
+        # exact dezelfde commando's.
+        async def run(peak_id):
+            env = build([entry_dict([WEEKNIGHT])])
+            if peak_id:
+                env.peak._cascade[0].id = peak_id
+            plugged_in_charging(env)
+            out = []
+            for minute, cons, sw, chg in (
+                (0, 6000.0, None, None), (1, 1000.0, "off", "stopped"),
+                (6, 1000.0, None, None), (8, 1000.0, "on", "charging"),
+                (15, 6000.0, None, None), (25, 500.0, "off", "stopped"),
+            ):
+                if sw:
+                    env.hass.states.set(SW, sw)
+                    env.hass.states.set(CHG, chg)
+                    env.hass.states.set(SOC, "65" if minute < 20 else "40")
+                await env.tick(cons, MON_23 + timedelta(minutes=minute))
+                out.append(list(services(env)))
+                env.calls.clear()
+            return out
+        same = await run(None)
+        assert any(same), "de reeks moet commando's geven"
+        assert same == await run("ev_peak")
 
     async def test_disconnected_with_switch_on_is_not_charging(self):
         env = build([entry_dict([WEEKNIGHT])])

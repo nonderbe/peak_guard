@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta, timezone
 from time import monotonic
-from typing import TYPE_CHECKING, Dict, Mapping, Optional
+from typing import TYPE_CHECKING, Dict, Optional
 
 from ..const import (
     EV_CHARGING_CONFIRM_S,
@@ -51,7 +51,7 @@ CHARGE_STATES = (
 
 def sw_key(device: EVChargerDevice) -> str:
     """Sleutel van het geheugen per schakelaar: alle kopieën van de wagen delen hem."""
-    return device.switch_entity or device.entity_id
+    return getattr(device, "switch_entity", None) or device.entity_id
 
 
 def voltage(device: EVChargerDevice) -> float:
@@ -124,23 +124,24 @@ class ChargerMemory:
 class ChargerView:
     """Alleen-lezen beeld van één wagen: wat doet de lader nu?
 
-    Goedkoop; maak er een aan per vraag (EVGuard.view). 'guards' is de
-    dict device.id → EVDeviceGuard van EVGuard (enkel gelezen, behalve
-    home(), dat de laatst gekende locatie in de meegegeven guard bewaart).
+    Goedkoop; maak er een aan per vraag (EVGuard.view). 'guard' is de
+    EVDeviceGuard van de schakelaar (gedeeld door alle kopieën van de wagen),
+    None als Peak Guard de wagen nog nooit bekeek. Enkel gelezen, behalve
+    home(), dat de laatst gekende locatie in de meegegeven guard bewaart.
     """
 
-    __slots__ = ("hass", "memory", "guards", "device")
+    __slots__ = ("hass", "memory", "guard", "device")
 
     def __init__(
         self,
         hass: "HomeAssistant",
         memory: ChargerMemory,
-        guards: Mapping[str, EVDeviceGuard],
+        guard: Optional[EVDeviceGuard],
         device: EVChargerDevice,
     ) -> None:
         self.hass = hass
         self.memory = memory
-        self.guards = guards
+        self.guard = guard
         self.device = device
 
     # ------------------------------------------------------------------ #
@@ -259,14 +260,14 @@ class ChargerView:
     # ------------------------------------------------------------------ #
     #
     # Vier vensters bestaan bewust naast elkaar (zie CLAUDE.md, "Charger
-    # state"): SCHEDULE_START_CONFIRM_S (3 min, just_started),
+    # state", en docs/charger_state_plan.md): SCHEDULE_START_CONFIRM_S (3 min, just_started),
     # PEAK_RESTART_CONFIRM_S (3 min, just_stopped_by_pg),
     # EV_CHARGING_CONFIRM_S (10 min, pg_start_with_stale_stopped en de
     # 'is_charging'-bevestiging) en EV_STALE_STOPPED_S (20 min,
     # stale_stopped_after_start, met EV_STALE_REPORT_GRACE_S 2 min marge).
 
     def _guard(self) -> Optional[EVDeviceGuard]:
-        return self.guards.get(self.device.id)
+        return self.guard
 
     def stopped_by_pg_not_restarted(self) -> bool:
         """Peak Guard stopte de lader en startte hem sindsdien niet opnieuw."""
@@ -456,7 +457,7 @@ class ChargerView:
         """Geschat laadvermogen (W); 0 als de EV niet laadt."""
         if not self.charging_for_control(now or datetime.now(timezone.utc)):
             return 0.0
-        guard = self.guards.get(self.device.id)
+        guard = self.guard
         amps = self.current_a()
         if amps is None and guard is not None:
             amps = guard.last_sent_amps

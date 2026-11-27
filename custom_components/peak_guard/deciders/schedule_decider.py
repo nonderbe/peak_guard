@@ -45,6 +45,7 @@ from ..models import (
     EV_MIN_OFF_DURATION_S,
     EV_MIN_UPDATE_INTERVAL_S,
     BaseCascadeDevice,
+    EVChargerDevice,
     DeviceSnapshot,
     EVState,
     ScheduleEntry,
@@ -190,7 +191,7 @@ class ScheduleDecider(BaseDecider):
                 # bij uitschakelen; gebeurt in de volgende iteratie.
                 self._ending.append((old, rs))
             elif old.is_ev:
-                guard = self.ev_guard.guards.get(old.device.id)
+                guard = self.ev_guard.find_guard(old.device)
                 if guard is not None and guard.scheduled:
                     self.ev_guard.release_schedule(old.device)
         self.entries = unique
@@ -287,27 +288,6 @@ class ScheduleDecider(BaseDecider):
         entry = self.entry_for_entity(entity_id)
         return bool(entry and entry.device.manual_override)
 
-    def _sync_guards(self, entry: ScheduleEntry) -> None:
-        """Neem de schakeltoestand over naar de guards van andere kopieën.
-
-        EVGuard houdt guards bij per device.id; staat dezelfde EV met een
-        ander id in de piek-cascade, dan moet die guard weten dat het schema
-        de lader aan- of uitzette (anders slaat _apply_peak een turn_off over
-        als 'redundant').
-        """
-        src = self.ev_guard.get_guard(entry.device.id)
-        for d in list(self._peak_cascade) + list(self._inject_cascade):
-            if d.entity_id != entry.entity_id or d.id == entry.device.id:
-                continue
-            g = self.ev_guard.get_guard(d.id)
-            g.state = src.state
-            g.last_switch_state = src.last_switch_state
-            g.turned_on_at = src.turned_on_at
-            g.turned_off_at = src.turned_off_at
-            g.turned_off_by_pg = src.turned_off_by_pg
-            g.last_sent_amps = src.last_sent_amps
-            g.last_current_update = src.last_current_update
-
     def _in_inject_cascade(self, entity_id: str) -> bool:
         return any(d.entity_id == entity_id for d in self._inject_cascade)
 
@@ -348,7 +328,6 @@ class ScheduleDecider(BaseDecider):
             try:
                 if old.is_ev:
                     await self._ev_window_end(old, rs, consumption, now)
-                    self._sync_guards(old)
                 else:
                     await self._tick_switch(old, ActiveResult(active=False), consumption, now, rs)
             except Exception:
@@ -368,10 +347,7 @@ class ScheduleDecider(BaseDecider):
             )
             try:
                 if entry.is_ev:
-                    ev_changed = await self._tick_ev(entry, res, consumption, now)
-                    if ev_changed:
-                        self._sync_guards(entry)
-                    changed |= ev_changed
+                    changed |= await self._tick_ev(entry, res, consumption, now)
                 else:
                     changed |= await self._tick_switch(entry, res, consumption, now)
             except Exception:
@@ -541,7 +517,7 @@ class ScheduleDecider(BaseDecider):
     ) -> bool:
         dev = entry.device
         ev = self.ev_guard
-        guard = ev.get_guard(dev.id)
+        guard = ev.guard_for(dev)
         changed = False
         rs.detail = ""
 
@@ -727,12 +703,19 @@ class ScheduleDecider(BaseDecider):
         return f"{room}; verhoging naar {amps_allowed} A mislukt (API-limiet of fout) — nieuwe poging later"
 
     def _copy_guards(self, entry: ScheduleEntry) -> list:
-        """Guards van dit apparaat: het schema en elke cascade-kopie (mogelijk ander id)."""
-        ids = {entry.device.id} | {
-            d.id for d in list(self._peak_cascade) + list(self._inject_cascade)
-            if d.entity_id == entry.entity_id
-        }
-        return [self.ev_guard.get_guard(i) for i in ids]
+        """Guards van dit apparaat: het schema en elke cascade-kopie. Sinds de
+        guard per schakelaar bestaat (EVGuard.guard_for) is dat er normaal één;
+        een kopie met een andere schakelaar-entity telt apart mee."""
+        devs = [entry.device] + [
+            d for d in list(self._peak_cascade) + list(self._inject_cascade)
+            if d.entity_id == entry.entity_id and isinstance(d, EVChargerDevice)
+        ]
+        guards: list = []
+        for d in devs:
+            g = self.ev_guard.guard_for(d)
+            if all(g is not x for x in guards):
+                guards.append(g)
+        return guards
 
     def _last_current_update(self, entry: ScheduleEntry) -> Optional[datetime]:
         """Laatste stroomaanpassing over alle kopieën van dit apparaat."""
@@ -755,7 +738,7 @@ class ScheduleDecider(BaseDecider):
     def _handover_to_solar(self, entry: ScheduleEntry, now: datetime, draw_w: float) -> None:
         """Lopende lading overdragen aan de solar-cascade (die stopt hem zodra het overschot weg is)."""
         dev = entry.device
-        guard = self.ev_guard.get_guard(dev.id)
+        guard = self.ev_guard.guard_for(dev)
         self._inject_snapshots[dev.entity_id] = DeviceSnapshot(
             entity_id=dev.entity_id,
             original_state="off",
@@ -794,7 +777,7 @@ class ScheduleDecider(BaseDecider):
 
         if dev.entity_id in self._inject_snapshots:
             # Solar laadt hem al; die herstelt bij het einde naar de rust-laadlimiet.
-            guard = ev.get_guard(dev.id)
+            guard = ev.guard_for(dev)
             guard.scheduled = False
             rs.status = "laden op zonne-overschot"
         elif ev.charging_for_control(dev, now):

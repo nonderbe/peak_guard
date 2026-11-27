@@ -208,7 +208,7 @@ class DecisionLogger:
             total_managed_w = 0.0
             for d in managed_solar:
                 if d.action_type == ACTION_EV_CHARGER:
-                    g = self._ev_guard.guards.get(d.id)
+                    g = self._ev_guard.find_guard(d)
                     if g and g.last_sent_amps is not None:
                         phases = int(d.phases) if isinstance(d, EVChargerDevice) and d.phases else 1
                         v = EV_VOLTS_3PHASE if phases == 3 else EV_VOLTS_1PHASE
@@ -271,7 +271,7 @@ class DecisionLogger:
         if d.action_type != ACTION_EV_CHARGER:
             return
 
-        guard = self._ev_guard.guards.get(d.id)
+        guard = self._ev_guard.find_guard(d)
         if not guard:
             return
 

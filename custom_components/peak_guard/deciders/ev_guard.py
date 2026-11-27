@@ -100,6 +100,11 @@ class EVGuard:
         self.hass = hass
         self.config = config
         self._iteration_actions = iteration_actions   # gedeelde mutable lijst
+        # Eén EVDeviceGuard per schakelaar (sw_key): de piek-, injectie- en
+        # schemakopie van dezelfde wagen delen hem, ook met een ander id.
+        # _guards wijst per device.id naar die gedeelde guard (status per id
+        # voor het paneel en de beslissingslog).
+        self._by_switch: Dict[str, EVDeviceGuard] = {}
         self._guards: Dict[str, EVDeviceGuard] = {}
         # Wat Peak Guard zelf met elke lader deed (start, 'is_charging'-
         # bevestiging), per schakelaar; ChargerView leest het.
@@ -154,7 +159,7 @@ class EVGuard:
 
     def view(self, device: EVChargerDevice) -> ChargerView:
         """Alleen-lezen beeld van de lader (deciders/charger_state.py)."""
-        return ChargerView(self.hass, self._memory, self._guards, device)
+        return ChargerView(self.hass, self._memory, self.find_guard(device), device)
 
     def set_daily_budget(self, budget) -> None:
         """Koppel het dagelijkse EV-API-budget (aangeroepen vanuit __init__.py)."""
@@ -226,8 +231,27 @@ class EVGuard:
     #  Interne helpers                                                     #
     # ------------------------------------------------------------------ #
 
+    def guard_for(self, device: EVChargerDevice) -> EVDeviceGuard:
+        """De EVDeviceGuard van deze wagen (per schakelaar, gedeeld door alle
+        kopieën); maak aan als hij nog niet bestaat."""
+        key = sw_key(device)
+        guard = self._by_switch.get(key)
+        if guard is None:
+            guard = self.find_guard(device)
+            if guard is None:
+                guard = EVDeviceGuard()
+            self._by_switch[key] = guard
+        self._guards[device.id] = guard
+        return guard
+
+    def find_guard(self, device: EVChargerDevice) -> Optional[EVDeviceGuard]:
+        """Zoals guard_for, maar maakt niets aan (None = nog nooit bekeken)."""
+        guard = self._by_switch.get(sw_key(device))
+        return guard if guard is not None else self._guards.get(device.id)
+
     def get_guard(self, device_id: str) -> EVDeviceGuard:
-        """Geef de EVDeviceGuard voor device_id; maak aan als nog niet bestaat."""
+        """Guard per device.id (tests, oudere aanroepers). Wordt gedeeld zodra
+        guard_for() dit apparaat ziet; de sturing gebruikt guard_for."""
         if device_id not in self._guards:
             self._guards[device_id] = EVDeviceGuard()
         return self._guards[device_id]
@@ -249,7 +273,7 @@ class EVGuard:
 
     def min_off_remaining_s(self, device: EVChargerDevice, now: datetime) -> float:
         """Resterende min-OFF-tijd na een stop door Peak Guard (0 = mag weer aan)."""
-        guard = self._guards.get(device.id)
+        guard = self.find_guard(device)
         if guard is None or guard.turned_off_at is None or not guard.turned_off_by_pg:
             return 0.0
         return max(0.0, EV_MIN_OFF_DURATION_S - (now - guard.turned_off_at).total_seconds())
@@ -908,7 +932,7 @@ class EVGuard:
                             cur_val = float(cur_state.state)
                         except (ValueError, TypeError):
                             cur_val = None
-                        guard = self.get_guard(device.id)
+                        guard = self.guard_for(device)
                         if cur_val is not None:
                             # Een verouderde sensor kan nog de stroom van vóór de
                             # verlaging tonen; vergelijk met wat laatst gestuurd is.
@@ -935,7 +959,7 @@ class EVGuard:
                         ts=now,
                         max_kw=restored_kw,
                     )
-                    guard = self.get_guard(device.id)
+                    guard = self.guard_for(device)
                     guard.state = EVState.CHARGING
                     guard.last_switch_state = True
                     guard.turned_on_at = now
@@ -958,7 +982,7 @@ class EVGuard:
                             device.name, ev_event.measured_duration_min,
                             ev_event.shifted_kwh, ev_event.savings_euro,
                         )
-                    guard = self.get_guard(device.id)
+                    guard = self.guard_for(device)
                     guard.state = EVState.IDLE
                     guard.last_switch_state = None
                     guard.soc_override_active = False
@@ -969,7 +993,6 @@ class EVGuard:
             if snapshot.original_state != "on":
                 # Geen turn_off naar een gestopte Tesla (schakelaar 'unknown');
                 # zie ChargerView.already_stopped_for_solar_restore.
-                self.get_guard(device.id)
                 stopped = self.view(device).already_stopped_for_solar_restore(sw_state, now)
                 if not stopped:
                     await self._set_soc_override(
@@ -980,6 +1003,8 @@ class EVGuard:
                         restore_a = (
                             snapshot.original_current
                             if snapshot.original_current is not None
+                            # Bewust de entity-ondergrens (min_value; 0 telt
+                            # als niet ingesteld), niet hw_min_amps.
                             else (device.min_value or DEFAULT_EV_MIN_AMPERE)
                         )
                         # De stroom terugzetten is bijzaak: een geblokkeerde of
@@ -1019,7 +1044,7 @@ class EVGuard:
                             ev_event.shifted_kwh, ev_event.savings_euro,
                         )
 
-                    guard = self.get_guard(device.id)
+                    guard = self.guard_for(device)
                     guard.state = EVState.IDLE
                     guard.last_switch_state = None
                     guard.turned_off_at = now
@@ -1035,7 +1060,7 @@ class EVGuard:
                     )
                     # Een eerder verlaagde stroom (vóór v1.9.7 verlaagde de
                     # solar-cascade ook een stilstaande wagen) terugzetten.
-                    guard = self.get_guard(device.id)
+                    guard = self.guard_for(device)
                     if (
                         cur_entity and snapshot.original_current is not None
                         and guard.last_sent_amps is not None
@@ -1063,7 +1088,7 @@ class EVGuard:
                         device_id=device.id,
                         now=now,
                     )
-                    guard = self.get_guard(device.id)
+                    guard = self.guard_for(device)
                     guard.state = EVState.IDLE
                     guard.last_switch_state = None
                     guard.soc_override_active = False
@@ -1118,7 +1143,7 @@ class EVGuard:
         if current_a is None:
             return 0.0
         current_a = self._effective_current_amps(
-            device, self.get_guard(device.id), self.hass.states.get(device.current_entity),
+            device, self.guard_for(device), self.hass.states.get(device.current_entity),
             now or datetime.now(timezone.utc), current_a,
         )
         return max(0.0, orig_a - current_a) * voltage
@@ -1146,7 +1171,7 @@ class EVGuard:
         voltage = self.voltage(device)
         max_a = float(device.max_value if device.max_value is not None else DEFAULT_EV_MAX_AMPERE)
         orig_a = min(snapshot.original_current, max_a) if snapshot.original_current is not None else max_a
-        guard = self.get_guard(device.id)
+        guard = self.guard_for(device)
         current_a = self._effective_current_amps(
             device, guard, self.hass.states.get(cur_entity), now, current_a
         )
@@ -1242,7 +1267,7 @@ class EVGuard:
         hw_min_a = charger_hw_min_amps(device)
         max_a = float(device.max_value if device.max_value is not None else DEFAULT_EV_MAX_AMPERE)
 
-        guard = self.get_guard(device.id)
+        guard = self.guard_for(device)
         if now is None:
             now = datetime.now(timezone.utc)
         view = self.view(device)
@@ -1480,7 +1505,7 @@ class EVGuard:
         self, device: EVChargerDevice, amps: int, now: datetime,
     ) -> Optional[str]:
         """Start het laden voor het laadschema. None = gestart, anders de reden waarom niet."""
-        guard = self.get_guard(device.id)
+        guard = self.guard_for(device)
         self._log_ctx = {"charge_state": self._charge_state(device), "device": device.name, "cascade": "schedule", "surplus_w": 0.0}
         sw_entity = device.switch_entity or device.entity_id
 
@@ -1533,7 +1558,7 @@ class EVGuard:
         cur_entity = device.current_entity
         if not cur_entity:
             return False
-        guard = self.get_guard(device.id)
+        guard = self.guard_for(device)
         if not self._rate_check(device.name, f"set_value {amps} A voor laadschema"):
             return False
         self._log_ctx = {"charge_state": self._charge_state(device), "device": device.name, "cascade": "schedule", "surplus_w": 0.0}
@@ -1554,7 +1579,7 @@ class EVGuard:
 
     async def schedule_stop(self, device: EVChargerDevice, now: datetime, reason: str) -> bool:
         """Stop het laden (einde venster of ongeplande lading); True bij succes."""
-        guard = self.get_guard(device.id)
+        guard = self.guard_for(device)
         sw_entity = device.switch_entity or device.entity_id
         if not self._rate_check(device.name, f"turn_off ({reason})", reducing=True):
             return False
@@ -1579,7 +1604,7 @@ class EVGuard:
         last_switch_state=None zodat de solar-cascade een laadsessie die
         daarna start (bv. na een SOC-override) als handmatige start herkent.
         """
-        guard = self.get_guard(device.id)
+        guard = self.guard_for(device)
         guard.scheduled         = False
         guard.state             = EVState.IDLE
         guard.last_switch_state = None
@@ -1667,7 +1692,7 @@ class EVGuard:
 
         if now is None:
             now = datetime.now(timezone.utc)
-        guard = self.get_guard(device.id)
+        guard = self.guard_for(device)
         guard.skip_reason = ""
 
         if cascade_type == "peak":
