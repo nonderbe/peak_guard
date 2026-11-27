@@ -972,24 +972,10 @@ class EVGuard:
 
             # ---- INJECTIEPREVENTIE: schakelaar was uit (of unknown), nu aangezet ---- #
             if snapshot.original_state != "on":
-                # Een gekende laadstatus die niet 'laden' is, telt als uit: geen
-                # turn_off naar een gestopte Tesla (schakelaar 'unknown').
-                # Net gestart door Peak Guard: de laadstatus loopt nog achter.
-                charge_state = self._charge_state(device)
-                _g = self.get_guard(device.id)
-                just_started = (
-                    _g.turned_on_at is not None
-                    and (now - _g.turned_on_at).total_seconds() < SCHEDULE_START_CONFIRM_S
-                )
-                # Enkel een schakelaar zonder bruikbare toestand (Tesla:
-                # 'unknown') wordt via de laadstatus beoordeeld; een schakelaar
-                # die 'on' meldt, gaat altijd uit (anders laadt een wagen die
-                # later weer ingeplugd wordt van het net).
-                stopped = sw_state.state == "off" or (
-                    sw_state.state in ("unknown", "unavailable")
-                    and not just_started
-                    and charge_state != "" and not self.charging_for_control(device, now)
-                )
+                # Geen turn_off naar een gestopte Tesla (schakelaar 'unknown');
+                # zie ChargerView.already_stopped_for_solar_restore.
+                self.get_guard(device.id)
+                stopped = self.view(device).already_stopped_for_solar_restore(sw_state, now)
                 if not stopped:
                     await self._set_soc_override(
                         device, override=False, original_soc=snapshot.original_soc
