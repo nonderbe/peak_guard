@@ -1257,33 +1257,21 @@ class EVGuard:
             return False
 
         phases  = int(device.phases) if device.phases else 1
-        voltage = EV_VOLTS_3PHASE if phases == 3 else EV_VOLTS_1PHASE
-        hw_min_a = float(
-            device.min_current if device.min_current is not None
-            else (device.min_value if device.min_value is not None else DEFAULT_EV_MIN_AMPERE)
-        )
+        voltage = charger_voltage(device)
+        hw_min_a = charger_hw_min_amps(device)
         max_a = float(device.max_value if device.max_value is not None else DEFAULT_EV_MAX_AMPERE)
 
         guard = self.get_guard(device.id)
         if now is None:
             now = datetime.now(timezone.utc)
-        recently_started = (
-            guard.turned_on_at is not None
-            and (now - guard.turned_on_at).total_seconds() < SCHEDULE_START_CONFIRM_S
-        )
-        if guard.last_switch_state is False and guard.turned_off_by_pg:
+        view = self.view(device)
+        if view.stopped_by_pg_not_restarted():
             # Door Peak Guard gestopt en niet herstart: de stroom verlagen op
             # een wagen die stilstaat is een nutteloze API-call (een Tesla
             # meldt na turn_off nog even 'charging').
             return False
-        charging = self.charging_for_control(device, now)
-        if not charging and not self._charge_state(device):
-            # Geen laadstatus en een schakelaar zonder toestand (Tesla zonder
-            # charge_state_sensor): val terug op wat Peak Guard zelf weet.
-            _sw = self.hass.states.get(device.switch_entity or device.entity_id)
-            if _sw is None or _sw.state in ("unknown", "unavailable"):
-                charging = guard.state == EVState.CHARGING and guard.last_switch_state is True
-        if not charging and not recently_started:
+        charging = view.charging_for_throttle(now)
+        if not charging and not view.just_started(now):
             # Laadt niet (en Peak Guard startte hem niet net): niets te
             # verlagen. Het herstel ruimt het snapshot op zonder de stroom
             # van een stilstaande wagen te verlagen.

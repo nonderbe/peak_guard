@@ -21,6 +21,8 @@ from typing import TYPE_CHECKING, Dict, Mapping, Optional
 
 from ..const import (
     EV_CHARGING_CONFIRM_S,
+    PEAK_RESTART_CONFIRM_S,
+    SCHEDULE_START_CONFIRM_S,
     EV_STALE_STOPPED_S,
     EV_STALE_REPORT_GRACE_S,
     DEFAULT_EV_MIN_AMPERE,
@@ -28,6 +30,7 @@ from ..const import (
 from ..models import (
     EVChargerDevice,
     EVDeviceGuard,
+    EVState,
     EV_SENSOR_STALE_S,
     EV_VOLTS_1PHASE,
     EV_VOLTS_3PHASE,
@@ -244,13 +247,161 @@ class ChargerView:
 
     def stopped_by_pg(self) -> bool:
         """Staat de lader uit voor het herstel na piekbeperking? (EVGuard.peak_is_off)"""
-        guard = self.guards.get(self.device.id)
-        if guard is not None and guard.last_switch_state is False and guard.turned_off_by_pg:
+        if self.stopped_by_pg_not_restarted():
             # Door Peak Guard gestopt en niet herstart: de laadstatus van een
             # Tesla meldt na turn_off vaak nog een of meer cycli 'charging'.
             return True
         # Laadstatus i.p.v. de schakelaar: die van een Tesla blijft vaak 'unknown'.
         return not self.observed_charging()
+
+    # ------------------------------------------------------------------ #
+    #  Wat Peak Guard zelf deed (tijdvensters)                             #
+    # ------------------------------------------------------------------ #
+    #
+    # Vier vensters bestaan bewust naast elkaar (zie CLAUDE.md, "Charger
+    # state"): SCHEDULE_START_CONFIRM_S (3 min, just_started),
+    # PEAK_RESTART_CONFIRM_S (3 min, just_stopped_by_pg),
+    # EV_CHARGING_CONFIRM_S (10 min, pg_start_with_stale_stopped en de
+    # 'is_charging'-bevestiging) en EV_STALE_STOPPED_S (20 min,
+    # stale_stopped_after_start, met EV_STALE_REPORT_GRACE_S 2 min marge).
+
+    def _guard(self) -> Optional[EVDeviceGuard]:
+        return self.guards.get(self.device.id)
+
+    def stopped_by_pg_not_restarted(self) -> bool:
+        """Peak Guard stopte de lader en startte hem sindsdien niet opnieuw."""
+        guard = self._guard()
+        return (
+            guard is not None and guard.last_switch_state is False
+            and bool(guard.turned_off_by_pg)
+        )
+
+    def just_started(self, now: datetime) -> bool:
+        """Minder dan SCHEDULE_START_CONFIRM_S sinds turned_on_at (start door
+        Peak Guard of een herkende manuele start): de laadstatus loopt nog achter."""
+        guard = self._guard()
+        return (
+            guard is not None and guard.turned_on_at is not None
+            and (now - guard.turned_on_at).total_seconds() < SCHEDULE_START_CONFIRM_S
+        )
+
+    def just_stopped_by_pg(self, now: datetime) -> bool:
+        """Minder dan PEAK_RESTART_CONFIRM_S sinds de eigen turn_off: een Tesla
+        toont dan vaak nog 'charging'."""
+        guard = self._guard()
+        return (
+            guard is not None and bool(guard.turned_off_by_pg)
+            and guard.turned_off_at is not None
+            and (now - guard.turned_off_at).total_seconds() < PEAK_RESTART_CONFIRM_S
+        )
+
+    def pg_start_with_stale_stopped(self, now: datetime) -> bool:
+        """De oudere piekregel: laadstatus 'stopped', schakelaar volgens Peak
+        Guard aan en turned_on_at minder dan EV_CHARGING_CONFIRM_S geleden. Dekt
+        ook een manuele start en een start van vóór een herstart van HA."""
+        guard = self._guard()
+        return (
+            self.charge_state() == "stopped"
+            and guard is not None and guard.last_switch_state is True
+            and guard.turned_on_at is not None
+            and (now - guard.turned_on_at).total_seconds() < EV_CHARGING_CONFIRM_S
+        )
+
+    # ------------------------------------------------------------------ #
+    #  Antwoorden per stuurpad (bewust verschillend, met een naam)         #
+    # ------------------------------------------------------------------ #
+
+    def charging_for_throttle(self, now: datetime) -> bool:
+        """Laadt de wagen, voor de solar-verlaging (throttle_down_solar)?
+
+        charging_for_control; zonder laadstatus en met een schakelaar zonder
+        toestand (Tesla zonder charge_state_sensor) wat Peak Guard zelf weet.
+        """
+        charging = self.charging_for_control(now)
+        if not charging and not self.charge_state():
+            _sw = self.hass.states.get(sw_key(self.device))
+            if _sw is None or _sw.state in ("unknown", "unavailable"):
+                guard = self._guard()
+                charging = (
+                    guard is not None and guard.state == EVState.CHARGING
+                    and guard.last_switch_state is True
+                )
+        return charging
+
+    def already_stopped_for_solar_restore(self, sw_state, now: datetime) -> bool:
+        """Is de wagen al gestopt, voor het solar-herstel (geen turn_off nodig)?
+
+        Enkel een schakelaar zonder bruikbare toestand (Tesla: 'unknown')
+        wordt via de laadstatus beoordeeld; een schakelaar die 'on' meldt, gaat
+        altijd uit (anders laadt een wagen die later weer ingeplugd wordt van
+        het net). Net gestart: de laadstatus loopt nog achter. Een gekende
+        laadstatus die niet 'laden' is, telt als uit.
+        """
+        return sw_state.state == "off" or (
+            sw_state.state in ("unknown", "unavailable")
+            and not self.just_started(now)
+            and self.charge_state() != "" and not self.charging_for_control(now)
+        )
+
+    def switch_on_for_apply(self, sw_state, now: datetime) -> bool:
+        """Staat de lader aan, voor apply_action (piek en solar)?
+
+        De schakelaar; bij 'unknown'/'unavailable' een status-sensor die
+        on/charging/connected/complete meldt (hier tellen 'connected' en
+        'complete' bewust als aan, anders dan in observed_charging), of
+        charging_for_control. Zo gaat er geen onnodige turn_on naar een al
+        ladende wagen en legt het snapshot geen 'unknown' als origineel vast.
+        """
+        device = self.device
+        if sw_state.state == "on":
+            return True
+        if sw_state.state not in ("unknown", "unavailable"):
+            return False
+        if device.status_sensor:
+            _st_fallback = self.hass.states.get(device.status_sensor)
+            if _st_fallback is not None and _st_fallback.state not in ("unknown", "unavailable", ""):
+                if _st_fallback.state in ("on", "charging", "connected", "complete"):
+                    _LOGGER.debug(
+                        "Peak Guard EV: schakelaar '%s' = '%s' maar status-sensor '%s' = '%s' — "
+                        "behandeld als AAN (auto laadt al)",
+                        sw_key(device), sw_state.state, device.status_sensor, _st_fallback.state,
+                    )
+                    return True
+        # Zelfde fallback via de laadstatus (charge_state_sensor), een
+        # bevestigde 'is_charging'-weigering, of een 'stopped' die nog van
+        # vóór de eigen start dateert — ook zonder status-sensor.
+        return self.charging_for_control(now)
+
+    def peak_already_stopped(self, now: datetime) -> bool:
+        """Piekpad: door Peak Guard gestopt en niet herstart — niets af te schakelen.
+
+        Vlak na de eigen turn_off toont een Tesla vaak nog 'charging'; daarna
+        telt enkel een laadstatus 'charging' (manueel herstart).
+        """
+        guard = self._guard()
+        return guard is not None and guard.last_switch_state is False and (
+            self.just_stopped_by_pg(now) or not self.observed_charging()
+        )
+
+    def peak_not_charging(self, now: datetime) -> bool:
+        """Piekpad: een gekende laadstatus zegt dat de wagen niet laadt.
+
+        Vlak na een eigen start toont een Tesla nog minuten 'stopped':
+        charging_for_control telt dat als ladend, en daarnaast de oudere regel
+        pg_start_with_stale_stopped — liever een call te veel dan een piek.
+        'complete'/'disconnected' gelden altijd.
+        """
+        return (
+            bool(self.charge_state()) and not self.charging_for_control(now)
+            and not self.pg_start_with_stale_stopped(now)
+        )
+
+    def refusal_was_manual_start(self) -> bool:
+        """Een 'is_charging'-weigering bij een solar-start: was het een
+        manuele/app-start? Enkel de eigen SoC-override kan een volle wagen
+        ('complete') hervat hebben; elke andere laadstatus op dat moment
+        betekent dat iemand anders hem startte."""
+        return self.confirmed_state() not in ("complete", "fully_charged")
 
     def confirmed_state(self) -> Optional[str]:
         """Laadstatus in HA bij de laatste 'is_charging'-weigering (None = geen)."""
