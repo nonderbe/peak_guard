@@ -1603,11 +1603,17 @@ class EVGuard:
 
         last_switch_state=None zodat de solar-cascade een laadsessie die
         daarna start (bv. na een SOC-override) als handmatige start herkent.
+        Een stop door Peak Guard die nog geldt (last_switch_state False,
+        turned_off_by_pg — bv. de piek-cascade stopte de wagen) blijft staan:
+        de guard is gedeeld met de andere kopieën, en zonder die stop ziet
+        peak_is_off een achterlopende 'charging' als een lopende lading. De
+        solar-cascade herkent een manuele start ook vanuit False.
         """
         guard = self.guard_for(device)
         guard.scheduled         = False
         guard.state             = EVState.IDLE
-        guard.last_switch_state = None
+        if not (guard.last_switch_state is False and guard.turned_off_by_pg):
+            guard.last_switch_state = None
         guard.skip_reason       = ""
         self._reset_debounce(guard)
 

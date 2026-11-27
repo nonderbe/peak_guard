@@ -90,3 +90,40 @@ async def test_peak_stop_by_one_copy_is_seen_by_the_inject_copy():
     assert await ev.throttle_down_solar(solar, consumption=500.0,
                                         now=T0 + timedelta(seconds=30)) is False
     assert len(hass.services.calls) == calls
+
+
+async def test_release_schedule_keeps_a_peak_stop():
+    """Bekende beperking t.e.m. v1.9.14: het schema laat de wagen los (doel
+    bereikt / entry verwijderd) terwijl de piek-cascade hem gestopt heeft;
+    de stop mag niet vergeten worden, ook al meldt de Tesla nog 'charging'."""
+    hass, ev = _guard()
+    hass.states.set(SW, "on")
+    hass.states.set("sensor.tesla_charging", "charging")
+    hass.states.set("number.tesla_current", "6")
+    sched, peak = _ev("ev_sched"), _ev("ev_peak")
+    g = ev.guard_for(sched)
+    g.state, g.last_switch_state, g.turned_on_at = EVState.CHARGING, True, T0 - timedelta(minutes=30)
+    g.scheduled = True
+
+    await ev.apply_action(peak, 5000.0, {}, "peak", MockPeakTracker(),
+                          MockSolarTracker(), now=T0)
+    assert hass.services.has_call("turn_off")
+    ev.release_schedule(sched)
+    assert g.scheduled is False
+    assert ev.peak_is_off(peak) is True
+    assert ev.view(peak).stopped_by_pg_not_restarted()
+    calls = len(hass.services.calls)
+    assert await ev.apply_action(peak, 5000.0, {}, "peak", MockPeakTracker(),
+                                 MockSolarTracker(), now=T0 + timedelta(seconds=30)) == 5000.0
+    assert len(hass.services.calls) == calls
+
+
+def test_release_schedule_still_forgets_its_own_running_charge():
+    """Een lopende lading van het schema: last_switch_state → None (de
+    solar-cascade herkent een start daarna als manueel)."""
+    _, ev = _guard()
+    sched = _ev("ev_sched")
+    g = ev.guard_for(sched)
+    g.state, g.last_switch_state, g.scheduled = EVState.CHARGING, True, True
+    ev.release_schedule(sched)
+    assert g.last_switch_state is None and g.state == EVState.IDLE

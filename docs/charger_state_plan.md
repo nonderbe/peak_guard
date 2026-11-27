@@ -94,7 +94,8 @@ niet in één keer moeten veranderen.
   bleek `_sync_guards` bij verschillende ids een piekstop te wissen (schema
   herstartte na 1 min i.p.v. na de min-OFF); nu gedragen beide configuraties
   zich gelijk. `explain()` is nog niet gebouwd (de bestaande `holds` volstaan
-  voorlopig).
+  voorlopig). Daarna opgelost (nog in 1.9.14): `release_schedule` vergat een
+  piekstop op de gedeelde guard.
 
 ## Bewust niet in stap 1
 
